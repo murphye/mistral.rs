@@ -5,7 +5,8 @@
 //! ported.
 use candle_core::{DType, Result, Tensor};
 
-use crate::cuda::gdn::{GdnStateSlots, RecurrenceInputs};
+use crate::cuda::gdn::{FusedDecodeRecurrence, GdnStateSlots, RecurrenceInputs};
+use crate::kv_cache::RecurrentStateLayout;
 use crate::gdn::GdnGateActivation;
 
 // Must match the state dtype codes in gdn.cu.
@@ -509,4 +510,170 @@ pub fn fused_gdn_gating_rocm(
             other
         ),
     }
+}
+
+/// Largest key head dimension the baseline decode kernel supports.
+const GDN_DECODE_MAX_K: usize = 256;
+/// `GdnDecodeKernel::Baseline` in gdn.cu: the key-major kernel without the
+/// NVIDIA-specific cooperative and pipelined variants.
+const GDN_DECODE_KERNEL_BASELINE: i32 = 0;
+
+fn rocm_ptr<T: candle_core::rocm_backend::RocmDType>(t: &Tensor, name: &str) -> Result<u64> {
+    let (s, l) = t.storage_and_layout();
+    let s = match &*s {
+        candle_core::Storage::Rocm(c) => c.as_rocm_slice::<T>()?,
+        _ => candle_core::bail!("{name} must be a rocm tensor"),
+    };
+    Ok(s.slice(l.start_offset()..).device_ptr())
+}
+
+/// Single-token GDN step from the convolved projections: gating, L2 norm and the
+/// key-major recurrence in one kernel. Returns `[BH, 1, V]` in the input dtype.
+pub fn fused_decode_recurrence_rocm(launch: FusedDecodeRecurrence<'_>) -> Result<Tensor> {
+    use candle_core as candle;
+    use core::ffi::c_void;
+
+    let FusedDecodeRecurrence {
+        mixed_qkv,
+        b,
+        a,
+        a_log,
+        dt_bias,
+        state,
+        batch_size,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        tiled_v_heads,
+        state_layout,
+        slots,
+    } = launch;
+    if state_layout != RecurrentStateLayout::GdnKeyMajor || head_k_dim > GDN_DECODE_MAX_K {
+        candle::bail!("ROCm GDN decode needs a key-major state with K <= {GDN_DECODE_MAX_K}");
+    }
+    let dtype_code = match mixed_qkv.dtype() {
+        DType::F16 => 0,
+        DType::BF16 => 1,
+        other => candle::bail!("fused_decode_recurrence_rocm only supports f16/bf16, got {other:?}"),
+    };
+    let dev = mixed_qkv.device().as_rocm_device()?;
+    let half_ptr = |t: &Tensor, name: &str| -> Result<u64> {
+        match t.dtype() {
+            DType::F16 => rocm_ptr::<half::f16>(t, name),
+            DType::BF16 => rocm_ptr::<half::bf16>(t, name),
+            other => candle::bail!("{name} has unsupported dtype {other:?}"),
+        }
+    };
+    let mixed_ptr = half_ptr(mixed_qkv, "mixed_qkv")?;
+    let b_ptr = half_ptr(b, "b")?;
+    let a_ptr = half_ptr(a, "a")?;
+    let b_stride = b.stride();
+    let a_stride = a.stride();
+    let alog_ptr = rocm_ptr::<f32>(a_log, "a_log")?;
+    let dtb_ptr = rocm_ptr::<f32>(dt_bias, "dt_bias")?;
+    let (state_ptr, state_dtype) = rocm_recurrent_state_ptr(state, "state")?;
+
+    let bh = batch_size * num_v_heads;
+    let output = unsafe { Tensor::empty((bh, 1, head_v_dim), mixed_qkv.dtype(), mixed_qkv.device()) }?;
+    let out_ptr = half_ptr(&output, "output")?;
+    let stream = dev.hip_stream().raw() as i64;
+    with_slot_indices(slots, |slot_ptr, _| {
+        unsafe {
+            crate::rocm::ffi::gdn_decode_recurrence(
+                mixed_ptr as *const c_void,
+                b_ptr as *const c_void,
+                a_ptr as *const c_void,
+                alog_ptr as *const f32,
+                dtb_ptr as *const f32,
+                state_ptr,
+                out_ptr as *mut c_void,
+                batch_size as i32,
+                num_k_heads as i32,
+                num_v_heads as i32,
+                head_k_dim as i32,
+                head_v_dim as i32,
+                i32::from(tiled_v_heads),
+                b_stride[0] as i64,
+                b_stride[b_stride.len() - 1] as i64,
+                a_stride[0] as i64,
+                a_stride[a_stride.len() - 1] as i64,
+                slot_ptr,
+                GDN_DECODE_KERNEL_BASELINE,
+                dtype_code,
+                state_dtype,
+                stream,
+            );
+        }
+        Ok(())
+    })?;
+    Ok(output)
+}
+
+/// Splits the convolved projections into f32 `[BH, S, K]` q/k (L2 normalized),
+/// `[BH, S, V]` v and `[BH, S]` gate/beta for the prefill recurrence.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_recurrence_inputs_rocm(
+    mixed_qkv: &Tensor,
+    b: &Tensor,
+    a: &Tensor,
+    a_log: &Tensor,
+    dt_bias: &Tensor,
+    batch_size: usize,
+    seq_len: usize,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    tiled_v_heads: bool,
+) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    use candle_core as candle;
+    use core::ffi::c_void;
+
+    let dtype_code = match mixed_qkv.dtype() {
+        DType::F16 => 0,
+        DType::BF16 => 1,
+        other => candle::bail!("prepare_recurrence_inputs_rocm only supports f16/bf16, got {other:?}"),
+    };
+    let half_ptr = |t: &Tensor, name: &str| -> Result<u64> {
+        match t.dtype() {
+            DType::F16 => rocm_ptr::<half::f16>(t, name),
+            DType::BF16 => rocm_ptr::<half::bf16>(t, name),
+            other => candle::bail!("{name} has unsupported dtype {other:?}"),
+        }
+    };
+    let dev = mixed_qkv.device();
+    let bh = batch_size * num_v_heads;
+    let empty = |shape: &[usize]| unsafe { Tensor::empty(shape, DType::F32, dev) };
+    let q = empty(&[bh, seq_len, head_k_dim])?;
+    let k = empty(&[bh, seq_len, head_k_dim])?;
+    let v = empty(&[bh, seq_len, head_v_dim])?;
+    let g = empty(&[bh, seq_len])?;
+    let beta = empty(&[bh, seq_len])?;
+    unsafe {
+        crate::rocm::ffi::gdn_prepare_recurrence(
+            half_ptr(mixed_qkv, "mixed_qkv")? as *const c_void,
+            half_ptr(b, "b")? as *const c_void,
+            half_ptr(a, "a")? as *const c_void,
+            rocm_ptr::<f32>(a_log, "a_log")? as *const f32,
+            rocm_ptr::<f32>(dt_bias, "dt_bias")? as *const f32,
+            rocm_ptr::<f32>(&q, "q")? as *mut c_void,
+            rocm_ptr::<f32>(&k, "k")? as *mut c_void,
+            rocm_ptr::<f32>(&v, "v")? as *mut c_void,
+            rocm_ptr::<f32>(&g, "g")? as *mut f32,
+            rocm_ptr::<f32>(&beta, "beta")? as *mut f32,
+            batch_size as i32,
+            seq_len as i32,
+            seq_len as i32,
+            num_k_heads as i32,
+            num_v_heads as i32,
+            head_k_dim as i32,
+            head_v_dim as i32,
+            i32::from(tiled_v_heads),
+            dtype_code,
+            0,
+            dev.as_rocm_device()?.hip_stream().raw() as i64,
+        );
+    }
+    Ok((q, k, v, g, beta))
 }

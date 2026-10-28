@@ -256,6 +256,17 @@ pub fn apply_recurrence_from_convolved(
         );
     }
 
+    #[cfg(feature = "rocm")]
+    if mixed_qkv.device().is_rocm()
+        && cache.state_layout == RecurrentStateLayout::GdnKeyMajor
+        && matches!(mixed_qkv.dtype(), DType::F16 | DType::BF16)
+        && dims.head_k_dim <= 256
+    {
+        return recurrence_rocm_from_convolved(
+            mixed_qkv, b, a, a_log, dt_bias, dims, batch_size, seq_len, cache, dtype,
+        );
+    }
+
     if seq_len == 1 && mixed_qkv.device().is_cpu() {
         return decode_recurrence_cpu_from_convolved(
             mixed_qkv, b, a, a_log, dt_bias, dims, batch_size, cache, dtype,
@@ -660,6 +671,97 @@ fn recurrence_cuda(
         crate::cuda::gdn::gated_delta_rule_recurrence_cuda(inputs, &mut state_flat, slots)?
     };
 
+    finish_recurrence(
+        RecurrenceOutput::BatchHeadMajor(out_bh),
+        state_flat,
+        dims,
+        batch_size,
+        seq_len,
+        cache,
+        dtype,
+    )
+}
+
+/// GDN step straight from the convolved projections on ROCm: the fused decode
+/// kernel for single tokens, and the fused input preparation plus the
+/// key-major recurrence kernels for prefill.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn recurrence_rocm_from_convolved(
+    mixed_qkv: &Tensor,
+    b: &Tensor,
+    a: &Tensor,
+    a_log: &Tensor,
+    dt_bias: &Tensor,
+    dims: &GdnDims,
+    batch_size: usize,
+    seq_len: usize,
+    cache: &mut GdnLayerCache,
+    dtype: DType,
+) -> Result<Tensor> {
+    use crate::rocm::gdn::RecurrenceKernel;
+
+    let mixed_qkv = mixed_qkv.contiguous()?;
+    let (b, a) = if seq_len == 1 {
+        (b.clone(), a.clone())
+    } else {
+        (b.contiguous()?, a.contiguous()?)
+    };
+    let a_log = a_log.to_dtype(DType::F32)?.contiguous()?;
+    let dt_bias = dt_bias.to_dtype(DType::F32)?.contiguous()?;
+    let mut state_flat = prepare_state_for_backend(cache, dims, batch_size)?;
+    let slots = GdnStateSlots::from_option(cache.slots.as_ref());
+    let tiled_v_heads = dims.v_head_layout == GdnVHeadLayout::Tiled;
+
+    let out_bh = if seq_len == 1 {
+        crate::rocm::gdn::fused_decode_recurrence_rocm(crate::cuda::gdn::FusedDecodeRecurrence {
+            mixed_qkv: &mixed_qkv,
+            b: &b,
+            a: &a,
+            a_log: &a_log,
+            dt_bias: &dt_bias,
+            state: &mut state_flat,
+            batch_size,
+            num_k_heads: dims.num_k_heads,
+            num_v_heads: dims.num_v_heads,
+            head_k_dim: dims.head_k_dim,
+            head_v_dim: dims.head_v_dim,
+            tiled_v_heads,
+            state_layout: cache.state_layout,
+            slots,
+        })?
+    } else {
+        let (q_bh, k_bh, v_bh, g_bh, beta_bh) = crate::rocm::gdn::prepare_recurrence_inputs_rocm(
+            &mixed_qkv,
+            &b,
+            &a,
+            &a_log,
+            &dt_bias,
+            batch_size,
+            seq_len,
+            dims.num_k_heads,
+            dims.num_v_heads,
+            dims.head_k_dim,
+            dims.head_v_dim,
+            tiled_v_heads,
+        )?;
+        let inputs = RecurrenceInputs {
+            q: &q_bh,
+            k: &k_bh,
+            v: &v_bh,
+            g: &g_bh,
+            beta: &beta_bh,
+        };
+        let kernel =
+            if seq_len >= RECURRENCE_CHUNK_THRESHOLD && matches!(dims.head_k_dim, 64 | 128) {
+                RecurrenceKernel::Warp
+            } else if seq_len >= RECURRENCE_CHUNK_THRESHOLD {
+                RecurrenceKernel::Chunked
+            } else {
+                RecurrenceKernel::Scalar
+            };
+        crate::rocm::gdn::gated_delta_rule_recurrence_rocm(kernel, inputs, &mut state_flat, slots)?
+    };
     finish_recurrence(
         RecurrenceOutput::BatchHeadMajor(out_bh),
         state_flat,
