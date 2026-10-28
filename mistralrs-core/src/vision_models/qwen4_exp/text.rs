@@ -1053,6 +1053,21 @@ impl Qwen4ExpTextModel {
             res = next_res;
             pending_norm = xn;
         }
+        if !store_spec {
+            // Select the logit rows on the last layer's device and move only those: copying
+            // the whole residual back would make the first device's stream wait for the last
+            // device, so consecutive prompt chunks could not overlap across devices.
+            let rows = ctx.logits(&res)?;
+            if !ctx.needs_logits() {
+                let mut dims = rows.dims().to_vec();
+                *dims.last_mut().expect("residual rows have a feature axis") = 1;
+                return Tensor::zeros(dims, rows.dtype(), &self.device);
+            }
+            let rows = rows.to_device(&self.device)?;
+            let xn = self.final_mixer.norm(&rows)?;
+            let xs = self.final_mixer.mix(&xn)?;
+            return ctx.lm_head(&*self.lm_head, &xs);
+        }
         let res = res.to_device(&self.device)?;
         if store_spec {
             *self.gdn_replay_stash.lock().expect("gdn stash poisoned") = gdn_stash;
