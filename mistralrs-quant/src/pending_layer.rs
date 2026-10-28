@@ -150,7 +150,7 @@ impl QuantMethod for PendingIsqLayer {
         self.resolve()?.embedding_forward_raw(ids)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     fn get_qtensor(&self) -> Option<Arc<candle_core::quantized::QTensor>> {
         self.resolve().ok()?.get_qtensor()
     }

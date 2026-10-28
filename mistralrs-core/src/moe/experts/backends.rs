@@ -1338,6 +1338,33 @@ impl FastExpertsWeights {
             .any(|projection| projection.name() == "NVFP4")
     }
 
+    /// Gate and up GGUF experts in one ROCm kernel that also applies the activation.
+    fn rocm_fused_gate_up(
+        &self,
+        xs: &Tensor,
+        ids: &Tensor,
+        act: crate::layers::Activation,
+    ) -> Result<Option<Tensor>> {
+        use crate::layers::Activation;
+        #[cfg(feature = "rocm")]
+        if xs.device().is_rocm() && !self.fused_gate_proj.has_bias() && !self.fused_up_proj.has_bias()
+        {
+            let act = match act {
+                Activation::Silu | Activation::Swish => 0,
+                Activation::NewGelu | Activation::GeluPytorchTanh => 1,
+                _ => return Ok(None),
+            };
+            if let (Some(gate), Some(up)) =
+                (self.fused_gate_proj.get_qtensor(), self.fused_up_proj.get_qtensor())
+            {
+                let ids = ids.to_dtype(DType::U32)?.contiguous()?;
+                return gate.rocm_indexed_moe_glu_forward(&up, act, &xs.contiguous()?, &ids);
+            }
+        }
+        let _ = (xs, ids, act);
+        Ok(None)
+    }
+
     pub(super) fn forward_gather(
         &self,
         forward: &MoEForward,
@@ -1354,9 +1381,14 @@ impl FastExpertsWeights {
                 forward
                     .xs_flat
                     .reshape((forward.shape.num_tokens, 1, forward.shape.hidden_dim))?;
-            let gate = self.fused_gate_proj.gather_forward(&xs, forward.topk_ids)?;
-            let up = self.fused_up_proj.gather_forward(&xs, forward.topk_ids)?;
-            let down_in = crate::ops::mul_and_act(&gate, &up, config.act)?;
+            let down_in = match self.rocm_fused_gate_up(&xs, forward.topk_ids, config.act)? {
+                Some(down_in) => down_in,
+                None => {
+                    let gate = self.fused_gate_proj.gather_forward(&xs, forward.topk_ids)?;
+                    let up = self.fused_up_proj.gather_forward(&xs, forward.topk_ids)?;
+                    crate::ops::mul_and_act(&gate, &up, config.act)?
+                }
+            };
             self.fused_down_proj.process_routed_stats(&down_in, ids)?;
             self.fused_down_proj
                 .gather_forward(&down_in, forward.topk_ids)?
