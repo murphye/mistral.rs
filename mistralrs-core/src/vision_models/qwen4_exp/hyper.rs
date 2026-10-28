@@ -76,6 +76,13 @@ impl GatedResidual {
     /// The block input: mean over streams of `xn * sigmoid(up(silu(down(xn) / hc)))`.
     pub(super) fn mix(&self, xn: &Tensor) -> Result<Tensor> {
         let lo = self.down.forward(xn)?;
+        #[cfg(feature = "rocm")]
+        let lo = if lo.device().is_rocm() {
+            crate::rocm::moe_glue::act_scaled(&lo, 1.0 / self.hc as f32, 0)?
+        } else {
+            candle_nn::ops::silu(&(lo / self.hc as f64)?)?
+        };
+        #[cfg(not(feature = "rocm"))]
         let lo = candle_nn::ops::silu(&(lo / self.hc as f64)?)?;
         let gate = self.up.forward(&lo)?;
         #[cfg(feature = "cuda")]

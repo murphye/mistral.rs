@@ -558,9 +558,6 @@ impl QsaAttention {
         let v = v.transpose(1, 2)?.contiguous()?;
         let (cache_k, cache_v) = kv_cache.append(&k_all, &v)?;
         let keys = cache_k.narrow(1, 0, self.num_kv_heads)?.contiguous()?;
-        let aux = cache_k
-            .i((.., self.num_kv_heads, .., ..aux_width))?
-            .contiguous()?;
 
         let y = match step.mode {
             QsaMode::Dense => Sdpa.run_attention(
@@ -572,6 +569,9 @@ impl QsaAttention {
                 &self.sdpa_params,
             )?,
             QsaMode::Sparse { .. } => {
+                let aux = cache_k
+                    .i((.., self.num_kv_heads, .., ..aux_width))?
+                    .contiguous()?;
                 let mask = self.selection_mask(index_q, &aux, step, b_sz, seq_len, q.dtype())?;
                 Sdpa.run_attention_noflash(
                     q,

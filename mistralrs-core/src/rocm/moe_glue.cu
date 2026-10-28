@@ -147,3 +147,26 @@ __global__ void add_sigmoid_gated_kernel(const T *__restrict__ y, const T *__res
 GATED_ADD_OP(float, f32)
 GATED_ADD_OP(__half, f16)
 GATED_ADD_OP(__nv_bfloat16, bf16)
+
+// out = act(x * scale), contiguous with n elements.
+template <typename T>
+__global__ void act_scaled_kernel(const T *__restrict__ x, T *__restrict__ out, const int64_t n,
+                                  const float scale, const int kind) {
+  const int64_t stride = (int64_t)gridDim.x * blockDim.x;
+  for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+    out[i] = from_float<T>(glu_activation(to_float(x[i]) * scale, kind));
+  }
+}
+
+#define ACT_SCALED_OP(T, SUFFIX)                                                                  \
+  extern "C" void act_scaled_##SUFFIX(const void *x, void *out, int64_t n, float scale, int kind, \
+                                      int64_t stream) {                                           \
+    const int threads = 256;                                                                      \
+    const int64_t blocks = (n + threads - 1) / threads;                                           \
+    act_scaled_kernel<T><<<(unsigned)(blocks < 65535 ? blocks : 65535), threads, 0,               \
+                           (cudaStream_t)stream>>>((const T *)x, (T *)out, n, scale, kind);       \
+  }
+
+ACT_SCALED_OP(float, f32)
+ACT_SCALED_OP(__half, f16)
+ACT_SCALED_OP(__nv_bfloat16, bf16)

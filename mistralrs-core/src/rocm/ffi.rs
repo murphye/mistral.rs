@@ -249,4 +249,7 @@ extern "C" {
     pub fn topk_large_packed_f32(input: *const c_void, block_values: *mut f32, block_indices: *mut u32, block_maxes: *mut f32, block_sums: *mut f32, packed_out: *mut f32, ncols: i32, k: i32, chunk_size: i32, nblocks: i32, inv_temperature: f32, stream: i64);
     pub fn topk_large_packed_f16(input: *const c_void, block_values: *mut f32, block_indices: *mut u32, block_maxes: *mut f32, block_sums: *mut f32, packed_out: *mut f32, ncols: i32, k: i32, chunk_size: i32, nblocks: i32, inv_temperature: f32, stream: i64);
     pub fn topk_large_packed_bf16(input: *const c_void, block_values: *mut f32, block_indices: *mut u32, block_maxes: *mut f32, block_sums: *mut f32, packed_out: *mut f32, ncols: i32, k: i32, chunk_size: i32, nblocks: i32, inv_temperature: f32, stream: i64);
+    pub fn act_scaled_f32(x: *const c_void, out: *mut c_void, n: i64, scale: f32, kind: i32, stream: i64);
+    pub fn act_scaled_f16(x: *const c_void, out: *mut c_void, n: i64, scale: f32, kind: i32, stream: i64);
+    pub fn act_scaled_bf16(x: *const c_void, out: *mut c_void, n: i64, scale: f32, kind: i32, stream: i64);
 }

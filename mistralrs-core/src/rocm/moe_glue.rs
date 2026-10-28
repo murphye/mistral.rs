@@ -144,3 +144,26 @@ pub fn add_sigmoid_gated(y: &Tensor, shared: &Tensor, gate: &Tensor) -> Result<T
     }
     Ok(out)
 }
+
+/// `act(x * scale)` in one kernel; `kind` is a `mistralrs_quant::GluActivationType`.
+pub fn act_scaled(x: &Tensor, scale: f32, kind: i32) -> Result<Tensor> {
+    let x = x.contiguous()?;
+    let out = unsafe { Tensor::empty(x.shape(), x.dtype(), x.device()) }?;
+    let launch = match x.dtype() {
+        DType::F32 => crate::rocm::ffi::act_scaled_f32,
+        DType::F16 => crate::rocm::ffi::act_scaled_f16,
+        DType::BF16 => crate::rocm::ffi::act_scaled_bf16,
+        dt => candle_core::bail!("act_scaled: unsupported dtype {dt:?}"),
+    };
+    unsafe {
+        launch(
+            half_or_f32_ptr(&x, "x")? as *const c_void,
+            half_or_f32_ptr(&out, "out")? as *mut c_void,
+            x.elem_count() as i64,
+            scale,
+            kind,
+            stream(&x)?,
+        );
+    }
+    Ok(out)
+}
