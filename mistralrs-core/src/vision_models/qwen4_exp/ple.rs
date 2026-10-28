@@ -18,6 +18,9 @@ const GATE_MAGNITUDE_FLOOR: f64 = 1e-6;
 const TABLE_SHARD_PREFIX: &str = "shard_";
 const GGUF_TABLE_NAME: &str = "per_layer_token_embd.weight";
 const GGML_TYPE_IQ4_NL: u32 = 20;
+const GGML_TYPE_Q4_0: u32 = 2;
+const GGML_TYPE_Q5_0: u32 = 6;
+const GGML_TYPE_Q8_0: u32 = 8;
 const IQ4_NL_BLOCK: usize = 32;
 const IQ4_NL_BLOCK_BYTES: usize = 18;
 const KVALUES_IQ4_NL: [i8; 16] = [
@@ -208,12 +211,85 @@ enum TableSource {
         starts: Vec<usize>,
         dtype: DType,
     },
-    /// One tensor in the GGUF memory map; `load_gguf` admits only IQ4_NL, which llama.cpp emits.
+    /// One tensor in the GGUF memory map, in one of the 32-element block formats
+    /// llama.cpp emits for this table.
     Gguf {
         archive: Arc<GgufArchive>,
         #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
         rows: usize,
+        format: GgufTableFormat,
     },
+}
+
+/// Block formats of the GGUF n-gram table. All use 32-element blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GgufTableFormat {
+    Iq4Nl,
+    Q4_0,
+    Q5_0,
+    Q8_0,
+}
+
+impl GgufTableFormat {
+    fn from_ggml_type(raw: u32) -> Option<Self> {
+        match raw {
+            GGML_TYPE_IQ4_NL => Some(Self::Iq4Nl),
+            GGML_TYPE_Q4_0 => Some(Self::Q4_0),
+            GGML_TYPE_Q5_0 => Some(Self::Q5_0),
+            GGML_TYPE_Q8_0 => Some(Self::Q8_0),
+            _ => None,
+        }
+    }
+
+    fn block_bytes(self) -> usize {
+        match self {
+            Self::Iq4Nl | Self::Q4_0 => 18,
+            Self::Q5_0 => 22,
+            Self::Q8_0 => 34,
+        }
+    }
+
+    fn row_bytes(self, head_dim: usize) -> usize {
+        head_dim / IQ4_NL_BLOCK * self.block_bytes()
+    }
+
+    /// ggml `dequantize_row_*` for one row.
+    fn dequantize_row(self, src: &[u8], out: &mut [f32]) {
+        match self {
+            Self::Iq4Nl => dequantize_iq4_nl_row(src, out),
+            Self::Q4_0 => {
+                for (block, dst) in src.chunks_exact(18).zip(out.chunks_exact_mut(32)) {
+                    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+                    for (j, &byte) in block[2..].iter().enumerate() {
+                        dst[j] = d * (i32::from(byte & 0xf) - 8) as f32;
+                        dst[j + 16] = d * (i32::from(byte >> 4) - 8) as f32;
+                    }
+                }
+            }
+            Self::Q5_0 => {
+                for (block, dst) in src.chunks_exact(22).zip(out.chunks_exact_mut(32)) {
+                    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+                    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+                    for (j, &byte) in block[6..].iter().enumerate() {
+                        let xh_0 = ((qh >> j) << 4) & 0x10;
+                        let xh_1 = (qh >> (j + 12)) & 0x10;
+                        let x0 = ((u32::from(byte) & 0xf) | xh_0) as i32 - 16;
+                        let x1 = ((u32::from(byte) >> 4) | xh_1) as i32 - 16;
+                        dst[j] = d * x0 as f32;
+                        dst[j + 16] = d * x1 as f32;
+                    }
+                }
+            }
+            Self::Q8_0 => {
+                for (block, dst) in src.chunks_exact(34).zip(out.chunks_exact_mut(32)) {
+                    let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+                    for (q, y) in block[2..].iter().zip(dst.iter_mut()) {
+                        *y = d * f32::from(*q as i8);
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct PleTable {
@@ -340,12 +416,12 @@ impl PleTable {
 
     fn load_gguf(archive: Arc<GgufArchive>, head_dim: usize) -> Result<Self> {
         let info = archive.tensor_info(GGUF_TABLE_NAME)?;
-        if info.dtype().raw() != GGML_TYPE_IQ4_NL {
+        let Some(format) = GgufTableFormat::from_ggml_type(info.dtype().raw()) else {
             candle_core::bail!(
-                "Qwen4-Exp GGUF n-gram table `{GGUF_TABLE_NAME}` is {}, only IQ4_NL is supported",
+                "Qwen4-Exp GGUF n-gram table `{GGUF_TABLE_NAME}` is {}, supported formats are IQ4_NL, Q4_0, Q5_0 and Q8_0",
                 info.dtype().name()
             );
-        }
+        };
         let rows = match info.shape() {
             &[rows, dim] if dim == head_dim && head_dim.is_multiple_of(IQ4_NL_BLOCK) => rows,
             shape => candle_core::bail!(
@@ -357,7 +433,11 @@ impl PleTable {
             "Qwen4-Exp PLE n-gram table is memory-mapped from GGUF"
         );
         Ok(Self {
-            source: TableSource::Gguf { archive, rows },
+            source: TableSource::Gguf {
+                archive,
+                rows,
+                format,
+            },
             head_dim,
             #[cfg(feature = "cuda")]
             device_index: None,
@@ -401,6 +481,16 @@ impl PleTable {
     /// are copied as is, safetensors rows are quantized to 8 or 4 bits.
     #[cfg(feature = "cuda")]
     fn make_resident(&mut self, device: &Device) -> Result<()> {
+        if let TableSource::Gguf { format, .. } = self.source {
+            if format != GgufTableFormat::Iq4Nl {
+                tracing::info!(
+                    ?format,
+                    "Qwen4-Exp GGUF PLE table is not IQ4_NL, so it stays memory-mapped; {}",
+                    self.fallback_path()
+                );
+                return Ok(());
+            }
+        }
         if !self.head_dim.is_multiple_of(RESIDENT_GROUP) {
             tracing::warn!(
                 head_dim = self.head_dim,
@@ -586,8 +676,10 @@ impl PleTable {
                 Tensor::from_raw_buffer(&data, *dtype, &[rows.len(), self.head_dim], &Device::Cpu)?
                     .to_device(device)
             }
-            TableSource::Gguf { archive, .. } => {
-                let row_bytes = iq4_nl_row_bytes(self.head_dim);
+            TableSource::Gguf {
+                archive, format, ..
+            } => {
+                let row_bytes = format.row_bytes(self.head_dim);
                 let bytes = archive.tensor_data(GGUF_TABLE_NAME)?.bytes();
                 let mut out = vec![0f32; rows.len() * self.head_dim];
                 for (dst, &row) in out.chunks_exact_mut(self.head_dim).zip(rows) {
@@ -595,7 +687,7 @@ impl PleTable {
                     let src = bytes
                         .get(offset..offset + row_bytes)
                         .ok_or_else(|| outside(row))?;
-                    dequantize_iq4_nl_row(src, dst);
+                    format.dequantize_row(src, dst);
                 }
                 Tensor::from_vec(out, (rows.len(), self.head_dim), device)
             }
@@ -1157,5 +1249,53 @@ mod tests {
         hash.rows(&tokens[5..], 0, &[Some(248044), Some(553)], &mut split);
         hash.rows(&tokens, 5, &[None, None], &mut rows);
         assert_eq!(split, rows);
+    }
+}
+
+#[cfg(test)]
+mod gguf_table_format_tests {
+    use super::GgufTableFormat;
+
+    /// Q5_0 block: f16 scale, 32 high bits, 16 bytes of low nibbles.
+    #[test]
+    fn q5_0_row_matches_reference() {
+        let d = half::f16::from_f32(0.5);
+        let values: Vec<i32> = (0..32).map(|i| (i * 7 % 32) - 16).collect();
+        let mut block = Vec::with_capacity(22);
+        block.extend_from_slice(&d.to_le_bytes());
+        let mut qh = 0u32;
+        let mut qs = [0u8; 16];
+        for j in 0..16 {
+            let (q0, q1) = ((values[j] + 16) as u32, (values[j + 16] + 16) as u32);
+            qs[j] = ((q0 & 0xf) | ((q1 & 0xf) << 4)) as u8;
+            qh |= ((q0 >> 4) & 1) << j;
+            qh |= ((q1 >> 4) & 1) << (j + 16);
+        }
+        block.extend_from_slice(&qh.to_le_bytes());
+        block.extend_from_slice(&qs);
+        let mut out = [0f32; 32];
+        GgufTableFormat::Q5_0.dequantize_row(&block, &mut out);
+        for (y, x) in out.iter().zip(&values) {
+            assert_eq!(*y, 0.5 * *x as f32);
+        }
+    }
+
+    #[test]
+    fn q4_0_and_q8_0_rows_match_reference() {
+        let d = half::f16::from_f32(0.25);
+        let mut q4 = d.to_le_bytes().to_vec();
+        q4.extend((0..16u8).map(|j| (j & 0xf) | ((15 - j) << 4)));
+        let mut out = [0f32; 32];
+        GgufTableFormat::Q4_0.dequantize_row(&q4, &mut out);
+        for j in 0..16 {
+            assert_eq!(out[j], 0.25 * (j as f32 - 8.0));
+            assert_eq!(out[j + 16], 0.25 * (7.0 - j as f32));
+        }
+        let mut q8 = d.to_le_bytes().to_vec();
+        q8.extend((0..32i8).map(|j| (j - 16) as u8));
+        GgufTableFormat::Q8_0.dequantize_row(&q8, &mut out);
+        for (j, y) in out.iter().enumerate() {
+            assert_eq!(*y, 0.25 * (j as f32 - 16.0));
+        }
     }
 }

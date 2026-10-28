@@ -1326,7 +1326,9 @@ impl FastExpertsWeights {
     }
 
     fn uses_flattened_gather(&self, device: &Device) -> bool {
+        // ROCm's indexed GGUF MoE kernel takes the same [tokens, 1, hidden] layout as CUDA.
         device.is_cuda()
+            || device.is_rocm()
             || [
                 &self.fused_gate_proj,
                 &self.fused_up_proj,
