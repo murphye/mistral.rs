@@ -13,12 +13,16 @@ use crate::{EmbeddingRequest, EmbeddingRequestBuilder, RequestLike, TextMessages
 // Re-export for convenience
 pub use mistralrs_core::{AddModelConfig, ModelStatus, Pipeline, SchedulerConfig};
 
-/// Gets the best device, cpu, cuda if compiled with CUDA, or Metal
+/// Gets the best device, cpu, cuda if compiled with CUDA, rocm if compiled with ROCm, or Metal
 pub fn best_device(force_cpu: bool) -> Result<Device> {
     if force_cpu {
         return Ok(Device::Cpu);
     }
-    #[cfg(not(feature = "metal"))]
+    #[cfg(feature = "rocm")]
+    {
+        Device::rocm_if_available(0)
+    }
+    #[cfg(not(any(feature = "metal", feature = "rocm")))]
     {
         Device::cuda_if_available(0)
     }

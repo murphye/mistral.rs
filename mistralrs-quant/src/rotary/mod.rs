@@ -196,6 +196,9 @@ impl CustomOp3 for RotaryEmb {
 }
 
 pub fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor, is_neox: bool) -> Result<Tensor> {
+    if x.device().is_rocm() {
+        return generic_apply_rotary_q(x, cos, sin, None, is_neox);
+    }
     let x = x.contiguous()?;
     let cos = cos.contiguous()?;
     let sin = sin.contiguous()?;
@@ -399,6 +402,77 @@ where
             }
         });
     Tensor::from_vec(dst, src_l.shape().clone(), &candle_core::Device::Cpu)
+}
+
+/// RoPE for GPU backends without dedicated kernels here (ROCm): selects the
+/// cos/sin rows with tensor ops, then applies candle-nn's fused rope kernels to
+/// the rotated channels. Matches the CPU implementation's semantics.
+fn generic_apply_rotary_q(
+    q: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    positions: Option<&Tensor>,
+    is_neox: bool,
+) -> Result<Tensor> {
+    let (batch, _heads, seq_len, head_dim) = q.dims4()?;
+    let (cos, sin) = match positions {
+        Some(positions) => {
+            let (_, rot_dim) = cos.dims2()?;
+            let positions = positions.flatten_all()?.to_device(q.device())?;
+            if positions.elem_count() != batch * seq_len {
+                candle_core::bail!(
+                    "RoPE positions length {} does not match token count {}",
+                    positions.elem_count(),
+                    batch * seq_len
+                );
+            }
+            let cos = cos.index_select(&positions, 0)?;
+            let sin = sin.index_select(&positions, 0)?;
+            (
+                cos.reshape((batch, seq_len, rot_dim))?,
+                sin.reshape((batch, seq_len, rot_dim))?,
+            )
+        }
+        None if cos.rank() == 3 => (cos.clone(), sin.clone()),
+        None => {
+            let (rows, rot_dim) = cos.dims2()?;
+            if rows == seq_len {
+                (cos.clone(), sin.clone())
+            } else if rows == batch * seq_len {
+                (
+                    cos.reshape((batch, seq_len, rot_dim))?,
+                    sin.reshape((batch, seq_len, rot_dim))?,
+                )
+            } else {
+                candle_core::bail!(
+                    "RoPE cache rows {rows} are incompatible with batch {batch} and seq {seq_len}"
+                )
+            }
+        }
+    };
+    let rot_dim = cos.dim(candle_core::D::Minus1)?;
+    if rot_dim == 0 || rot_dim * 2 > head_dim {
+        candle_core::bail!(
+            "RoPE rot dim {} is incompatible with head dim {head_dim}",
+            rot_dim * 2
+        );
+    }
+    let (cos, sin) = (cos.contiguous()?, sin.contiguous()?);
+    let rope = |x: &Tensor| {
+        if is_neox {
+            candle_nn::rotary_emb::rope(x, &cos, &sin)
+        } else {
+            candle_nn::rotary_emb::rope_i(x, &cos, &sin)
+        }
+    };
+    if rot_dim * 2 == head_dim {
+        rope(&q.contiguous()?)
+    } else {
+        // Partial rotary: only the leading 2 * rot_dim channels are rotated.
+        let rotated = rope(&q.narrow(3, 0, rot_dim * 2)?.contiguous()?)?;
+        let passthrough = q.narrow(3, rot_dim * 2, head_dim - rot_dim * 2)?;
+        Tensor::cat(&[rotated, passthrough], 3)
+    }
 }
 
 fn cpu_apply_rotary_q(
@@ -835,6 +909,9 @@ fn apply_rotary_q_inner(
     if q.device().is_metal() {
         return metal_apply_rotary_q(q, cos, sin, positions, is_neox);
     }
+    if q.device().is_rocm() {
+        return generic_apply_rotary_q(q, cos, sin, positions, is_neox);
+    }
     cpu_apply_rotary_q(q, cos, sin, positions, is_neox)
 }
 
@@ -877,6 +954,13 @@ fn apply_rotary_qk_inner(
     #[cfg(feature = "metal")]
     if q.device().is_metal() {
         return metal_apply_rotary_qk(q, k, cos, sin, positions, is_neox);
+    }
+    if q.device().is_rocm() {
+        check_qk_shape(q, k)?;
+        return Ok((
+            generic_apply_rotary_q(q, cos, sin, positions, is_neox)?,
+            generic_apply_rotary_q(k, cos, sin, positions, is_neox)?,
+        ));
     }
     cpu_apply_rotary_qk(q, k, cos, sin, positions, is_neox)
 }

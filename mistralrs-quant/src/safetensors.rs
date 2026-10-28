@@ -209,6 +209,28 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         Device::Cuda(_) => {
             return Err(Error::Msg("CUDA support not compiled".to_string()));
         }
+        #[cfg(feature = "rocm")]
+        Device::Rocm(device) => {
+            let mut slice = unsafe { device.alloc::<u8>(data.len())? };
+            device.memcpy_htod(data, &mut slice)?;
+
+            let slice = match dtype {
+                DType::F6E2M3 => candle_core::rocm_backend::RocmStorageSlice::F6E2M3(slice),
+                DType::F6E3M2 => candle_core::rocm_backend::RocmStorageSlice::F6E3M2(slice),
+                DType::F4 => candle_core::rocm_backend::RocmStorageSlice::F4(slice),
+                DType::F8E8M0 => candle_core::rocm_backend::RocmStorageSlice::F8E8M0(slice),
+                _ => unreachable!(),
+            };
+            let storage = candle_core::rocm_backend::RocmStorage {
+                slice,
+                device: device.clone(),
+            };
+            Storage::Rocm(storage)
+        }
+        #[cfg(not(feature = "rocm"))]
+        Device::Rocm(_) => {
+            return Err(Error::Msg("ROCm support not compiled".to_string()));
+        }
         #[cfg(feature = "metal")]
         Device::Metal(device) => {
             let buffer = device.new_buffer_with_data(data)?;

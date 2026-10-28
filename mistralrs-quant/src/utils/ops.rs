@@ -196,6 +196,9 @@ pub trait LeftshiftOp {
 
 impl LeftshiftOp for Tensor {
     fn leftshift(&self, n: usize) -> Result<Tensor> {
+        if self.device().is_rocm() {
+            return rocm_on_cpu(self, |x| x.apply_op1_no_bwd(&Leftshift(n)));
+        }
         self.apply_op1_no_bwd(&Leftshift(n))
     }
 }
@@ -800,20 +803,33 @@ pub trait BitWiseOp {
 
 impl BitWiseOp for Tensor {
     fn bitwise_and(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.apply_op2_no_bwd(rhs, &BitWise::new(BitWiseBinaryOpEnum::And))
+        bitwise_binary(self, rhs, BitWiseBinaryOpEnum::And)
     }
 
     fn bitwise_or(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.apply_op2_no_bwd(rhs, &BitWise::new(BitWiseBinaryOpEnum::Or))
+        bitwise_binary(self, rhs, BitWiseBinaryOpEnum::Or)
     }
 
     fn bitwise_xor(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.apply_op2_no_bwd(rhs, &BitWise::new(BitWiseBinaryOpEnum::Xor))
+        bitwise_binary(self, rhs, BitWiseBinaryOpEnum::Xor)
     }
 
     fn bitwise_not(&self) -> Result<Tensor> {
-        self.apply_op1_no_bwd(&BitWiseUnary::new(BitWiseUnaryOpEnum::Not))
+        let op = BitWiseUnary::new(BitWiseUnaryOpEnum::Not);
+        if self.device().is_rocm() {
+            return rocm_on_cpu(self, |x| x.apply_op1_no_bwd(&op));
+        }
+        self.apply_op1_no_bwd(&op)
     }
+}
+
+fn bitwise_binary(lhs: &Tensor, rhs: &Tensor, op: BitWiseBinaryOpEnum) -> Result<Tensor> {
+    let op = BitWise::new(op);
+    if lhs.device().is_rocm() {
+        let rhs = rhs.to_device(&candle_core::Device::Cpu)?;
+        return rocm_on_cpu(lhs, |x| x.apply_op2_no_bwd(&rhs, &op));
+    }
+    lhs.apply_op2_no_bwd(rhs, &op)
 }
 
 // ────────────────────────────── ArgSort / Sort ────────────────────────────────
@@ -1050,7 +1066,7 @@ pub trait SortOp {
 
 impl SortOp for Tensor {
     fn fast_argsort_asc<D: Dim>(&self, axis: D) -> Result<Tensor> {
-        if self.device().is_cpu() || self.device().is_cuda() {
+        if self.device().is_cpu() || self.device().is_cuda() || self.device().is_rocm() {
             return self.arg_sort_last_dim(true);
         }
         self.apply_op1_no_bwd(&ArgSort {
@@ -1059,7 +1075,7 @@ impl SortOp for Tensor {
     }
 
     fn fast_sort_asc<D: Dim>(&self, axis: D) -> Result<Tensor> {
-        if self.device().is_cpu() || self.device().is_cuda() {
+        if self.device().is_cpu() || self.device().is_cuda() || self.device().is_rocm() {
             return Ok(self.sort_last_dim(true)?.0);
         }
         self.apply_op1_no_bwd(&Sort {
@@ -1384,6 +1400,9 @@ impl NonZeroOp for Tensor {
         if !self.is_contiguous() {
             return Err(candle_core::Error::RequiresContiguous { op: "nonzero" });
         }
+        if self.device().is_rocm() {
+            return rocm_on_cpu(self, |x| x.apply_op1_no_bwd(&NonZero));
+        }
         self.apply_op1_no_bwd(&NonZero)
     }
 }
@@ -1576,11 +1595,15 @@ impl CumSumOp for Tensor {
         inclusive: bool,
         reverse: bool,
     ) -> Result<Tensor> {
-        self.apply_op1_no_bwd(&CumSum {
+        let op = CumSum {
             inclusive,
             reverse,
             axis: axis.to_index(self.shape(), "cumsum")?,
-        })
+        };
+        if self.device().is_rocm() {
+            return rocm_on_cpu(self, |x| x.apply_op1_no_bwd(&op));
+        }
+        self.apply_op1_no_bwd(&op)
     }
 }
 
@@ -2971,10 +2994,28 @@ pub fn fused_glu(a: &Tensor, b: &Tensor, activation: GluActivationType) -> Resul
         return a.apply_op2_no_bwd(b, &FusedGlu(activation));
     }
 
+    if a.device().is_rocm() {
+        let activated = match activation {
+            GluActivationType::Silu => a.silu()?,
+            GluActivationType::Gelu => a.gelu()?,
+            GluActivationType::Relu => a.relu()?,
+            GluActivationType::GeluErf => a.gelu_erf()?,
+            GluActivationType::Sigmoid => candle_nn::ops::sigmoid(a)?,
+        };
+        return activated * b;
+    }
+
     let a = a.contiguous()?;
     let b = b.contiguous()?;
 
     a.apply_op2_no_bwd(&b, &FusedGlu(activation))
+}
+
+/// Runs `f` on a CPU copy of `x` and moves the result back to `x`'s device. Used
+/// on ROCm for custom ops that have no ROCm kernel and are off the hot path.
+pub(crate) fn rocm_on_cpu(x: &Tensor, f: impl FnOnce(&Tensor) -> Result<Tensor>) -> Result<Tensor> {
+    let device = x.device().clone();
+    f(&x.to_device(&candle_core::Device::Cpu)?)?.to_device(&device)
 }
 
 #[cfg(feature = "cuda")]
@@ -3431,6 +3472,11 @@ impl CustomOp1 for Softcap {
 pub fn softcap(input: &Tensor, cap: f32) -> Result<Tensor> {
     if !cap.is_finite() || cap <= 0.0 {
         candle_core::bail!("softcap requires a positive finite cap");
+    }
+
+    if input.device().is_rocm() {
+        let dtype = input.dtype();
+        return ((input.to_dtype(DType::F32)? / cap as f64)?.tanh()? * cap as f64)?.to_dtype(dtype);
     }
 
     let input = input.contiguous()?;

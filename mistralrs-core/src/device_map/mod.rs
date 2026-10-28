@@ -260,6 +260,16 @@ fn mapped_device_for_ordinal(
             }),
         DeviceLocation::Metal { gpu_id } if gpu_id == ordinal => Ok(device.clone()),
         DeviceLocation::Metal { .. } => Device::new_metal(ordinal),
+        DeviceLocation::Rocm { gpu_id } if gpu_id == ordinal => Ok(device.clone()),
+        DeviceLocation::Rocm { .. } => all_devices
+            .iter()
+            .find(|d| d.is_rocm() && device_ordinal(d) == ordinal)
+            .cloned()
+            .ok_or_else(|| {
+                candle_core::Error::msg(format!(
+                    "Could not find rocm device with ordinal {ordinal}"
+                ))
+            }),
     }
 }
 
@@ -268,6 +278,7 @@ fn device_ordinal(device: &Device) -> usize {
         DeviceLocation::Cpu => 0,
         DeviceLocation::Cuda { gpu_id } => gpu_id,
         DeviceLocation::Metal { gpu_id } => gpu_id,
+        DeviceLocation::Rocm { gpu_id } => gpu_id,
     }
 }
 
@@ -329,6 +340,32 @@ pub fn get_all_similar_devices(base: &Device) -> Result<Vec<Device>> {
                     break;
                 }
             }
+        }
+        #[cfg(feature = "rocm")]
+        Device::Rocm(_) => {
+            let DeviceLocation::Rocm { gpu_id: base_ord } = base.location() else {
+                candle_core::bail!("location and device do not match");
+            };
+            let count =
+                candle_core::rocm_backend::hip::device_count().map_err(candle_core::Error::wrap)?;
+            for ord in 0..count {
+                if base_ord == ord {
+                    devices.push(base.clone());
+                    continue;
+                }
+                // Integrated GPUs (e.g. a Ryzen iGPU) share system memory and are
+                // much slower: never spread layers onto them.
+                if candle_core::rocm_backend::hip::device_is_integrated(ord).unwrap_or(true) {
+                    continue;
+                }
+                if let Ok(dev) = Device::new_rocm(ord) {
+                    devices.push(dev);
+                }
+            }
+        }
+        #[cfg(not(feature = "rocm"))]
+        Device::Rocm(_) => {
+            candle_core::bail!("Not compiled with rocm features, but have a rocm device.");
         }
         #[cfg(not(feature = "metal"))]
         Device::Metal(_) => {

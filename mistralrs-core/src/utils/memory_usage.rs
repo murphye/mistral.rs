@@ -220,6 +220,25 @@ impl MemoryUsage {
             Device::Cuda(_) => {
                 candle_core::bail!("Cannot query memory for CUDA device")
             }
+            #[cfg(feature = "rocm")]
+            Device::Rocm(dev) => {
+                if dev.is_integrated()? {
+                    let (total_bytes, avail_bytes) = system_memory()?;
+                    Ok(DeviceMemory::Unified {
+                        total: total_bytes,
+                        available: avail_bytes,
+                        allocated: total_bytes.saturating_sub(avail_bytes),
+                        working_set_limit: total_bytes,
+                    })
+                } else {
+                    let (free, total) = dev.mem_get_info()?;
+                    Ok(DeviceMemory::Discrete { total, free })
+                }
+            }
+            #[cfg(not(feature = "rocm"))]
+            Device::Rocm(_) => {
+                candle_core::bail!("Cannot query memory for ROCm device")
+            }
             #[cfg(feature = "metal")]
             Device::Metal(dev) => {
                 let (total, available) = system_memory()?;

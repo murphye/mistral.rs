@@ -3753,6 +3753,9 @@ impl ArgSortOp for Tensor {
             Some(last_dim) => *last_dim,
             None => candle_core::bail!("empty last-dim in arg-sort"),
         };
+        if self.device().is_rocm() {
+            return self.arg_sort_last_dim(asc);
+        }
         // No need for a backward pass for arg sort.
         self.apply_op1_no_bwd(&ArgSort {
             asc,
@@ -3775,6 +3778,9 @@ impl ArgSortOp for Tensor {
             Some(last_dim) => *last_dim,
             None => candle_core::bail!("empty last-dim in arg-sort"),
         };
+        if self.device().is_rocm() {
+            return self.sort_last_dim(asc);
+        }
         let sorted = self.copy()?;
 
         let asort = sorted.apply_op1_no_bwd(&ArgSort {

@@ -1344,6 +1344,8 @@ fn init_device(force_cpu: bool, seed: Option<u64>) -> Result<candle_core::Device
         Device::Cpu
     } else if mistralrs_core::distributed::use_nccl() {
         Device::Cpu
+    } else if cfg!(feature = "rocm") {
+        Device::rocm_if_available(0)?
     } else {
         Device::cuda_if_available(0)?
     };
