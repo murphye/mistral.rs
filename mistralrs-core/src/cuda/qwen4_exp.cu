@@ -997,6 +997,202 @@ q4_qsa_attention_reduce_kernel(const float *__restrict__ part_acc,
     }                                                                          \
   } while (0)
 
+
+#ifdef USE_ROCM
+// Prefill variant of q4_qsa_attention_kernel for RDNA (wave32 WMMA). One
+// workgroup per (token, kv head): the query heads sharing that kv head form the
+// rows of a 16-row tile, and the token's selected items are consumed 16 at a time
+// with an online softmax. Scores and P.V run on WMMA through rocWMMA; the output
+// accumulates in LDS. Head dim 256, at most 16 query heads per kv head.
+#include <rocwmma/rocwmma.hpp>
+
+#define Q4W_ROWS 16
+#define Q4W_ITEMS 16
+#define Q4W_LD (Q4_ATTN_HEAD_DIM + 8)
+#define Q4W_OLD (Q4_ATTN_HEAD_DIM + 4)
+#define Q4W_THREADS 128
+
+template <typename T>
+__global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
+    const T *__restrict__ q, const T *__restrict__ k_cache,
+    const T *__restrict__ v_cache, Q4Tokens l, Q4Paged pg,
+    const int *__restrict__ selected, const int *__restrict__ n_selected,
+    int topk, int ratio, int n_q_heads, int n_kv_heads, float scale,
+    int flashinfer_layout, T *__restrict__ out) {
+  using namespace rocwmma;
+  using bf = rocwmma::bfloat16_t;
+  __shared__ bf q_lds[Q4W_ROWS * Q4W_LD];
+  __shared__ bf k_lds[Q4W_ITEMS * Q4W_LD];
+  __shared__ bf v_lds[Q4W_ITEMS * Q4W_LD];
+  __shared__ float s_part[4][Q4W_ROWS * Q4W_ITEMS];
+  __shared__ bf p_lds[Q4W_ROWS * (Q4W_ITEMS + 8)];
+  __shared__ float o_lds[Q4W_ROWS * Q4W_OLD];
+  __shared__ float m_row[Q4W_ROWS], l_row[Q4W_ROWS], corr_row[Q4W_ROWS];
+  __shared__ const T *k_item[Q4W_ITEMS];
+  __shared__ const T *v_item[Q4W_ITEMS];
+
+  const int t = blockIdx.x;
+  const int g = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int wave = tid / 32;
+  const int group = n_q_heads / n_kv_heads;
+
+  int seq;
+  const int pos = q4_pos_of(l, pg, t, seq);
+  int n_block_items = 0, n_items = 0, tail_start = 0;
+  if (pos >= 0) {
+    const int nb = (pos + 1) / ratio;
+    n_block_items = n_selected[t] * ratio;
+    tail_start = nb * ratio;
+    n_items = n_block_items + (pos + 1 - tail_start);
+  }
+
+  for (int e = tid; e < Q4W_ROWS * Q4_ATTN_HEAD_DIM; e += Q4W_THREADS) {
+    const int r = e / Q4_ATTN_HEAD_DIM, d = e % Q4_ATTN_HEAD_DIM;
+    float v = 0.0f;
+    if (r < group) {
+      v = q4_f(q[((size_t)t * n_q_heads + g * group + r) * Q4_ATTN_HEAD_DIM + d]) * scale;
+    }
+    q_lds[r * Q4W_LD + d] = static_cast<bf>(v);
+    o_lds[r * Q4W_OLD + d] = 0.0f;
+  }
+  if (tid < Q4W_ROWS) {
+    m_row[tid] = -FLT_MAX;
+    l_row[tid] = 0.0f;
+  }
+  const size_t head_stride_fi = (size_t)pg.block_size * Q4_ATTN_HEAD_DIM;
+
+  for (int it0 = 0; it0 < n_items; it0 += Q4W_ITEMS) {
+    __syncthreads();
+    if (tid < Q4W_ITEMS) {
+      const int it = it0 + tid;
+      const T *kp = nullptr, *vp = nullptr;
+      if (it < n_items) {
+        const int p = it < n_block_items
+                          ? selected[(size_t)t * topk + it / ratio] * ratio + it % ratio
+                          : tail_start + (it - n_block_items);
+        const int blk = pg.block_tables[(size_t)seq * pg.max_blocks_per_seq + p / pg.block_size];
+        const int off = p % pg.block_size;
+        const size_t head_base = (size_t)blk * n_kv_heads + g;
+        if (flashinfer_layout) {
+          kp = k_cache + head_base * head_stride_fi + (size_t)off * Q4_ATTN_HEAD_DIM;
+          vp = v_cache + head_base * head_stride_fi + (size_t)off * Q4_ATTN_HEAD_DIM;
+        } else {
+          // K: [blocks, kv_heads, 256/8, block_size, 8]; V: [blocks, kv_heads, 256, block_size].
+          kp = k_cache + head_base * Q4_ATTN_HEAD_DIM * pg.block_size + (size_t)off * 8;
+          vp = v_cache + head_base * Q4_ATTN_HEAD_DIM * pg.block_size + off;
+        }
+      }
+      k_item[tid] = kp;
+      v_item[tid] = vp;
+    }
+    __syncthreads();
+    // K and V tiles: 16 items x 256 dims.
+    for (int e = tid; e < Q4W_ITEMS * (Q4_ATTN_HEAD_DIM / 8); e += Q4W_THREADS) {
+      const int j = e / (Q4_ATTN_HEAD_DIM / 8), c = e % (Q4_ATTN_HEAD_DIM / 8);
+      const T *kp = k_item[j];
+      float kv[8];
+      if (kp) {
+        q4_load8(flashinfer_layout ? kp + c * 8 : kp + (size_t)c * pg.block_size * 8, kv);
+      } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) kv[i] = 0.0f;
+      }
+#pragma unroll
+      for (int i = 0; i < 8; ++i) k_lds[j * Q4W_LD + c * 8 + i] = static_cast<bf>(kv[i]);
+    }
+    for (int e = tid; e < Q4W_ITEMS * Q4_ATTN_HEAD_DIM; e += Q4W_THREADS) {
+      const int d = e / Q4W_ITEMS, j = e % Q4W_ITEMS;
+      const T *vp = v_item[j];
+      float v = 0.0f;
+      if (vp) {
+        v = q4_f(flashinfer_layout ? vp[d] : vp[(size_t)d * pg.block_size]);
+      }
+      v_lds[j * Q4W_LD + d] = static_cast<bf>(v);
+    }
+    __syncthreads();
+    // S = Q K^T: each wave reduces a quarter of the head dim.
+    {
+      fragment<accumulator, 16, 16, 16, float32_t> acc;
+      fill_fragment(acc, 0.0f);
+#pragma unroll
+      for (int kk = wave * 64; kk < wave * 64 + 64; kk += 16) {
+        fragment<matrix_a, 16, 16, 16, bf, row_major> a;
+        fragment<matrix_b, 16, 16, 16, bf, col_major> b;
+        load_matrix_sync(a, q_lds + kk, Q4W_LD);
+        load_matrix_sync(b, k_lds + kk, Q4W_LD);
+        mma_sync(acc, a, b, acc);
+      }
+      store_matrix_sync(s_part[wave], acc, Q4W_ITEMS, mem_row_major);
+    }
+    __syncthreads();
+    // Online softmax, one row per 8 threads.
+    if (tid < Q4W_ROWS * 8) {
+      const int r = tid / 8, sub = tid % 8;
+      float sv[2];
+      float mx = -FLT_MAX;
+#pragma unroll
+      for (int u = 0; u < 2; ++u) {
+        const int j = sub * 2 + u;
+        float v = s_part[0][r * Q4W_ITEMS + j] + s_part[1][r * Q4W_ITEMS + j] +
+                  s_part[2][r * Q4W_ITEMS + j] + s_part[3][r * Q4W_ITEMS + j];
+        if (it0 + j >= n_items) v = -FLT_MAX;
+        sv[u] = v;
+        mx = fmaxf(mx, v);
+      }
+#pragma unroll
+      for (int o = 4; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o, 8));
+      const float m_old = m_row[r];
+      const float m_new = fmaxf(m_old, mx);
+      float sum = 0.0f;
+#pragma unroll
+      for (int u = 0; u < 2; ++u) {
+        const int j = sub * 2 + u;
+        const float pv = it0 + j < n_items ? __expf(sv[u] - m_new) : 0.0f;
+        sum += pv;
+        p_lds[r * (Q4W_ITEMS + 8) + j] = static_cast<bf>(pv);
+      }
+#pragma unroll
+      for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o, 8);
+      __syncwarp();
+      if (sub == 0) {
+        const float corr = __expf(m_old - m_new);
+        corr_row[r] = corr;
+        l_row[r] = l_row[r] * corr + sum;
+        m_row[r] = m_new;
+      }
+    }
+    __syncthreads();
+    for (int e = tid; e < Q4W_ROWS * Q4_ATTN_HEAD_DIM; e += Q4W_THREADS) {
+      const int r = e / Q4_ATTN_HEAD_DIM, d = e % Q4_ATTN_HEAD_DIM;
+      o_lds[r * Q4W_OLD + d] *= corr_row[r];
+    }
+    __syncthreads();
+    // O += P V: 16 column tiles of the head dim, four per wave.
+    {
+      fragment<matrix_a, 16, 16, 16, bf, row_major> a;
+      load_matrix_sync(a, p_lds, Q4W_ITEMS + 8);
+#pragma unroll
+      for (int ct = wave * 4; ct < wave * 4 + 4; ++ct) {
+        fragment<matrix_b, 16, 16, 16, bf, row_major> b;
+        fragment<accumulator, 16, 16, 16, float32_t> acc;
+        load_matrix_sync(b, v_lds + ct * 16, Q4W_LD);
+        load_matrix_sync(acc, o_lds + ct * 16, Q4W_OLD, mem_row_major);
+        mma_sync(acc, a, b, acc);
+        store_matrix_sync(o_lds + ct * 16, acc, Q4W_OLD, mem_row_major);
+      }
+    }
+  }
+  __syncthreads();
+  for (int e = tid; e < group * Q4_ATTN_HEAD_DIM; e += Q4W_THREADS) {
+    const int r = e / Q4_ATTN_HEAD_DIM, d = e % Q4_ATTN_HEAD_DIM;
+    const float inv = l_row[r] > 0.0f ? 1.0f / l_row[r] : 0.0f;
+    out[((size_t)t * n_q_heads + g * group + r) * Q4_ATTN_HEAD_DIM + d] =
+        q4_t<T>(o_lds[r * Q4W_OLD + d] * inv);
+  }
+}
+#endif
+
 #define Q4_DISPATCH_HALF(dtype, ...)                                           \
   do {                                                                         \
     if ((dtype) == 0) {                                                        \
@@ -1236,6 +1432,21 @@ extern "C" void qwen4_qsa_attention(
     return;
   }
   const cudaStream_t s = (cudaStream_t)stream;
+#ifdef USE_ROCM
+  // Prefill batches take the WMMA kernel; decode keeps the split kernel below.
+  if (layout.n_tokens >= 64 && n_q_heads % n_kv_heads == 0 &&
+      n_q_heads / n_kv_heads <= Q4W_ROWS) {
+    const dim3 wgrid(layout.n_tokens, n_kv_heads);
+    Q4_DISPATCH_HALF(dtype, {
+      q4_qsa_attention_wmma_kernel<scalar_t><<<wgrid, Q4W_THREADS, 0, s>>>(
+          (const scalar_t *)q, (const scalar_t *)k_cache,
+          (const scalar_t *)v_cache, layout, paged, selected, n_selected, topk,
+          ratio, n_q_heads, n_kv_heads, scale, flashinfer_layout,
+          (scalar_t *)out);
+    });
+    return;
+  }
+#endif
   const dim3 grid(layout.n_tokens, n_kv_heads, splits);
   Q4_DISPATCH_HALF(dtype, {
     q4_qsa_attention_kernel<scalar_t><<<grid, Q4_ATTN_WARPS * 32, 0, s>>>(
