@@ -544,17 +544,7 @@ impl QsaAttention {
         let half_rot = self.rotary_emb_half_dim();
         let aux_width = aux_dim(&self.qsa, half_rot);
         // The indexer state rides along as an extra key head so it batches and truncates with the cache
-        let aux = Tensor::cat(
-            &[
-                raw_key.contiguous()?,
-                cos_sin.0.to_dtype(k.dtype())?,
-                cos_sin.1.to_dtype(k.dtype())?,
-            ],
-            D::Minus1,
-        )?
-        .pad_with_zeros(D::Minus1, 0, self.head_dim - aux_width)?
-        .unsqueeze(1)?;
-        let k_all = Tensor::cat(&[k.clone(), aux], 1)?.contiguous()?;
+        let k_all = self.pack_keys(k, raw_key, cos_sin, aux_width)?;
         let v = v.transpose(1, 2)?.contiguous()?;
         let (cache_k, cache_v) = kv_cache.append(&k_all, &v)?;
         let keys = cache_k.narrow(1, 0, self.num_kv_heads)?.contiguous()?;
@@ -584,6 +574,31 @@ impl QsaAttention {
             }
         };
         y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))
+    }
+
+    /// `k` with the aux head `[raw_key, cos, sin, 0..]` appended along the head axis.
+    fn pack_keys(
+        &self,
+        k: &Tensor,
+        raw_key: &Tensor,
+        cos_sin: &(Tensor, Tensor),
+        aux_width: usize,
+    ) -> Result<Tensor> {
+        #[cfg(feature = "rocm")]
+        if k.device().is_rocm() {
+            return crate::rocm::moe_glue::qsa_pack_keys(k, raw_key, &cos_sin.0, &cos_sin.1);
+        }
+        let aux = Tensor::cat(
+            &[
+                raw_key.contiguous()?,
+                cos_sin.0.to_dtype(k.dtype())?,
+                cos_sin.1.to_dtype(k.dtype())?,
+            ],
+            D::Minus1,
+        )?
+        .pad_with_zeros(D::Minus1, 0, self.head_dim - aux_width)?
+        .unsqueeze(1)?;
+        Tensor::cat(&[k.clone(), aux], 1)?.contiguous()
     }
 
     /// Additive `[b, 1, s, kv]` mask admitting each query's selected blocks and incomplete tail.
@@ -754,6 +769,33 @@ mod tests {
             .to_vec1::<f32>()?;
         // pairs (0, 2) rotate by 90 degrees, (1, 3) stay, dims 4.. pass through
         assert_eq!(out, [-2.0, 1.0, 0.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        Ok(())
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn rocm_qsa_pack_keys_matches_cat() -> Result<()> {
+        let rocm = Device::new_rocm(0)?;
+        let (b, heads, s, d, d_idx, half) = (2, 3, 5, 256, 128, 32);
+        let k = Tensor::randn(0f32, 1.0, (b, heads, s, d), &Device::Cpu)?.to_dtype(DType::BF16)?;
+        // raw_key as a strided narrow of a wider projection, like index_qk.
+        let wide = Tensor::randn(0f32, 1.0, (b, s, 3 * d_idx), &Device::Cpu)?.to_dtype(DType::BF16)?;
+        let cos = Tensor::randn(0f32, 1.0, (b, s, half), &Device::Cpu)?.to_dtype(DType::BF16)?;
+        let sin = Tensor::randn(0f32, 1.0, (b, s, half), &Device::Cpu)?.to_dtype(DType::BF16)?;
+        let aux = Tensor::cat(&[wide.narrow(D::Minus1, 2 * d_idx, d_idx)?, cos.clone(), sin.clone()], D::Minus1)?
+            .pad_with_zeros(D::Minus1, 0, d - d_idx - 2 * half)?
+            .unsqueeze(1)?;
+        let expected = Tensor::cat(&[k.clone(), aux], 1)?.to_dtype(DType::F32)?;
+        let got = crate::rocm::moe_glue::qsa_pack_keys(
+            &k.to_device(&rocm)?,
+            &wide.to_device(&rocm)?.narrow(D::Minus1, 2 * d_idx, d_idx)?,
+            &cos.to_device(&rocm)?,
+            &sin.to_device(&rocm)?,
+        )?
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?;
+        let diff = (got - expected)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert_eq!(diff, 0.0);
         Ok(())
     }
 

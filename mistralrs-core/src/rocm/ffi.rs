@@ -252,4 +252,7 @@ extern "C" {
     pub fn act_scaled_f32(x: *const c_void, out: *mut c_void, n: i64, scale: f32, kind: i32, stream: i64);
     pub fn act_scaled_f16(x: *const c_void, out: *mut c_void, n: i64, scale: f32, kind: i32, stream: i64);
     pub fn act_scaled_bf16(x: *const c_void, out: *mut c_void, n: i64, scale: f32, kind: i32, stream: i64);
+    pub fn qsa_pack_keys_f32(k: *const c_void, raw_key: *const c_void, cos: *const c_void, sin: *const c_void, out: *mut c_void, batch: i32, heads: i32, seq: i32, d: i32, d_idx: i32, half: i32, raw_stride: i64, cs_batch_stride: i64, stream: i64);
+    pub fn qsa_pack_keys_f16(k: *const c_void, raw_key: *const c_void, cos: *const c_void, sin: *const c_void, out: *mut c_void, batch: i32, heads: i32, seq: i32, d: i32, d_idx: i32, half: i32, raw_stride: i64, cs_batch_stride: i64, stream: i64);
+    pub fn qsa_pack_keys_bf16(k: *const c_void, raw_key: *const c_void, cos: *const c_void, sin: *const c_void, out: *mut c_void, batch: i32, heads: i32, seq: i32, d: i32, d_idx: i32, half: i32, raw_stride: i64, cs_batch_stride: i64, stream: i64);
 }

@@ -167,3 +167,56 @@ pub fn act_scaled(x: &Tensor, scale: f32, kind: i32) -> Result<Tensor> {
     }
     Ok(out)
 }
+
+/// QSA keys `k: [b, heads, s, d]` with the indexer's aux head appended as head `heads`:
+/// `[raw_key, cos, sin]` zero-padded to `d`. `raw_key: [b, s, d_idx]` may have strided rows;
+/// `cos`/`sin: [b or 1, s, half]`.
+pub fn qsa_pack_keys(k: &Tensor, raw_key: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let (b, heads, seq, d) = k.dims4()?;
+    let (_, _, d_idx) = raw_key.dims3()?;
+    let half = cos.dim(candle_core::D::Minus1)?;
+    if d_idx + 2 * half > d {
+        candle_core::bail!("qsa_pack_keys: aux width {} exceeds head dim {d}", d_idx + 2 * half);
+    }
+    let k = k.contiguous()?;
+    let dtype = k.dtype();
+    let raw_key = if raw_key.dtype() == dtype { raw_key.clone() } else { raw_key.to_dtype(dtype)? };
+    // Rows of raw_key must be evenly spaced with unit stride inside a row.
+    let raw_key = match raw_key.stride() {
+        [sb, ss, 1] if *sb == seq * *ss => raw_key,
+        _ => raw_key.contiguous()?,
+    };
+    let raw_stride = raw_key.stride()[1] as i64;
+    let cos = cos.to_dtype(dtype)?.contiguous()?;
+    let sin = sin.to_dtype(dtype)?.contiguous()?;
+    if cos.elem_count() != sin.elem_count() || cos.elem_count() % (seq * half) != 0 {
+        candle_core::bail!("qsa_pack_keys: cos/sin shapes {:?} {:?}", cos.shape(), sin.shape());
+    }
+    let cs_batch_stride = if cos.elem_count() == seq * half { 0 } else { (seq * half) as i64 };
+    let out = unsafe { Tensor::empty((b, heads + 1, seq, d), dtype, k.device()) }?;
+    let launch = match dtype {
+        DType::F32 => crate::rocm::ffi::qsa_pack_keys_f32,
+        DType::F16 => crate::rocm::ffi::qsa_pack_keys_f16,
+        DType::BF16 => crate::rocm::ffi::qsa_pack_keys_bf16,
+        dt => candle_core::bail!("qsa_pack_keys: unsupported dtype {dt:?}"),
+    };
+    unsafe {
+        launch(
+            half_or_f32_ptr(&k, "k")? as *const c_void,
+            half_or_f32_ptr(&raw_key, "raw_key")? as *const c_void,
+            half_or_f32_ptr(&cos, "cos")? as *const c_void,
+            half_or_f32_ptr(&sin, "sin")? as *const c_void,
+            half_or_f32_ptr(&out, "out")? as *mut c_void,
+            b as i32,
+            heads as i32,
+            seq as i32,
+            d as i32,
+            d_idx as i32,
+            half as i32,
+            raw_stride,
+            cs_batch_stride,
+            stream(&k)?,
+        );
+    }
+    Ok(out)
+}

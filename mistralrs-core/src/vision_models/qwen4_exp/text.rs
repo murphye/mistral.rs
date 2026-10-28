@@ -789,7 +789,7 @@ impl Qwen4ExpTextModel {
             .cloned()
             .ok_or_else(|| candle_core::Error::msg("Qwen4-Exp requires recurrent metadata"))?;
         let packed_layout = packed_gdn_layout(&xs, ctx)?;
-        let cos_sin = self.rotary_emb.compute_cos_sin(position_ids, xs.dtype())?;
+        let mut cos_sin = self.rotary_emb.compute_cos_sin(position_ids, xs.dtype())?;
         let attention_mask = DeviceMappedMask::new(attention_mask.clone(), &*self.mapper)?;
 
         let (batch, seq_len, _) = xs.dims3()?;
@@ -952,6 +952,10 @@ impl Qwen4ExpTextModel {
                     else {
                         candle_core::bail!("Hybrid cache layer {i} is not an attention cache");
                     };
+                    // Move the rotary tables to each device once per step, not once per layer.
+                    if !cos_sin.0.device().same_device(h.device()) {
+                        cos_sin = (cos_sin.0.to_device(h.device())?, cos_sin.1.to_device(h.device())?);
+                    }
                     attn.forward(
                         &h,
                         &attention_mask.get(h.device()),

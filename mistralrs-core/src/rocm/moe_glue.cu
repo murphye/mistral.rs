@@ -170,3 +170,56 @@ __global__ void act_scaled_kernel(const T *__restrict__ x, T *__restrict__ out, 
 ACT_SCALED_OP(float, f32)
 ACT_SCALED_OP(__half, f16)
 ACT_SCALED_OP(__nv_bfloat16, bf16)
+
+// QSA keys plus the indexer's aux head: out[b, h, t, :] = k[b, h, t, :] for h < heads, and
+// out[b, heads, t, :] = [raw_key[b, t, :d_idx], cos[b, t, :half], sin[b, t, :half], 0...].
+// k and out are contiguous; raw_key rows are `raw_stride` apart; cos/sin rows are
+// contiguous with `cs_batch_stride` (0 when broadcast) between batches.
+template <typename T>
+__global__ void qsa_pack_keys_kernel(const T *__restrict__ k, const T *__restrict__ raw_key,
+                                     const T *__restrict__ cos, const T *__restrict__ sin,
+                                     T *__restrict__ out, const int heads, const int seq,
+                                     const int d, const int d_idx, const int half,
+                                     const int64_t raw_stride, const int64_t cs_batch_stride,
+                                     const int64_t n) {
+  const int64_t stride = (int64_t)gridDim.x * blockDim.x;
+  for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+    const int j = (int)(i % d);
+    const int64_t row = i / d;
+    const int t = (int)(row % seq);
+    const int h = (int)((row / seq) % (heads + 1));
+    const int64_t b = row / seq / (heads + 1);
+    T value;
+    if (h < heads) {
+      value = k[((b * heads + h) * seq + t) * d + j];
+    } else if (j < d_idx) {
+      value = raw_key[(b * seq + t) * raw_stride + j];
+    } else if (j < d_idx + half) {
+      value = cos[b * cs_batch_stride + (int64_t)t * half + (j - d_idx)];
+    } else if (j < d_idx + 2 * half) {
+      value = sin[b * cs_batch_stride + (int64_t)t * half + (j - d_idx - half)];
+    } else {
+      value = from_float<T>(0.0f);
+    }
+    out[i] = value;
+  }
+}
+
+#define QSA_PACK_KEYS_OP(T, SUFFIX)                                                                \
+  extern "C" void qsa_pack_keys_##SUFFIX(const void *k, const void *raw_key, const void *cos,      \
+                                         const void *sin, void *out, int batch, int heads, int seq, \
+                                         int d, int d_idx, int half, int64_t raw_stride,           \
+                                         int64_t cs_batch_stride, int64_t stream) {                \
+    const int64_t n = (int64_t)batch * (heads + 1) * seq * d;                                      \
+    const int threads = 256;                                                                       \
+    const int64_t blocks = (n + threads - 1) / threads;                                            \
+    qsa_pack_keys_kernel<T><<<(unsigned)(blocks < 65535 ? blocks : 65535), threads, 0,             \
+                              (cudaStream_t)stream>>>((const T *)k, (const T *)raw_key,            \
+                                                      (const T *)cos, (const T *)sin, (T *)out,    \
+                                                      heads, seq, d, d_idx, half, raw_stride,      \
+                                                      cs_batch_stride, n);                         \
+  }
+
+QSA_PACK_KEYS_OP(float, f32)
+QSA_PACK_KEYS_OP(__half, f16)
+QSA_PACK_KEYS_OP(__nv_bfloat16, bf16)
