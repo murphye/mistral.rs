@@ -118,3 +118,32 @@ __global__ void rope_partial_neox_kernel(const T *__restrict__ x, const float *_
 ROPE_OP(float, f32)
 ROPE_OP(__half, f16)
 ROPE_OP(__nv_bfloat16, bf16)
+
+// out[t, h] = y[t, h] + sigmoid(gate[t]) * shared[t, h]: the gated shared
+// expert of Qwen MoE blocks. gate holds one logit per token.
+template <typename T>
+__global__ void add_sigmoid_gated_kernel(const T *__restrict__ y, const T *__restrict__ shared,
+                                         const T *__restrict__ gate, T *__restrict__ out,
+                                         const int64_t n, const int hidden) {
+  const int64_t stride = (int64_t)gridDim.x * blockDim.x;
+  for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+    const float g = 1.0f / (1.0f + expf(-to_float(gate[i / hidden])));
+    out[i] = from_float<T>(to_float(y[i]) + g * to_float(shared[i]));
+  }
+}
+
+#define GATED_ADD_OP(T, SUFFIX)                                                                \
+  extern "C" void add_sigmoid_gated_##SUFFIX(const void *y, const void *shared,                \
+                                             const void *gate, void *out, int64_t n,           \
+                                             int hidden, int64_t stream) {                     \
+    const int threads = 256;                                                                   \
+    const int64_t blocks = (n + threads - 1) / threads;                                        \
+    add_sigmoid_gated_kernel<T><<<(unsigned)(blocks < 65535 ? blocks : 65535), threads, 0,     \
+                                  (cudaStream_t)stream>>>((const T *)y, (const T *)shared,     \
+                                                          (const T *)gate, (T *)out, n,        \
+                                                          hidden);                             \
+  }
+
+GATED_ADD_OP(float, f32)
+GATED_ADD_OP(__half, f16)
+GATED_ADD_OP(__nv_bfloat16, bf16)

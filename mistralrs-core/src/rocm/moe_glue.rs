@@ -1,4 +1,4 @@
-//! Fused GLU activation, MoE top-k weighted sum and partial NeoX RoPE.
+//! Fused GLU activation, MoE combines and partial NeoX RoPE.
 
 use std::ffi::c_void;
 
@@ -105,6 +105,41 @@ pub fn rope_partial_neox(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tenso
             d as i32,
             half as i32,
             stream(&x)?,
+        );
+    }
+    Ok(out)
+}
+
+/// `y + sigmoid(gate) * shared` for `y`, `shared` of shape `[.., hidden]` and one
+/// gate logit per row, all in the same dtype.
+pub fn add_sigmoid_gated(y: &Tensor, shared: &Tensor, gate: &Tensor) -> Result<Tensor> {
+    let hidden = y.dim(candle_core::D::Minus1)?;
+    if y.shape() != shared.shape()
+        || gate.elem_count() * hidden != y.elem_count()
+        || y.dtype() != shared.dtype()
+        || y.dtype() != gate.dtype()
+    {
+        candle_core::bail!("add_sigmoid_gated: mismatched inputs {:?} {:?} {:?}", y.shape(), shared.shape(), gate.shape());
+    }
+    let y = y.contiguous()?;
+    let shared = shared.contiguous()?;
+    let gate = gate.contiguous()?;
+    let out = unsafe { Tensor::empty(y.shape(), y.dtype(), y.device()) }?;
+    let launch = match y.dtype() {
+        DType::F32 => crate::rocm::ffi::add_sigmoid_gated_f32,
+        DType::F16 => crate::rocm::ffi::add_sigmoid_gated_f16,
+        DType::BF16 => crate::rocm::ffi::add_sigmoid_gated_bf16,
+        dt => candle_core::bail!("add_sigmoid_gated: unsupported dtype {dt:?}"),
+    };
+    unsafe {
+        launch(
+            half_or_f32_ptr(&y, "y")? as *const c_void,
+            half_or_f32_ptr(&shared, "shared")? as *const c_void,
+            half_or_f32_ptr(&gate, "gate")? as *const c_void,
+            half_or_f32_ptr(&out, "out")? as *mut c_void,
+            y.elem_count() as i64,
+            hidden as i32,
+            stream(&y)?,
         );
     }
     Ok(out)

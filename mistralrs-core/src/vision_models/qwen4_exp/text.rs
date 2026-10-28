@@ -172,8 +172,19 @@ impl SparseMoeBlock {
             .experts
             .forward(xs, topk.values, &topk.indices)?
             .reshape((b_size, seq_len, hidden_dim))?;
-        let shared_gate = candle_nn::ops::sigmoid(&self.shared_expert_gate.forward(&xs_flat)?)?
-            .reshape((b_size, seq_len, 1))?;
+        let shared_logit = self.shared_expert_gate.forward(&xs_flat)?;
+        #[cfg(feature = "rocm")]
+        if xs.device().is_rocm() {
+            let shared_out = self.shared_expert.forward(xs)?;
+            if y.dtype() == shared_out.dtype() && shared_logit.dtype() == y.dtype() {
+                return crate::rocm::moe_glue::add_sigmoid_gated(&y, &shared_out, &shared_logit);
+            }
+            let shared_gate =
+                candle_nn::ops::sigmoid(&shared_logit)?.reshape((b_size, seq_len, 1))?;
+            return y + shared_out.broadcast_mul(&shared_gate)?;
+        }
+        let shared_gate =
+            candle_nn::ops::sigmoid(&shared_logit)?.reshape((b_size, seq_len, 1))?;
         let shared_out = self
             .shared_expert
             .forward(xs)?
