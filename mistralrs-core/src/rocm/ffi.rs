@@ -233,4 +233,11 @@ extern "C" {
         output_scale: f32,
         stream: i64,
     );
+
+    pub fn glu_act_mul_f32(gate: *const c_void, up: *const c_void, out: *mut c_void, n: i64, kind: i32, stream: i64);
+    pub fn glu_act_mul_f16(gate: *const c_void, up: *const c_void, out: *mut c_void, n: i64, kind: i32, stream: i64);
+    pub fn glu_act_mul_bf16(gate: *const c_void, up: *const c_void, out: *mut c_void, n: i64, kind: i32, stream: i64);
+    pub fn moe_weighted_reduce_f32(ys: *const c_void, weights: *const f32, out: *mut c_void, tokens: i32, top_k: i32, hidden: i32, stream: i64);
+    pub fn moe_weighted_reduce_f16(ys: *const c_void, weights: *const f32, out: *mut c_void, tokens: i32, top_k: i32, hidden: i32, stream: i64);
+    pub fn moe_weighted_reduce_bf16(ys: *const c_void, weights: *const f32, out: *mut c_void, tokens: i32, top_k: i32, hidden: i32, stream: i64);
 }

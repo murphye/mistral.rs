@@ -1356,7 +1356,7 @@ impl FastExpertsWeights {
                     .reshape((forward.shape.num_tokens, 1, forward.shape.hidden_dim))?;
             let gate = self.fused_gate_proj.gather_forward(&xs, forward.topk_ids)?;
             let up = self.fused_up_proj.gather_forward(&xs, forward.topk_ids)?;
-            let down_in = (up * gate.apply(&config.act)?)?;
+            let down_in = crate::ops::mul_and_act(&gate, &up, config.act)?;
             self.fused_down_proj.process_routed_stats(&down_in, ids)?;
             self.fused_down_proj
                 .gather_forward(&down_in, forward.topk_ids)?
@@ -2107,6 +2107,13 @@ mod nvfp4_tests {
 
 /// Sum `[tokens, top_k, hidden]` expert outputs weighted by `topk_weights` into `[tokens, hidden]`.
 fn topk_weight_reduce(ys: &Tensor, topk_weights: &Tensor, dtype: DType) -> Result<Tensor> {
+    #[cfg(feature = "rocm")]
+    if ys.device().is_rocm()
+        && topk_weights.dtype() == DType::F32
+        && matches!(ys.dtype(), DType::BF16 | DType::F16 | DType::F32)
+    {
+        return crate::rocm::moe_glue::moe_weighted_reduce(ys, topk_weights)?.to_dtype(dtype);
+    }
     #[cfg(feature = "metal")]
     if ys.device().is_metal() && matches!(ys.dtype(), DType::BF16 | DType::F16 | DType::F32) {
         let (tokens, top_k, hidden) = ys.dims3()?;

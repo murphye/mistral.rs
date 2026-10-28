@@ -1,0 +1,81 @@
+// Elementwise kernels that replace short chains of generic ops on ROCm: the
+// gated activation of GLU MLPs and the top-k weighted sum of MoE outputs.
+#include "cuda_bf16.h"
+#include "cuda_fp16.h"
+#include <stdint.h>
+
+template <typename T> __device__ __forceinline__ float to_float(T x) { return static_cast<float>(x); }
+template <> __device__ __forceinline__ float to_float<__half>(__half x) { return __half2float(x); }
+template <> __device__ __forceinline__ float to_float<__nv_bfloat16>(__nv_bfloat16 x) {
+  return __bfloat162float(x);
+}
+
+template <typename T> __device__ __forceinline__ T from_float(float x) { return static_cast<T>(x); }
+template <> __device__ __forceinline__ __half from_float<__half>(float x) { return __float2half(x); }
+template <> __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float x) {
+  return __float2bfloat16(x);
+}
+
+// Activation codes follow mistralrs_quant::GluActivationType.
+__device__ __forceinline__ float glu_activation(float x, int kind) {
+  switch (kind) {
+  case 0:
+    return x / (1.0f + expf(-x));
+  case 1:
+    return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
+  case 2:
+    return fmaxf(x, 0.0f);
+  case 3:
+    return 0.5f * x * (1.0f + erff(x * 0.7071067812f));
+  default:
+    return 1.0f / (1.0f + expf(-x));
+  }
+}
+
+// out = act(gate) * up, all contiguous with n elements.
+template <typename T>
+__global__ void glu_act_mul_kernel(const T *__restrict__ gate, const T *__restrict__ up,
+                                   T *__restrict__ out, const int64_t n, const int kind) {
+  const int64_t stride = (int64_t)gridDim.x * blockDim.x;
+  for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+    out[i] = from_float<T>(glu_activation(to_float(gate[i]), kind) * to_float(up[i]));
+  }
+}
+
+// out[t, h] = sum_k ys[t, k, h] * weights[t, k], accumulated in f32.
+template <typename T>
+__global__ void moe_weighted_reduce_kernel(const T *__restrict__ ys, const float *__restrict__ weights,
+                                           T *__restrict__ out, const int top_k, const int hidden) {
+  const int t = blockIdx.y;
+  const T *row = ys + (int64_t)t * top_k * hidden;
+  const float *w = weights + (int64_t)t * top_k;
+  for (int h = blockIdx.x * blockDim.x + threadIdx.x; h < hidden; h += gridDim.x * blockDim.x) {
+    float acc = 0.0f;
+    for (int k = 0; k < top_k; k++) {
+      acc += to_float(row[(int64_t)k * hidden + h]) * w[k];
+    }
+    out[(int64_t)t * hidden + h] = from_float<T>(acc);
+  }
+}
+
+#define GLUE_OPS(T, SUFFIX)                                                                     \
+  extern "C" void glu_act_mul_##SUFFIX(const void *gate, const void *up, void *out, int64_t n, \
+                                       int kind, int64_t stream) {                             \
+    const int threads = 256;                                                                   \
+    const int64_t blocks = (n + threads - 1) / threads;                                        \
+    glu_act_mul_kernel<T><<<(unsigned)(blocks < 65535 ? blocks : 65535), threads, 0,           \
+                            (cudaStream_t)stream>>>((const T *)gate, (const T *)up, (T *)out,  \
+                                                    n, kind);                                  \
+  }                                                                                            \
+  extern "C" void moe_weighted_reduce_##SUFFIX(const void *ys, const float *weights, void *out, \
+                                               int tokens, int top_k, int hidden,              \
+                                               int64_t stream) {                               \
+    const int threads = 256;                                                                   \
+    dim3 grid((hidden + threads - 1) / threads, tokens, 1);                                    \
+    moe_weighted_reduce_kernel<T><<<grid, threads, 0, (cudaStream_t)stream>>>(                 \
+        (const T *)ys, weights, (T *)out, top_k, hidden);                                      \
+  }
+
+GLUE_OPS(float, f32)
+GLUE_OPS(__half, f16)
+GLUE_OPS(__nv_bfloat16, bf16)

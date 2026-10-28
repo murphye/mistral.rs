@@ -246,6 +246,7 @@ const ROCM_SOURCES: &[&str] = &[
     "src/cuda/gdn.cu",
     "src/cuda/moe_router.cu",
     "src/cuda/qwen4_exp.cu",
+    "src/rocm/moe_glue.cu",
 ];
 
 /// Compiles `ROCM_SOURCES` with hipcc into a static library, using
@@ -257,6 +258,7 @@ fn build_rocm_kernels() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/cuda");
+    println!("cargo:rerun-if-changed=src/rocm");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     let rocm_path =
         PathBuf::from(std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into()));

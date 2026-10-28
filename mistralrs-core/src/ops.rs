@@ -6927,6 +6927,16 @@ pub enum GatedActivationOrder {
 }
 
 pub fn mul_and_act(a: &Tensor, b: &Tensor, act: Activation) -> Result<Tensor> {
+    #[cfg(feature = "rocm")]
+    if a.device().is_rocm()
+        && matches!(a.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        && a.dtype() == b.dtype()
+        && a.shape() == b.shape()
+    {
+        if let Some(activation_type) = glu_activation_type(act) {
+            return crate::rocm::moe_glue::glu_act_mul(a, b, activation_type as i32);
+        }
+    }
     // Check if we can use the fused kernel (works on CUDA, Metal, and CPU)
     if matches!(a.dtype(), DType::F16 | DType::BF16 | DType::F32) && a.dtype() == b.dtype() {
         if let Some(activation_type) = glu_activation_type(act) {
