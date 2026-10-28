@@ -12,7 +12,11 @@ use candle_core::{
 fn supported(dtype: GgmlDType) -> bool {
     matches!(
         dtype,
-        GgmlDType::Q8_0
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
             | GgmlDType::Q2K
             | GgmlDType::Q3K
             | GgmlDType::Q4K
