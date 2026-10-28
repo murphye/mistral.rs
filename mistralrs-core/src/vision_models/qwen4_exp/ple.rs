@@ -865,7 +865,6 @@ pub(super) struct PleState<'a> {
 pub(super) struct PleBatch<'a> {
     pub seqs: &'a [(usize, usize)],
 #[cfg(any(feature = "cuda", feature = "rocm"))]
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub layout: Option<&'a super::kernels::TokenLayout>,
 }
 
@@ -1021,6 +1020,21 @@ impl PleLayer {
         if let Some(out) = conv_inputs_out {
             *out = Some(normed.clone());
         }
+        // Host-gathered rows still take the fused conv when the device runs the kernels.
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        if let (true, Some(layout)) = (super::kernel_device(flat.device()), batch.layout) {
+            let out = super::kernels::ple_conv(super::kernels::PleConvArgs {
+                normed: &normed,
+                gated: &gated,
+                residual: &flat,
+                weight: &self.conv_weight,
+                state_pool: state.conv,
+                slots: state.slots,
+                layout,
+                dilation: self.cfg.conv_dilation(),
+            })?;
+            return out.reshape(dims);
+        }
         let out = self.conv_host(&flat, &gated, &normed, state, batch.seqs)?;
         out.reshape(dims)
     }
@@ -1029,13 +1043,13 @@ impl PleLayer {
     fn gate(&self, emb: &Tensor, flat: &Tensor) -> Result<(Tensor, Tensor)> {
         let key = self.key_proj.forward(emb)?;
         let value = self.value_proj.forward(emb)?;
-        #[cfg(feature = "cuda")]
-        if flat.device().is_cuda() {
-            return crate::cuda::qwen4_exp::ple_gate(
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        if super::kernel_device(flat.device()) {
+            return super::kernels::ple_gate(
                 &key,
                 flat,
                 &value,
-                crate::cuda::qwen4_exp::PleGateWeights {
+                super::kernels::PleGateWeights {
                     key: &self.norm_key,
                     query: &self.norm_query,
                     conv: &self.norm_conv,
