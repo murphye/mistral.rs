@@ -242,7 +242,11 @@ fn main() {
 
 /// CUDA kernels from `src/cuda` that the ROCm backend uses.
 #[cfg(all(feature = "rocm", not(feature = "cuda")))]
-const ROCM_SOURCES: &[&str] = &["src/cuda/gdn.cu", "src/cuda/qwen4_exp.cu"];
+const ROCM_SOURCES: &[&str] = &[
+    "src/cuda/gdn.cu",
+    "src/cuda/moe_router.cu",
+    "src/cuda/qwen4_exp.cu",
+];
 
 /// Compiles `ROCM_SOURCES` with hipcc into a static library, using
 /// candle-rocm-kernels' CUDA compatibility headers and target list.

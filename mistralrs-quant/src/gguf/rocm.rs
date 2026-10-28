@@ -1,7 +1,7 @@
 //! ROCm implementation of indexed MoE forward for GGUF quantized weights.
 //!
-//! Uses candle's fused q8_1 indexed MoE kernel, which reads only the selected
-//! experts, instead of dequantizing every expert as the generic path does.
+//! Uses candle's indexed MoE kernels, which read only the selected experts,
+//! instead of dequantizing every expert as the generic path does.
 
 use candle_core::{
     quantized::{GgmlDType, QMatMul},
@@ -66,18 +66,12 @@ pub fn rocm_indexed_moe_forward(
         }
         _ => return Ok(None),
     };
-    let original_dtype = x.dtype();
-    // The kernel reads f32 activations and u32 ids from the start of their buffers.
-    let x3 = if x3.dtype() == DType::F32 {
-        x3.copy()?
-    } else {
-        x3.to_dtype(DType::F32)?
+    // The kernel takes f32/f16/bf16 activations and returns their dtype.
+    let x3 = match x3.dtype() {
+        DType::F32 | DType::F16 | DType::BF16 => x3.contiguous()?,
+        _ => x3.to_dtype(DType::F32)?,
     };
-    let ids2 = if ids2.dtype() == DType::U32 {
-        ids2.copy()?
-    } else {
-        ids2.to_dtype(DType::U32)?
-    };
+    let ids2 = ids2.to_dtype(DType::U32)?.contiguous()?;
     let out = qtensor.indexed_moe_forward(&x3, &ids2)?;
     let out = match restore {
         Some((b, s)) => {
@@ -86,5 +80,5 @@ pub fn rocm_indexed_moe_forward(
         }
         None => out,
     };
-    Ok(Some(out.to_dtype(original_dtype)?))
+    Ok(Some(out.to_dtype(x.dtype())?))
 }

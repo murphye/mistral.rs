@@ -7,6 +7,7 @@ use candle_core::{DType, Result, Tensor};
 
 use crate::cuda::gdn::{FusedDecodeRecurrence, GdnStateSlots, RecurrenceInputs};
 use crate::kv_cache::RecurrentStateLayout;
+use crate::rocm::rocm_ptr;
 use crate::gdn::GdnGateActivation;
 
 // Must match the state dtype codes in gdn.cu.
@@ -518,14 +519,6 @@ const GDN_DECODE_MAX_K: usize = 256;
 /// NVIDIA-specific cooperative and pipelined variants.
 const GDN_DECODE_KERNEL_BASELINE: i32 = 0;
 
-fn rocm_ptr<T: candle_core::rocm_backend::RocmDType>(t: &Tensor, name: &str) -> Result<u64> {
-    let (s, l) = t.storage_and_layout();
-    let s = match &*s {
-        candle_core::Storage::Rocm(c) => c.as_rocm_slice::<T>()?,
-        _ => candle_core::bail!("{name} must be a rocm tensor"),
-    };
-    Ok(s.slice(l.start_offset()..).device_ptr())
-}
 
 /// Single-token GDN step from the convolved projections: gating, L2 norm and the
 /// key-major recurrence in one kernel. Returns `[BH, 1, V]` in the input dtype.

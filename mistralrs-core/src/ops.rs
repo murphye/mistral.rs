@@ -230,9 +230,9 @@ pub enum MoeRouterScoreFunction {
     Sigmoid,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 impl MoeRouterScoreFunction {
-    const fn as_i32(self) -> i32 {
+    pub(crate) const fn as_i32(self) -> i32 {
         match self {
             Self::Raw => 0,
             Self::Softmax => 1,
@@ -249,9 +249,9 @@ pub enum MoeRouterSelectedWeight {
     Sigmoid,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 impl MoeRouterSelectedWeight {
-    const fn as_i32(self) -> i32 {
+    pub(crate) const fn as_i32(self) -> i32 {
         match self {
             Self::Score => 0,
             Self::Softmax => 1,
@@ -282,6 +282,21 @@ pub fn moe_router_topk(
         cuda_moe_router_topk_if_supported(logits, config, selection_bias, expert_scale)?
     {
         return Ok(topk);
+    }
+
+    #[cfg(feature = "rocm")]
+    if logits.device().is_rocm()
+        && logits
+            .dims()
+            .last()
+            .is_some_and(|&n| cuda_moe_router_topk_supports_experts(n))
+    {
+        return crate::rocm::moe_router::moe_router_topk_rocm(
+            logits,
+            config,
+            selection_bias,
+            expert_scale,
+        );
     }
 
     let logits = logits.to_dtype(DType::F32)?;
@@ -343,13 +358,13 @@ pub fn moe_router_topk(
     Ok(TopKOutput { values, indices })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 const MOE_ROUTER_MAX_POWER_OF_TWO_EXPERTS: usize = 512;
 
-#[cfg(feature = "cuda")]
-const MOE_ROUTER_EXTRA_EXPERT_COUNTS: &[usize] = &[576];
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+const MOE_ROUTER_EXTRA_EXPERT_COUNTS: &[usize] = &[288, 576];
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn cuda_moe_router_topk_supports_experts(n_experts: usize) -> bool {
     (n_experts.is_power_of_two() && n_experts <= MOE_ROUTER_MAX_POWER_OF_TWO_EXPERTS)
         || MOE_ROUTER_EXTRA_EXPERT_COUNTS.contains(&n_experts)
