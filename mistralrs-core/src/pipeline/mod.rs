@@ -2080,10 +2080,14 @@ pub trait Pipeline:
 
                     let preserve_causal_generation = input_seqs.len() > 1
                         && !return_raw_logits
-                        && self.device().is_cuda()
-                        && ((self.supports_batched_cuda_sampling()
-                            && sampling::can_sample_batch_cuda(input_seqs))
-                            || crate::speculative::verifier::can_batch_device_verify(input_seqs));
+                        && ((self.device().is_cuda()
+                            && ((self.supports_batched_cuda_sampling()
+                                && sampling::can_sample_batch_cuda(input_seqs))
+                                || crate::speculative::verifier::can_batch_device_verify(
+                                    input_seqs,
+                                )))
+                            || (self.device().is_rocm()
+                                && sampling::can_sample_batch_rocm(input_seqs)));
                     let start = Instant::now();
                     let raw_logits = self
                         .forward_inputs(inputs, return_raw_logits)?
@@ -2580,7 +2584,7 @@ pub trait Pipeline:
                             seq_indices,
                         } = inputs.map_err(candle_core::Error::msg)?;
 
-                        let preserve_causal_generation = (input_seqs.len() > 1
+                        let preserve_causal_generation = ((input_seqs.len() > 1
                             || cuda_decode_lookahead)
                             && !return_raw_logits
                             && self.device().is_cuda()
@@ -2588,7 +2592,11 @@ pub trait Pipeline:
                                 && sampling::can_sample_batch_cuda(input_seqs))
                                 || crate::speculative::verifier::can_batch_device_verify(
                                     input_seqs,
-                                ));
+                                )))
+                            || (input_seqs.len() > 1
+                                && !return_raw_logits
+                                && self.device().is_rocm()
+                                && sampling::can_sample_batch_rocm(input_seqs));
                         if self.cache().is_hybrid() {
                             let mut hybrid_cache = self.cache().hybrid();
                             let sequence_slots = seq_indices

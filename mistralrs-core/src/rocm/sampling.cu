@@ -20,3 +20,25 @@
 TOPK_PACKED(float, f32)
 TOPK_PACKED(__half, f16)
 TOPK_PACKED(__nv_bfloat16, bf16)
+
+// One row per sequence, each with its own inverse temperature.
+#define TOPK_PACKED_BATCHED(T, SUFFIX)                                                            \
+  extern "C" void topk_large_packed_batched_##SUFFIX(                                             \
+      const void *input, const float *inv_temperatures, float *block_values,                      \
+      uint32_t *block_indices, float *block_maxes, float *block_sums, float *packed_out,           \
+      int nrows, int ncols, int k, int chunk_size, int nblocks, int64_t stream) {                 \
+    constexpr int block_size = 256;                                                               \
+    const size_t stage1_smem = static_cast<size_t>(chunk_size) * sizeof(bool);                   \
+    const size_t stage2_smem = static_cast<size_t>(nblocks) * static_cast<size_t>(k) * sizeof(bool); \
+    topk_large_stage1<T, true, true><<<dim3(nblocks, nrows), block_size, stage1_smem,             \
+                                       (cudaStream_t)stream>>>(                                   \
+        (const T *)input, block_values, block_indices, block_maxes, block_sums, ncols, k,         \
+        chunk_size, inv_temperatures, 0.0f);                                                      \
+    topk_large_stage2_f32_packed<true, true><<<nrows, block_size, stage2_smem,                    \
+                                               (cudaStream_t)stream>>>(                           \
+        block_values, block_indices, block_maxes, block_sums, packed_out, nblocks, k);            \
+  }
+
+TOPK_PACKED_BATCHED(float, f32)
+TOPK_PACKED_BATCHED(__half, f16)
+TOPK_PACKED_BATCHED(__nv_bfloat16, bf16)

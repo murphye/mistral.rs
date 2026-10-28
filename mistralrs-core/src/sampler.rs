@@ -1666,8 +1666,22 @@ impl Sampler {
 
     /// Samples from a device top-k packed as `[values(k), indices(k), softmax_denominator,
     /// global_max]`, applying top-p and min-p to the k candidates.
+    /// `(top_k, temperature)` when this sampler can take the batched ROCm top-k path:
+    /// temperature sampling with 1..=128 candidates and nothing applied to the full logits.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn rocm_topk_plan(&self, return_logprobs: bool) -> Option<(usize, f64)> {
+        let no_penalties = self.frequency_penalty.unwrap_or(0.0) == 0.0
+            && self.presence_penalty.unwrap_or(0.0) == 0.0
+            && self.repetition_penalty.unwrap_or(1.0) == 1.0;
+        let temperature = self.temperature?;
+        (no_penalties
+            && self.can_sample_topk_on_device(return_logprobs, false, false, false)
+            && self.top_k as usize <= crate::rocm::sampling::MAX_K)
+            .then_some((self.top_k as usize, temperature))
+    }
+
     #[cfg(any(feature = "metal", feature = "rocm"))]
-    fn sample_packed_topk(
+    pub(crate) fn sample_packed_topk(
         &self,
         packed: &[f32],
         k: usize,

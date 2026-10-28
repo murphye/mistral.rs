@@ -804,7 +804,12 @@ async fn sample_and_add_toks_inner(
     let max_model_len = metadata.max_seq_len;
     let eos_toks = metadata.eos_tok.clone();
 
-    let sampled_vec = match try_sample_batch_cuda(&logits, seqs, &rng)? {
+    let mut batched = try_sample_batch_cuda(&logits, seqs, &rng)?;
+    #[cfg(feature = "rocm")]
+    if batched.is_none() {
+        batched = try_sample_batch_rocm(&logits, seqs, &rng)?;
+    }
+    let sampled_vec = match batched {
         Some(sampled) => sampled,
         None => {
             let logits_seq = logits.into_cpu_rows()?;
@@ -1381,6 +1386,84 @@ fn try_sample_batch_cuda(
     _rng: &Arc<std::sync::Mutex<Isaac64Rng>>,
 ) -> Result<Option<Vec<Result<Logprobs>>>> {
     Ok(None)
+}
+
+/// Whether every sequence of a decode batch can be sampled by [`try_sample_batch_rocm`],
+/// so the batch's logits can stay on the device.
+pub(crate) fn can_sample_batch_rocm(seqs: &[&mut Sequence]) -> bool {
+    #[cfg(feature = "rocm")]
+    {
+        !seqs.is_empty()
+            && seqs.iter().all(|seq| {
+                matches!(&seq.recognizer, SequenceRecognizer::None)
+                    && seq.tool_call_state.is_none()
+                    && seq.sampler().rocm_topk_plan(seq.return_logprobs()).is_some()
+            })
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = seqs;
+        false
+    }
+}
+
+/// Top-k sampling of a whole batch on a ROCm device: one launch over all rows and one
+/// small read back, instead of copying every row's full logits to the host.
+#[cfg(feature = "rocm")]
+fn try_sample_batch_rocm(
+    logits: &CausalLogitsBatch,
+    seqs: &[&mut Sequence],
+    rng: &Arc<std::sync::Mutex<Isaac64Rng>>,
+) -> Result<Option<Vec<Result<Logprobs>>>> {
+    if seqs.len() < 2 || !can_sample_batch_rocm(seqs) {
+        return Ok(None);
+    }
+    let logits = match logits {
+        CausalLogitsBatch::PerSequence(logits) => {
+            if logits.len() != seqs.len() || logits.iter().any(|l| !l.device().is_rocm()) {
+                return Ok(None);
+            }
+            stack_final_logits(logits)?
+        }
+        CausalLogitsBatch::Batched(logits) => {
+            if logits.dim(0)? != seqs.len() || !logits.device().is_rocm() {
+                return Ok(None);
+            }
+            let dims = logits.dims();
+            logits
+                .contiguous()?
+                .reshape((dims[0], dims[dims.len() - 1]))?
+        }
+    };
+    let plans = seqs
+        .iter()
+        .map(|seq| {
+            seq.sampler()
+                .rocm_topk_plan(seq.return_logprobs())
+                .expect("checked by can_sample_batch_rocm")
+        })
+        .collect::<Vec<_>>();
+    let common_k = plans.iter().map(|(k, _)| *k).max().expect("batch is non-empty");
+    let inv_t = plans
+        .iter()
+        .map(|(_, t)| (1.0 / t) as f32)
+        .collect::<Vec<_>>();
+    let packed = crate::rocm::sampling::topk_logits_packed_batched(&logits, common_k, &inv_t)?;
+    let k_out = packed[0].len().saturating_sub(2) / 2;
+    Ok(Some(
+        std::iter::zip(std::iter::zip(packed, plans), seqs.iter())
+            .map(|((row, (k, temperature)), seq)| {
+                // Rows are sorted, so a smaller k is a prefix of the common one.
+                let k = k.min(k_out);
+                let mut own = Vec::with_capacity(2 * k + 2);
+                own.extend_from_slice(&row[..k]);
+                own.extend_from_slice(&row[k_out..k_out + k]);
+                own.extend_from_slice(&row[2 * k_out..2 * k_out + 2]);
+                seq.sampler()
+                    .sample_packed_topk(&own, k, temperature, seq.sampling_rng(rng))
+            })
+            .collect(),
+    ))
 }
 
 /// Async sample optionally adding to trie.

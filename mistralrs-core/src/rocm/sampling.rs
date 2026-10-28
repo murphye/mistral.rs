@@ -62,6 +62,63 @@ pub fn topk_logits_packed(logits: &Tensor, k: usize, temperature: f64) -> Result
     packed.to_vec1::<f32>()
 }
 
+/// [`topk_logits_packed`] for every row of `logits: [rows, vocab]`, each at its own inverse
+/// temperature, with one launch and one read back.
+pub fn topk_logits_packed_batched(
+    logits: &Tensor,
+    k: usize,
+    inv_temperatures: &[f32],
+) -> Result<Vec<Vec<f32>>> {
+    let (rows, ncols) = logits.dims2()?;
+    let logits = logits.contiguous()?;
+    let k = k.min(ncols);
+    if k == 0 || k > MAX_K || inv_temperatures.len() != rows {
+        candle_core::bail!("topk_logits_packed_batched: k={k}, {rows} rows, {} temperatures", inv_temperatures.len());
+    }
+    let nblocks = ncols.div_ceil(CHUNK_SIZE);
+    let device = logits.device();
+    let inv_t = Tensor::from_slice(inv_temperatures, rows, device)?;
+    let block_values = unsafe { Tensor::empty(rows * nblocks * k, DType::F32, device) }?;
+    let block_indices = unsafe { Tensor::empty(rows * nblocks * k, DType::U32, device) }?;
+    let block_maxes = unsafe { Tensor::empty(rows * nblocks, DType::F32, device) }?;
+    let block_sums = unsafe { Tensor::empty(rows * nblocks, DType::F32, device) }?;
+    let packed = unsafe { Tensor::empty((rows, 2 * k + 2), DType::F32, device) }?;
+    let (input, launch) = match logits.dtype() {
+        DType::F32 => (
+            rocm_ptr::<f32>(&logits, "logits")?,
+            crate::rocm::ffi::topk_large_packed_batched_f32
+                as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _, _, _, _, _),
+        ),
+        DType::F16 => (
+            rocm_ptr::<half::f16>(&logits, "logits")?,
+            crate::rocm::ffi::topk_large_packed_batched_f16 as _,
+        ),
+        DType::BF16 => (
+            rocm_ptr::<half::bf16>(&logits, "logits")?,
+            crate::rocm::ffi::topk_large_packed_batched_bf16 as _,
+        ),
+        dt => candle_core::bail!("topk_logits_packed_batched: unsupported dtype {dt:?}"),
+    };
+    unsafe {
+        launch(
+            input as *const c_void,
+            rocm_ptr::<f32>(&inv_t, "inv_temperatures")? as *const f32,
+            rocm_ptr::<f32>(&block_values, "block_values")? as *mut f32,
+            rocm_ptr::<u32>(&block_indices, "block_indices")? as *mut u32,
+            rocm_ptr::<f32>(&block_maxes, "block_maxes")? as *mut f32,
+            rocm_ptr::<f32>(&block_sums, "block_sums")? as *mut f32,
+            rocm_ptr::<f32>(&packed, "packed")? as *mut f32,
+            rows as i32,
+            ncols as i32,
+            k as i32,
+            CHUNK_SIZE as i32,
+            nblocks as i32,
+            device.as_rocm_device()?.hip_stream().raw() as i64,
+        );
+    }
+    packed.to_vec2::<f32>()
+}
+
 #[cfg(test)]
 mod tests {
     use candle_core::{Device, Tensor};
