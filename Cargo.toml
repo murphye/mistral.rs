@@ -37,16 +37,16 @@ rust-version = "1.94"
 # candle-metal-kernels = { version = "0.11.0" }
 # ROCm support lives on the rocm-backend branch of murphye/candle. To develop
 # against a sibling checkout instead, swap in the path dependencies below.
-# candle-core = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "e9192709eeb71c938717489e73785f34057a89b4" }
-# candle-nn = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "e9192709eeb71c938717489e73785f34057a89b4" }
-# candle-flash-attn-v3 = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "e9192709eeb71c938717489e73785f34057a89b4" }
-# candle-metal-kernels = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "e9192709eeb71c938717489e73785f34057a89b4" }
-# candle-rocm-kernels = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "e9192709eeb71c938717489e73785f34057a89b4" }
-candle-core = { path = "../candle/candle-core", version = "0.11.0" }
-candle-nn = { path = "../candle/candle-nn", version = "0.11.0" }
-candle-flash-attn-v3 = { path = "../candle/candle-flash-attn-v3", version = "0.11.0" }
-candle-metal-kernels = { path = "../candle/candle-metal-kernels", version = "0.11.0" }
-candle-rocm-kernels = { path = "../candle/candle-rocm-kernels", version = "0.11.0" }
+candle-core = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "5a8b84bb4472685fe85d9544490a0f2af8669a3c" }
+candle-nn = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "5a8b84bb4472685fe85d9544490a0f2af8669a3c" }
+candle-flash-attn-v3 = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "5a8b84bb4472685fe85d9544490a0f2af8669a3c" }
+candle-metal-kernels = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "5a8b84bb4472685fe85d9544490a0f2af8669a3c" }
+candle-rocm-kernels = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "5a8b84bb4472685fe85d9544490a0f2af8669a3c" }
+# candle-core = { path = "../candle/candle-core", version = "0.11.0" }
+# candle-nn = { path = "../candle/candle-nn", version = "0.11.0" }
+# candle-flash-attn-v3 = { path = "../candle/candle-flash-attn-v3", version = "0.11.0" }
+# candle-metal-kernels = { path = "../candle/candle-metal-kernels", version = "0.11.0" }
+# candle-rocm-kernels = { path = "../candle/candle-rocm-kernels", version = "0.11.0" }
 # candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.11.0", rev = "66a8cf184a5a519671454066b1b9efd446ec9f5c" }
 # candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.11.0", rev = "66a8cf184a5a519671454066b1b9efd446ec9f5c" }
 # candle-flash-attn-v3 = { git = "https://github.com/huggingface/candle.git", version = "0.11.0", rev = "66a8cf184a5a519671454066b1b9efd446ec9f5c" }
