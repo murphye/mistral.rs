@@ -1337,7 +1337,7 @@ impl Sampler {
         })
     }
 
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
     fn can_sample_topk_on_device(
         &self,
         return_logprobs: bool,
@@ -1649,10 +1649,34 @@ impl Sampler {
     ) -> Result<Logprobs> {
         let topk = crate::ops::metal_topk_logits_packed(&logits, self.top_k as usize, temperature)?;
         let packed = topk.packed.to_vec1::<f32>()?;
-        let k = topk.k;
+        self.sample_packed_topk(&packed, topk.k, temperature, rng)
+    }
+
+    #[cfg(feature = "rocm")]
+    fn sample_topk_on_device_rocm(
+        &self,
+        logits: Tensor,
+        temperature: f64,
+        rng: Arc<Mutex<Isaac64Rng>>,
+    ) -> Result<Logprobs> {
+        let k = (self.top_k as usize).min(logits.elem_count());
+        let packed = crate::rocm::sampling::topk_logits_packed(&logits, k, temperature)?;
+        self.sample_packed_topk(&packed, k, temperature, rng)
+    }
+
+    /// Samples from a device top-k packed as `[values(k), indices(k), softmax_denominator,
+    /// global_max]`, applying top-p and min-p to the k candidates.
+    #[cfg(any(feature = "metal", feature = "rocm"))]
+    fn sample_packed_topk(
+        &self,
+        packed: &[f32],
+        k: usize,
+        temperature: f64,
+        rng: Arc<Mutex<Isaac64Rng>>,
+    ) -> Result<Logprobs> {
         if packed.len() != 2 * k + 2 {
             candle_core::bail!(
-                "invalid Metal top-k packed output length {}, expected {}",
+                "invalid device top-k packed output length {}, expected {}",
                 packed.len(),
                 2 * k + 2
             );
@@ -1666,7 +1690,7 @@ impl Sampler {
         let denom = softmax_info[0];
         let global_max = softmax_info[1];
         if denom <= 0.0 || !denom.is_finite() || !global_max.is_finite() {
-            candle_core::bail!("invalid Metal top-k softmax normalizer");
+            candle_core::bail!("invalid device top-k softmax normalizer");
         }
 
         let inv_temperature = (1.0 / temperature) as f32;
@@ -1707,12 +1731,12 @@ impl Sampler {
                     .sum();
                 if positive_weight_sum == 0.0 {
                     return Err(Error::Msg(
-                        "All sampling probabilities are zero after Metal top-k filtering."
+                        "All sampling probabilities are zero after device top-k filtering."
                             .to_string(),
                     ));
                 }
                 return Err(Error::Msg(format!(
-                    "Failed to construct Metal top-k multinomial sampler: {e}"
+                    "Failed to construct device top-k multinomial sampler: {e}"
                 )));
             }
         };
@@ -2178,6 +2202,25 @@ impl Sampler {
                 let logits = self
                     .apply_device_sparse_penalties_if_needed_metal(logits, context, prompt_len)?;
                 return self.sample_topk_on_device_metal(logits, temperature, rng);
+            }
+        }
+
+        // Penalties are applied on the host, so the device path only covers unpenalized sampling.
+        #[cfg(feature = "rocm")]
+        if logits.device().is_rocm()
+            && self.frequency_penalty.unwrap_or(0.0) == 0.0
+            && self.presence_penalty.unwrap_or(0.0) == 0.0
+            && self.repetition_penalty.unwrap_or(1.0) == 1.0
+            && self.can_sample_topk_on_device(
+                return_logprobs,
+                sample_speculative,
+                multiple_sequences,
+                false,
+            )
+            && self.top_k as usize <= crate::rocm::sampling::MAX_K
+        {
+            if let Some(temperature) = self.temperature {
+                return self.sample_topk_on_device_rocm(logits, temperature, rng);
             }
         }
 

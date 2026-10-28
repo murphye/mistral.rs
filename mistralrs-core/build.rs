@@ -247,6 +247,7 @@ const ROCM_SOURCES: &[&str] = &[
     "src/cuda/moe_router.cu",
     "src/cuda/qwen4_exp.cu",
     "src/rocm/moe_glue.cu",
+    "src/rocm/sampling.cu",
 ];
 
 /// Compiles `ROCM_SOURCES` with hipcc into a static library, using

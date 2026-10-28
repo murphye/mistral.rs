@@ -4,6 +4,7 @@ pub mod gdn;
 pub mod moe_glue;
 pub mod moe_router;
 pub mod qwen4_exp;
+pub mod sampling;
 
 use candle_core::{Result, Tensor};
 
