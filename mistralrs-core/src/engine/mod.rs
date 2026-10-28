@@ -605,7 +605,9 @@ impl Engine {
                 pipeline.requires_uniform_media_batch(),
                 pipeline.supports_packed_prefill(),
                 hybrid_cache,
-                (pipeline.device().is_cuda() || pipeline.device().is_metal())
+                (pipeline.device().is_cuda()
+                    || pipeline.device().is_metal()
+                    || pipeline.device().is_rocm())
                     && !pipeline_metadata.is_xlora,
                 hybrid_cache,
                 pipeline.speculative_prefix_checkpoint_policy(),
