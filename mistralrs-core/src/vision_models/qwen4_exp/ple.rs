@@ -649,6 +649,22 @@ impl PleTable {
         })
     }
 
+    /// Turn off read-ahead on the mapped table. Host gathers touch a few scattered rows per token, and
+    /// read-ahead (often megabytes per fault) would stream unrelated rows from disk and evict hot pages.
+    fn advise_random(&self) -> Result<()> {
+        match &self.source {
+            TableSource::Shards { raw, names, .. } => {
+                for name in names {
+                    advise_random_access(raw.get(name)?.data());
+                }
+            }
+            TableSource::Gguf { archive, .. } => {
+                advise_random_access(archive.tensor_data(GGUF_TABLE_NAME)?.bytes());
+            }
+        }
+        Ok(())
+    }
+
     /// Host gather of `rows` into a `[rows.len(), head_dim]` tensor on `device`.
     fn gather_host(&self, rows: &[u64], device: &Device) -> Result<Tensor> {
         let outside = |row: u64| {
@@ -717,6 +733,20 @@ fn evict_page_cache(data: &[u8]) {
         let len = data.as_ptr() as usize + data.len() - start;
         unsafe {
             libc::madvise(start as *mut libc::c_void, len, libc::MADV_PAGEOUT);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = data;
+}
+
+fn advise_random_access(data: &[u8]) {
+    #[cfg(target_os = "linux")]
+    {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+        let start = data.as_ptr() as usize / page * page;
+        let len = data.as_ptr() as usize + data.len() - start;
+        unsafe {
+            libc::madvise(start as *mut libc::c_void, len, libc::MADV_RANDOM);
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -910,9 +940,13 @@ impl PleLayer {
     pub(super) fn make_table_resident(&mut self, device: &Device) -> Result<()> {
         #[cfg(feature = "cuda")]
         if device.is_cuda() {
-            return self.table.make_resident(device);
+            self.table.make_resident(device)?;
+            if self.gathers_on_device() {
+                return Ok(());
+            }
         }
         let _ = device;
+        self.table.advise_random()?;
         tracing::info!("Qwen4-Exp PLE rows are gathered from the memory-mapped table on the host");
         Ok(())
     }
