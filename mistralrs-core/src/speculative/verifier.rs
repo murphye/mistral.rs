@@ -1249,15 +1249,29 @@ async fn finish_verified_step_stochastic<P: Pipeline>(
         Some(distribution) => PreparedProposalDistribution::new(distribution, proposal.len())?,
         None => PreparedProposalDistribution::Deterministic,
     };
+    // On ROCm every row's probabilities come from one batched device top-k.
+    #[cfg(feature = "rocm")]
+    let mut batched_target_probs = seq
+        .sampler()
+        .speculative_target_probs_rows_rocm(&verify_logits)?
+        .map(|rows| rows.into_iter().map(Some).collect::<Vec<_>>());
+    #[cfg(not(feature = "rocm"))]
+    let mut batched_target_probs: Option<Vec<Option<crate::sampler::SpeculativeProbs>>> = None;
     let mut accepted = 0usize;
     for (idx, draft) in proposal.iter().copied().enumerate() {
         let target_row = logit_row(&verify_logits, idx)?;
         let sampler = seq.sampler();
-        let target_probs = sampler.speculative_target_probs(
-            flat_logits(target_row.clone())?,
-            seq.get_toks(),
-            seq.prompt_tokens(),
-        )?;
+        let target_probs = match batched_target_probs
+            .as_mut()
+            .and_then(|rows| rows.get_mut(idx).and_then(Option::take))
+        {
+            Some(probs) => probs,
+            None => sampler.speculative_target_probs(
+                flat_logits(target_row.clone())?,
+                seq.get_toks(),
+                seq.prompt_tokens(),
+            )?,
+        };
         let candidate_probs = proposal_distribution.probability_row(
             idx,
             draft,
@@ -1355,11 +1369,17 @@ async fn finish_verified_step_stochastic<P: Pipeline>(
 
     let row = logit_row(&verify_logits, accepted)?;
     let sampler = seq.sampler();
-    let target_probs = sampler.speculative_target_probs(
-        flat_logits(row.clone())?,
-        seq.get_toks(),
-        seq.prompt_tokens(),
-    )?;
+    let target_probs = match batched_target_probs
+        .as_mut()
+        .and_then(|rows| rows.get_mut(accepted).and_then(Option::take))
+    {
+        Some(probs) => probs,
+        None => sampler.speculative_target_probs(
+            flat_logits(row.clone())?,
+            seq.get_toks(),
+            seq.prompt_tokens(),
+        )?,
+    };
     let continuation = match fallback_uniforms {
         Some(uniforms) => sample_from_probs_with_uniform(
             &sampler,

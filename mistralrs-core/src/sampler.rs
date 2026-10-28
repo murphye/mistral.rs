@@ -1898,27 +1898,76 @@ impl Sampler {
     /// the k candidates has zero sampling mass, so only the candidates (and the full softmax
     /// normalizer) cross to the host. Dense rows are rebuilt with zeros elsewhere; `reporting`
     /// is exact for the candidates.
+    /// `(k, temperature)` of the device top-k path for speculative probabilities, if this
+    /// sampler can take it.
     #[cfg(feature = "rocm")]
-    fn speculative_probs_rocm(&self, logits: &Tensor) -> Result<Option<SpeculativeProbs>> {
+    fn speculative_rocm_plan(&self) -> Option<(usize, f64)> {
         let no_penalties = self.frequency_penalty.unwrap_or(0.0) == 0.0
             && self.presence_penalty.unwrap_or(0.0) == 0.0
             && self.repetition_penalty.unwrap_or(1.0) == 1.0;
-        let vocab = logits.elem_count();
         let (k, temperature) = match self.temperature {
             None => (1, 1.0),
             Some(t) if self.top_k > 0 => (self.top_k as usize, t),
-            Some(_) => return Ok(None),
+            Some(_) => return None,
         };
-        if !no_penalties
-            || !self.logits_processors.is_empty()
-            || !self.logits_bias.is_empty()
-            || self.dry_params.as_ref().is_some_and(|p| p.multiplier != 0.0)
-            || k > crate::rocm::sampling::MAX_K
-        {
+        (no_penalties
+            && self.logits_processors.is_empty()
+            && self.logits_bias.is_empty()
+            && self.dry_params.as_ref().is_none_or(|p| p.multiplier == 0.0)
+            && k <= crate::rocm::sampling::MAX_K)
+            .then_some((k, temperature))
+    }
+
+    /// [`Self::speculative_probs`] from a device top-k: with top-k sampling every token outside
+    /// the k candidates has zero sampling mass, so only the candidates (and the full softmax
+    /// normalizer) cross to the host. Dense rows are rebuilt with zeros elsewhere; `reporting`
+    /// is exact for the candidates.
+    #[cfg(feature = "rocm")]
+    fn speculative_probs_rocm(&self, logits: &Tensor) -> Result<Option<SpeculativeProbs>> {
+        let Some((k, temperature)) = self.speculative_rocm_plan() else {
             return Ok(None);
-        }
+        };
+        let vocab = logits.elem_count();
         let k = k.min(vocab);
         let packed = crate::rocm::sampling::topk_logits_packed(logits, k, temperature)?;
+        self.speculative_probs_from_packed(&packed, k, temperature, vocab)
+            .map(Some)
+    }
+
+    /// Speculative probabilities of every row of `logits: [.., rows, vocab]` with one batched
+    /// device top-k, or `None` when this sampler cannot use the device path.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn speculative_target_probs_rows_rocm(
+        &self,
+        logits: &Tensor,
+    ) -> Result<Option<Vec<SpeculativeProbs>>> {
+        let Some((k, temperature)) = self.speculative_rocm_plan() else {
+            return Ok(None);
+        };
+        if !logits.device().is_rocm() {
+            return Ok(None);
+        }
+        let vocab = logits.dim(candle_core::D::Minus1)?;
+        let rows = logits.elem_count() / vocab;
+        let logits = logits.reshape((rows, vocab))?.to_dtype(candle_core::DType::F32)?;
+        let k = k.min(vocab);
+        let inv_t = vec![(1.0 / temperature) as f32; rows];
+        let packed = crate::rocm::sampling::topk_logits_packed_batched(&logits, k, &inv_t)?;
+        packed
+            .iter()
+            .map(|row| self.speculative_probs_from_packed(row, k, temperature, vocab))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
+    #[cfg(feature = "rocm")]
+    fn speculative_probs_from_packed(
+        &self,
+        packed: &[f32],
+        k: usize,
+        temperature: f64,
+        vocab: usize,
+    ) -> Result<SpeculativeProbs> {
         let (values, rest) = packed.split_at(k);
         let (indices, softmax) = rest.split_at(k);
         let (denom, global_max) = (softmax[0], softmax[1]);
@@ -1967,10 +2016,10 @@ impl Sampler {
                 sampling[idx as usize] = p / total;
             }
         }
-        Ok(Some(SpeculativeProbs {
+        Ok(SpeculativeProbs {
             sampling,
             reporting,
-        }))
+        })
     }
 
     pub(crate) fn logprobs_from_probs(
