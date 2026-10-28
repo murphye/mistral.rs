@@ -160,6 +160,8 @@ pub struct GGUFLoader {
     config: GGUFSpecificConfig,
     jinja_explicit: Option<String>,
     encoder_cache_memory_bytes: Option<usize>,
+    /// Built-in MTP speculative decoding (`qwen4exp` with a merged `nextn` head).
+    mtp: bool,
 }
 
 #[derive(Clone, Default)]
@@ -306,6 +308,7 @@ pub struct GGUFLoaderBuilder {
     config: GGUFSpecificConfig,
     jinja_explicit: Option<String>,
     encoder_cache_memory_bytes: Option<usize>,
+    mtp: bool,
 }
 
 impl GGUFLoaderBuilder {
@@ -345,6 +348,13 @@ impl GGUFLoaderBuilder {
 
     pub fn with_tokenizer_json(mut self, tokenizer_json: String) -> Self {
         self.tokenizer_json = Some(tokenizer_json);
+        self
+    }
+
+    /// Enables built-in MTP speculative decoding; only `qwen4exp` with a merged MTP head
+    /// supports it.
+    pub fn with_mtp(mut self, mtp: bool) -> Self {
+        self.mtp = mtp;
         self
     }
 
@@ -433,6 +443,7 @@ impl GGUFLoaderBuilder {
             config: self.config,
             jinja_explicit: self.jinja_explicit,
             encoder_cache_memory_bytes: self.encoder_cache_memory_bytes,
+            mtp: self.mtp,
         })
     }
 }
@@ -479,6 +490,7 @@ impl GGUFLoader {
             config,
             jinja_explicit,
             encoder_cache_memory_bytes: None,
+            mtp: false,
         }
     }
 
@@ -594,9 +606,9 @@ impl GGUFLoader {
             in_situ_quant,
             paged_attn_config,
         } = args;
-        let archive = Arc::new(mistralrs_quant::GgufArchive::open(
-            paths.get_weight_filenames(),
-        )?);
+        let mut archive = mistralrs_quant::GgufArchive::open(paths.get_weight_filenames())?;
+        crate::gguf::qwen4exp::merge_mtp_head_from_env(&mut archive)?;
+        let archive = Arc::new(archive);
         let architecture = match archive.metadata_value("general.architecture") {
             Some(candle_core::quantized::gguf_file::Value::String(value)) => value.as_str(),
             Some(value) => {
@@ -801,6 +813,11 @@ impl GGUFLoader {
         let config =
             crate::gguf::qwen4exp::prepare_qwen4exp_config(external_config.as_deref(), &archive)?;
         let config = stamp_qk_rope_layout(&config, RopePairing::HalfSplit)?;
+        let config = if self.mtp {
+            super::loaders::inject_mtp_config_flag(&config)?
+        } else {
+            config
+        };
         let bindings = crate::gguf::qwen4exp::build_qwen4exp_bindings(&archive)?;
         let preprocessor_config = match args.paths.get_preprocessor_config() {
             Some(path) => Some(fs::read_to_string(path)?),
@@ -918,6 +935,7 @@ impl GGUFLoader {
             bail!("multimodal GGUF does not support legacy GGUF adapters");
         }
         let mut archive = mistralrs_quant::GgufArchive::open(paths.get_weight_filenames())?;
+        crate::gguf::qwen4exp::merge_mtp_head_from_env(&mut archive)?;
         let architecture = match archive.metadata_value("general.architecture") {
             Some(candle_core::quantized::gguf_file::Value::String(value)) => value.clone(),
             Some(value) => {
@@ -1071,7 +1089,8 @@ impl GGUFLoader {
             return Ok(None);
         }
 
-        let model_archive = mistralrs_quant::GgufArchive::open(paths.get_weight_filenames())?;
+        let mut model_archive = mistralrs_quant::GgufArchive::open(paths.get_weight_filenames())?;
+        crate::gguf::qwen4exp::merge_mtp_head_from_env(&mut model_archive)?;
         let synthesizes_config = matches!(
             model_archive.metadata_value("general.architecture"),
             Some(candle_core::quantized::gguf_file::Value::String(architecture))

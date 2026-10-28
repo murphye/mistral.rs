@@ -510,6 +510,35 @@ impl GgufArchive {
         Ok(())
     }
 
+    /// Merges a standalone MTP head (a llama.cpp `nextn` layer shipped as its own GGUF) into
+    /// this archive. Its tensors are added, and its metadata is kept under `mtp_head.` so that
+    /// keys such as the block and expert counts do not override the target's.
+    pub fn merge_mtp_head(&mut self, head: Self) -> Result<()> {
+        for name in head.tensors.keys() {
+            if self.tensors.contains_key(name) {
+                candle_core::bail!("MTP head tensor `{name}` is already in the target archive");
+            }
+        }
+        let shard_offset = self.shards.len();
+        let Self {
+            mappings,
+            shards,
+            tensors,
+            metadata,
+            ..
+        } = head;
+        for (key, value) in metadata {
+            self.metadata.insert(format!("mtp_head.{key}"), value);
+        }
+        for (name, mut tensor) in tensors {
+            tensor.shard_index += shard_offset;
+            self.tensors.insert(name, tensor);
+        }
+        self.mappings.extend(mappings);
+        self.shards.extend(shards);
+        Ok(())
+    }
+
     pub fn shards(&self) -> &[GgufShardInfo] {
         &self.shards
     }

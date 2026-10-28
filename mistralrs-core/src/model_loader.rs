@@ -293,8 +293,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
     if args.mtp
         && matches!(
             &args.model,
-            ModelSelected::GGUF { .. }
-                | ModelSelected::LoraGGUF { .. }
+            ModelSelected::LoraGGUF { .. }
                 | ModelSelected::XLoraGGUF { .. }
                 | ModelSelected::GGML { .. }
                 | ModelSelected::LoraGGML { .. }
@@ -321,8 +320,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
     let supports_max_model_len = supports_hf_config_overrides
         || matches!(
             &args.model,
-            ModelSelected::GGUF { .. }
-                | ModelSelected::LoraGGUF { .. }
+            ModelSelected::LoraGGUF { .. }
                 | ModelSelected::XLoraGGUF { .. }
         );
     if args.max_model_len.is_some() && !supports_max_model_len {
@@ -723,7 +721,8 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 args.no_kv_cache,
                 args.jinja_explicit,
             )
-            .with_encoder_cache_memory_bytes(args.encoder_cache_memory_bytes);
+            .with_encoder_cache_memory_bytes(args.encoder_cache_memory_bytes)
+            .with_mtp(args.mtp);
             if let Some(mmproj_filename) = mmproj_filename {
                 builder = builder.with_mmproj_files(
                     mmproj_filename

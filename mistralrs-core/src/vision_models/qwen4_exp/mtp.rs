@@ -117,7 +117,13 @@ impl Qwen4ExpMtpHead {
             attn_hc: GatedResidual::load(cfg, vb_layer.pp("attn_hyper_connection"), true)?,
             mlp_hc: GatedResidual::load(cfg, vb_layer.pp("mlp_hyper_connection"), true)?,
             moe: SparseMoeBlock::new(
-                cfg,
+                &match cfg.mtp_num_experts {
+                    Some(num_experts) => TextConfig {
+                        num_experts,
+                        ..cfg.clone()
+                    },
+                    None => cfg.clone(),
+                },
                 vb_layer_quant.pp("mlp"),
                 device.clone(),
                 loading_isq,

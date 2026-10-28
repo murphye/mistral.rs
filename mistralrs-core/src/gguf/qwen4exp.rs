@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value as JsonValue};
 
 use super::qwen_multimodal_bindings::{
     bind, bind_experts, bind_gdn, bind_qwen3_vision, bind_shared_expert, metadata_bool_indices,
-    metadata_usize, read_gdn_metadata, TensorInventory, DEEPSTACK_LAYERS,
+    metadata_usize, read_gdn_metadata, GdnMetadata, TensorInventory, DEEPSTACK_LAYERS,
 };
 use crate::gdn::GDN_V_HEAD_LAYOUT_CONFIG_KEY;
 use crate::vision_models::qwen4_exp::Config as Qwen4ExpConfig;
@@ -122,51 +122,14 @@ pub(crate) fn build_qwen4exp_bindings(archive: &GgufArchive) -> Result<GgufBindi
         format!("{mixer}.input_mix_weight_up.weight"),
         "output_hc_up.weight",
     );
-    for layer in 0..metadata_usize(archive, &format!("{ARCHITECTURE}.block_count"))? {
+    let layers = metadata_usize(archive, &format!("{ARCHITECTURE}.block_count"))?;
+    for layer in 0..layers {
         let native = format!("{NATIVE_ROOT}.layers.{layer}");
         let source = format!("blk.{layer}");
-        for (target, role) in LAYER_TENSORS {
-            bind(
-                &inventory,
-                &mut bindings,
-                format!("{native}.{target}"),
-                format!("{source}.{role}"),
-            );
-        }
-        for (target, role) in SHIFTED_NORMS {
-            bind_shifted_norm(
-                &inventory,
-                &mut bindings,
-                format!("{native}.{target}"),
-                format!("{source}.{role}"),
-            );
-        }
-        let q = format!("{source}.indexer.q_proj.weight");
-        let k = format!("{source}.indexer.k_proj.weight");
-        if inventory.contains(&q) && inventory.contains(&k) {
-            bindings.insert(
-                format!("{native}.self_attn.indexer.index_qk_proj.weight"),
-                GgufTensorBinding::concat(
-                    vec![GgufTensorBinding::tensor(q), GgufTensorBinding::tensor(k)],
-                    0,
-                ),
-            );
-        }
-        let conv = format!("{source}.ple_conv1d.weight");
-        if inventory.contains(&conv) {
-            let &[channels, kernel] = inventory.shape(&conv)? else {
-                bail!("Qwen4-Exp PLE convolution `{conv}` must be rank 2");
-            };
-            bindings.insert(
-                format!("{native}.ple.conv1d.weight"),
-                GgufTensorBinding::tensor(&conv).reshape(vec![channels, 1, kernel]),
-            );
-        }
-        if inventory.contains(&format!("{source}.attn_qkv.weight")) {
-            bind_gdn(&inventory, &native, &source, gdn, &mut bindings)?;
-        }
-        bind_experts(&inventory, &native, &source, &mut bindings);
-        bind_shared_expert(&inventory, &native, &source, &mut bindings)?;
+        bind_layer(&inventory, &mut bindings, &native, &source, gdn)?;
+    }
+    if let Some(mtp) = mtp_head_layer(archive) {
+        bind_mtp_head(&inventory, &mut bindings, mtp, gdn)?;
     }
     if has_projector(archive) {
         match archive.metadata_value(PROJECTOR_TYPE) {
@@ -179,6 +142,129 @@ pub(crate) fn build_qwen4exp_bindings(archive: &GgufArchive) -> Result<GgufBindi
         bind_qwen3_vision(&inventory, deepstack.as_deref(), &mut bindings)?;
     }
     Ok(bindings)
+}
+
+/// Native names of one decoder layer `source` (`blk.N`) under `native`.
+fn bind_layer(
+    inventory: &TensorInventory,
+    bindings: &mut GgufBindingMap,
+    native: &str,
+    source: &str,
+    gdn: GdnMetadata,
+) -> Result<()> {
+    for (target, role) in LAYER_TENSORS {
+        bind(
+            inventory,
+            bindings,
+            format!("{native}.{target}"),
+            format!("{source}.{role}"),
+        );
+    }
+    for (target, role) in SHIFTED_NORMS {
+        bind_shifted_norm(
+            inventory,
+            bindings,
+            format!("{native}.{target}"),
+            format!("{source}.{role}"),
+        );
+    }
+    let q = format!("{source}.indexer.q_proj.weight");
+    let k = format!("{source}.indexer.k_proj.weight");
+    if inventory.contains(&q) && inventory.contains(&k) {
+        bindings.insert(
+            format!("{native}.self_attn.indexer.index_qk_proj.weight"),
+            GgufTensorBinding::concat(
+                vec![GgufTensorBinding::tensor(q), GgufTensorBinding::tensor(k)],
+                0,
+            ),
+        );
+    }
+    let conv = format!("{source}.ple_conv1d.weight");
+    if inventory.contains(&conv) {
+        let &[channels, kernel] = inventory.shape(&conv)? else {
+            bail!("Qwen4-Exp PLE convolution `{conv}` must be rank 2");
+        };
+        bindings.insert(
+            format!("{native}.ple.conv1d.weight"),
+            GgufTensorBinding::tensor(&conv).reshape(vec![channels, 1, kernel]),
+        );
+    }
+    if inventory.contains(&format!("{source}.attn_qkv.weight")) {
+        bind_gdn(inventory, native, source, gdn, bindings)?;
+    }
+    bind_experts(inventory, native, source, bindings);
+    bind_shared_expert(inventory, native, source, bindings)?;
+    Ok(())
+}
+
+/// Environment variable naming a standalone MTP head GGUF (llama.cpp `nextn` layer, e.g.
+/// unsloth's `MTP/mtp-*.gguf`) to merge into a `qwen4exp` target for `--mtp`.
+pub(crate) const MTP_HEAD_ENV: &str = "MISTRALRS_QWEN4EXP_MTP_GGUF";
+
+/// Merges the MTP head named by [`MTP_HEAD_ENV`], if any, into a `qwen4exp` archive.
+pub(crate) fn merge_mtp_head_from_env(archive: &mut GgufArchive) -> Result<()> {
+    let Ok(path) = std::env::var(MTP_HEAD_ENV) else {
+        return Ok(());
+    };
+    let head = GgufArchive::open_file(&path)
+        .with_context(|| format!("opening the MTP head GGUF `{path}`"))?;
+    archive
+        .merge_mtp_head(head)
+        .with_context(|| format!("merging the MTP head GGUF `{path}`"))?;
+    tracing::info!("Merged Qwen4-Exp MTP head `{path}`");
+    Ok(())
+}
+
+/// Index of the MTP (`nextn`) layer when its tensors are present: right after the trunk.
+fn mtp_head_layer(archive: &GgufArchive) -> Option<usize> {
+    let layers = metadata_usize(archive, &format!("{ARCHITECTURE}.block_count")).ok()?;
+    archive
+        .contains_tensor(&format!("blk.{layers}.nextn.eh_proj.weight"))
+        .then_some(layers)
+}
+
+/// `mtp.*` names of the `nextn` layer `blk.{layer}`: one decoder layer plus the fusion of the
+/// next token's embedding with the target's hidden streams and the head's stream mixer.
+fn bind_mtp_head(
+    inventory: &TensorInventory,
+    bindings: &mut GgufBindingMap,
+    layer: usize,
+    gdn: GdnMetadata,
+) -> Result<()> {
+    let source = format!("blk.{layer}");
+    bind_layer(inventory, bindings, "mtp.layers.0", &source, gdn)?;
+    let nextn = format!("{source}.nextn");
+    for (target, role) in [
+        ("mtp.pre_fc_norm_embedding.weight", "enorm.weight"),
+        ("mtp.pre_fc_norm_hidden.weight", "hnorm.weight"),
+        ("mtp.hyper_connection_mixer.hc_norm.weight", "hc_head_norm.weight"),
+    ] {
+        bind_shifted_norm(inventory, bindings, target.to_string(), format!("{nextn}.{role}"));
+    }
+    for (target, role) in [
+        ("mtp.hyper_connection_mixer.input_mix_weight_down.weight", "hc_head_down.weight"),
+        ("mtp.hyper_connection_mixer.input_mix_weight_up.weight", "hc_head_up.weight"),
+    ] {
+        bind(inventory, bindings, target, format!("{nextn}.{role}"));
+    }
+    // eh_proj maps [embedding; hidden] to hidden: its two input halves are fc_embedding and
+    // fc_hidden.
+    let eh = format!("{nextn}.eh_proj.weight");
+    let &[out, input] = inventory.shape(&eh)? else {
+        bail!("Qwen4-Exp MTP `{eh}` must be rank 2");
+    };
+    if input != 2 * out {
+        bail!("Qwen4-Exp MTP `{eh}` has shape [{out}, {input}], expected [hidden, 2 * hidden]");
+    }
+    bindings.insert(
+        "mtp.fc_embedding.weight".to_string(),
+        GgufTensorBinding::tensor(&eh).slice(1, 0, out),
+    );
+    bindings.insert(
+        "mtp.fc_hidden.weight".to_string(),
+        GgufTensorBinding::tensor(&eh).slice(1, out, out),
+    );
+    Ok(())
 }
 
 fn bind_shifted_norm(
@@ -221,6 +307,16 @@ pub(crate) fn prepare_qwen4exp_config(
     text.insert(GDN_V_HEAD_LAYOUT_CONFIG_KEY.into(), json!("tiled"));
     if archive.contains_tensor("per_layer_token_embd.weight") {
         text.insert("_mistralrs_ple_hash".into(), ple_hash(archive)?);
+    }
+    if mtp_head_layer(archive).is_some() {
+        text.insert("mtp_num_hidden_layers".into(), json!(1));
+        // A head made for the full model keeps all its experts on a pruned target.
+        if let Some(experts) = archive
+            .metadata_value(&format!("mtp_head.{ARCHITECTURE}.expert_count"))
+            .and_then(|value| value.to_u64().ok())
+        {
+            text.insert("_mistralrs_mtp_num_experts".into(), json!(experts));
+        }
     }
     let config = serde_json::to_string(&config)?;
     let parsed: Qwen4ExpConfig = serde_json::from_str(&config)

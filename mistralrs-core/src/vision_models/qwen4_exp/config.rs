@@ -108,6 +108,10 @@ pub struct TextConfig {
     pub mtp_num_hidden_layers: usize,
     #[serde(default)]
     pub mtp_use_dedicated_embeddings: bool,
+    /// Experts of the MTP layer when they differ from the trunk's (a full-model head on a
+    /// pruned target).
+    #[serde(default, rename = "_mistralrs_mtp_num_experts")]
+    pub mtp_num_experts: Option<usize>,
     #[serde(default)]
     pub quantization_config: Option<QuantizedConfig>,
     #[serde(default, rename = "_mistralrs_gdn_v_head_layout")]
