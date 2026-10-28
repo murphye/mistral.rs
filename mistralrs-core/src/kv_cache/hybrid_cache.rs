@@ -762,6 +762,14 @@ impl RecurrentStatePool {
                 state_indices,
             );
         }
+        #[cfg(feature = "rocm")]
+        if self.device.is_rocm() {
+            return crate::rocm::moe_glue::copy_rows(
+                values,
+                &self.conv_state,
+                &state_indices.to_dtype(candle_core::DType::U32)?,
+            );
+        }
         let indices: Vec<u32> = state_indices.to_vec1()?;
         self.scatter_conv_state_for_indices(&indices, values)
     }
@@ -807,6 +815,14 @@ impl RecurrentStatePool {
                 &values.contiguous()?,
                 &self.recurrent_state,
                 state_indices,
+            );
+        }
+        #[cfg(feature = "rocm")]
+        if self.device.is_rocm() {
+            return crate::rocm::moe_glue::copy_rows(
+                values,
+                &self.recurrent_state,
+                &state_indices.to_dtype(candle_core::DType::U32)?,
             );
         }
         let indices: Vec<u32> = state_indices.to_vec1()?;

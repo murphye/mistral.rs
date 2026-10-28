@@ -220,3 +220,43 @@ pub fn qsa_pack_keys(k: &Tensor, raw_key: &Tensor, cos: &Tensor, sin: &Tensor) -
     }
     Ok(out)
 }
+
+/// `dst[rows[i]] = src[i]` along the first dimension, in place on `dst` (bf16, f16 or f32
+/// state pools indexed by u32 slot rows).
+pub fn copy_rows(src: &Tensor, dst: &Tensor, rows: &Tensor) -> Result<()> {
+    let src = src.contiguous()?;
+    let n_rows = src.dim(0)?;
+    if src.dtype() != dst.dtype()
+        || rows.dtype() != DType::U32
+        || rows.dim(0)? != n_rows
+        || src.dims()[1..] != dst.dims()[1..]
+        || !dst.is_contiguous()
+    {
+        candle_core::bail!(
+            "copy_rows: src {:?} {:?}, dst {:?} {:?}, rows {:?} {:?}",
+            src.shape(),
+            src.dtype(),
+            dst.shape(),
+            dst.dtype(),
+            rows.shape(),
+            rows.dtype()
+        );
+    }
+    let row_elems = src.elem_count() / n_rows.max(1);
+    if n_rows == 0 || row_elems == 0 {
+        return Ok(());
+    }
+    let rows = rows.contiguous()?;
+    unsafe {
+        crate::rocm::ffi::indexed_row_copy(
+            half_or_f32_ptr(&src, "src")? as *const c_void,
+            half_or_f32_ptr(dst, "dst")? as *mut c_void,
+            rocm_ptr::<u32>(&rows, "rows")? as *const u32,
+            n_rows as i64,
+            row_elems as i64,
+            src.dtype().size_in_bytes() as i32,
+            stream(&src)?,
+        );
+    }
+    Ok(())
+}

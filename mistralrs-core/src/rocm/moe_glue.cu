@@ -223,3 +223,31 @@ __global__ void qsa_pack_keys_kernel(const T *__restrict__ k, const T *__restric
 QSA_PACK_KEYS_OP(float, f32)
 QSA_PACK_KEYS_OP(__half, f16)
 QSA_PACK_KEYS_OP(__nv_bfloat16, bf16)
+
+// dst[rows[r], :] = src[r, :] for contiguous rows of `row_elems` 2- or 4-byte elements.
+template <typename W>
+__global__ void indexed_row_copy_kernel(const W *__restrict__ src, W *__restrict__ dst,
+                                        const uint32_t *__restrict__ rows, const int64_t n_rows,
+                                        const int64_t row_elems) {
+  const int64_t n = n_rows * row_elems;
+  const int64_t stride = (int64_t)gridDim.x * blockDim.x;
+  for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+    const int64_t r = i / row_elems;
+    dst[(int64_t)rows[r] * row_elems + (i - r * row_elems)] = src[i];
+  }
+}
+
+extern "C" void indexed_row_copy(const void *src, void *dst, const uint32_t *rows, int64_t n_rows,
+                                 int64_t row_elems, int elem_bytes, int64_t stream) {
+  const int64_t n = n_rows * row_elems;
+  const int threads = 256;
+  const int64_t blocks = (n + threads - 1) / threads;
+  const unsigned grid = (unsigned)(blocks < 65535 ? blocks : 65535);
+  if (elem_bytes == 4) {
+    indexed_row_copy_kernel<uint32_t><<<grid, threads, 0, (cudaStream_t)stream>>>(
+        (const uint32_t *)src, (uint32_t *)dst, rows, n_rows, row_elems);
+  } else {
+    indexed_row_copy_kernel<uint16_t><<<grid, threads, 0, (cudaStream_t)stream>>>(
+        (const uint16_t *)src, (uint16_t *)dst, rows, n_rows, row_elems);
+  }
+}

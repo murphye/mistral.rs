@@ -258,4 +258,5 @@ extern "C" {
     pub fn topk_large_packed_batched_f32(input: *const c_void, inv_temperatures: *const f32, block_values: *mut f32, block_indices: *mut u32, block_maxes: *mut f32, block_sums: *mut f32, packed_out: *mut f32, nrows: i32, ncols: i32, k: i32, chunk_size: i32, nblocks: i32, stream: i64);
     pub fn topk_large_packed_batched_f16(input: *const c_void, inv_temperatures: *const f32, block_values: *mut f32, block_indices: *mut u32, block_maxes: *mut f32, block_sums: *mut f32, packed_out: *mut f32, nrows: i32, ncols: i32, k: i32, chunk_size: i32, nblocks: i32, stream: i64);
     pub fn topk_large_packed_batched_bf16(input: *const c_void, inv_temperatures: *const f32, block_values: *mut f32, block_indices: *mut u32, block_maxes: *mut f32, block_sums: *mut f32, packed_out: *mut f32, nrows: i32, ncols: i32, k: i32, chunk_size: i32, nblocks: i32, stream: i64);
+    pub fn indexed_row_copy(src: *const c_void, dst: *mut c_void, rows: *const u32, n_rows: i64, row_elems: i64, elem_bytes: i32, stream: i64);
 }

@@ -1855,6 +1855,12 @@ impl Sampler {
         context: &[u32],
         prompt_len: usize,
     ) -> Result<SpeculativeProbs> {
+        #[cfg(feature = "rocm")]
+        if logits.device().is_rocm() {
+            if let Some(probs) = self.speculative_probs_rocm(&logits)? {
+                return Ok(probs);
+            }
+        }
         let logits = logits.to_vec1()?;
         let mut logits = self.apply_penalties(logits, context, prompt_len)?;
         for processor in &self.logits_processors {
@@ -1886,6 +1892,85 @@ impl Sampler {
             sampling,
             reporting,
         })
+    }
+
+    /// [`Self::speculative_probs`] from a device top-k: with top-k sampling every token outside
+    /// the k candidates has zero sampling mass, so only the candidates (and the full softmax
+    /// normalizer) cross to the host. Dense rows are rebuilt with zeros elsewhere; `reporting`
+    /// is exact for the candidates.
+    #[cfg(feature = "rocm")]
+    fn speculative_probs_rocm(&self, logits: &Tensor) -> Result<Option<SpeculativeProbs>> {
+        let no_penalties = self.frequency_penalty.unwrap_or(0.0) == 0.0
+            && self.presence_penalty.unwrap_or(0.0) == 0.0
+            && self.repetition_penalty.unwrap_or(1.0) == 1.0;
+        let vocab = logits.elem_count();
+        let (k, temperature) = match self.temperature {
+            None => (1, 1.0),
+            Some(t) if self.top_k > 0 => (self.top_k as usize, t),
+            Some(_) => return Ok(None),
+        };
+        if !no_penalties
+            || !self.logits_processors.is_empty()
+            || !self.logits_bias.is_empty()
+            || self.dry_params.as_ref().is_some_and(|p| p.multiplier != 0.0)
+            || k > crate::rocm::sampling::MAX_K
+        {
+            return Ok(None);
+        }
+        let k = k.min(vocab);
+        let packed = crate::rocm::sampling::topk_logits_packed(logits, k, temperature)?;
+        let (values, rest) = packed.split_at(k);
+        let (indices, softmax) = rest.split_at(k);
+        let (denom, global_max) = (softmax[0], softmax[1]);
+        if denom <= 0.0 || !denom.is_finite() || !global_max.is_finite() {
+            candle_core::bail!("invalid device top-k softmax normalizer");
+        }
+        let inv_t = (1.0 / temperature) as f32;
+        let probs = values
+            .iter()
+            .map(|v| (v * inv_t - global_max).exp() / denom)
+            .collect::<Vec<_>>();
+        let mut reporting = vec![0.0f32; vocab];
+        let mut sampling = vec![0.0f32; vocab];
+        for (&idx, &p) in indices.iter().zip(&probs) {
+            reporting[idx as usize] = p;
+        }
+        if self.temperature.is_none() {
+            sampling[indices[0] as usize] = 1.0;
+        } else {
+            // Candidates come sorted, as in sample_packed_topk: top-p then min-p over them.
+            let mut kept = probs.clone();
+            if self.top_p > 0.0 && self.top_p < 1.0 {
+                let cutoff = top_p_cutoff(self.top_p as f32, kept.iter().copied());
+                let mut cumsum = 0.0f32;
+                for p in &mut kept {
+                    if cumsum >= cutoff {
+                        *p = 0.0;
+                    } else {
+                        cumsum += *p;
+                    }
+                }
+            }
+            if self.min_p > 0.0 && self.min_p < 1.0 {
+                let threshold = kept.first().copied().unwrap_or(0.0) * self.min_p as f32;
+                for p in &mut kept {
+                    if threshold >= *p {
+                        *p = 0.0;
+                    }
+                }
+            }
+            let total: f32 = kept.iter().sum();
+            if total <= 0.0 || !total.is_finite() {
+                candle_core::bail!("all speculative sampling probabilities are zero after filtering");
+            }
+            for (&idx, &p) in indices.iter().zip(&kept) {
+                sampling[idx as usize] = p / total;
+            }
+        }
+        Ok(Some(SpeculativeProbs {
+            sampling,
+            reporting,
+        }))
     }
 
     pub(crate) fn logprobs_from_probs(
