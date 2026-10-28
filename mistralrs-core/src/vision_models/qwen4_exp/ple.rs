@@ -696,16 +696,23 @@ impl PleTable {
             TableSource::Gguf {
                 archive, format, ..
             } => {
+                use rayon::prelude::*;
                 let row_bytes = format.row_bytes(self.head_dim);
                 let bytes = archive.tensor_data(GGUF_TABLE_NAME)?.bytes();
                 let mut out = vec![0f32; rows.len() * self.head_dim];
-                for (dst, &row) in out.chunks_exact_mut(self.head_dim).zip(rows) {
-                    let offset = row as usize * row_bytes;
-                    let src = bytes
-                        .get(offset..offset + row_bytes)
-                        .ok_or_else(|| outside(row))?;
-                    format.dequantize_row(src, dst);
-                }
+                // Rows not in the page cache each fault in from disk; a prompt touches
+                // thousands, so fault them in parallel to keep the drive's queue full.
+                out.par_chunks_exact_mut(self.head_dim)
+                    .with_min_len(16)
+                    .zip(rows.par_iter())
+                    .try_for_each(|(dst, &row)| -> Result<()> {
+                        let offset = row as usize * row_bytes;
+                        let src = bytes
+                            .get(offset..offset + row_bytes)
+                            .ok_or_else(|| outside(row))?;
+                        format.dequantize_row(src, dst);
+                        Ok(())
+                    })?;
                 Tensor::from_vec(out, (rows.len(), self.head_dim), device)
             }
         }
