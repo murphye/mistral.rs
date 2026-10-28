@@ -558,6 +558,9 @@ pub struct Logprobs {
 pub(crate) struct SpeculativeProbs {
     pub sampling: Vec<f32>,
     pub reporting: Vec<f32>,
+    /// Every token with nonzero `sampling` mass, when known to be a small set (a device top-k),
+    /// so rejection sampling can skip the full vocabulary.
+    pub support: Option<Vec<u32>>,
 }
 
 /// Comparator for descending order by probability (second element of tuple).
@@ -1891,6 +1894,7 @@ impl Sampler {
         Ok(SpeculativeProbs {
             sampling,
             reporting,
+            support: None,
         })
     }
 
@@ -1984,8 +1988,10 @@ impl Sampler {
         for (&idx, &p) in indices.iter().zip(&probs) {
             reporting[idx as usize] = p;
         }
+        let mut support = Vec::with_capacity(k);
         if self.temperature.is_none() {
             sampling[indices[0] as usize] = 1.0;
+            support.push(indices[0] as u32);
         } else {
             // Candidates come sorted, as in sample_packed_topk: top-p then min-p over them.
             let mut kept = probs.clone();
@@ -2013,12 +2019,16 @@ impl Sampler {
                 candle_core::bail!("all speculative sampling probabilities are zero after filtering");
             }
             for (&idx, &p) in indices.iter().zip(&kept) {
-                sampling[idx as usize] = p / total;
+                if p > 0.0 {
+                    sampling[idx as usize] = p / total;
+                    support.push(idx as u32);
+                }
             }
         }
         Ok(SpeculativeProbs {
             sampling,
             reporting,
+            support: Some(support),
         })
     }
 
@@ -2054,6 +2064,23 @@ impl Sampler {
             top_logprobs,
             bytes,
         })
+    }
+
+    /// Samples `tokens` in proportion to `weights` (which need not be normalized), reporting
+    /// logprobs from the dense `reporting_probs`.
+    pub(crate) fn sample_from_weighted_tokens(
+        &self,
+        tokens: &[u32],
+        weights: &[f32],
+        reporting_probs: &[f32],
+        return_logprobs: bool,
+        rng: Arc<Mutex<Isaac64Rng>>,
+    ) -> Result<Logprobs> {
+        let distr = WeightedIndex::new(weights).map_err(|e| {
+            Error::Msg(format!("Failed to construct speculative sampler: {e}"))
+        })?;
+        let idx = distr.sample(&mut *rng.lock().expect("could not lock rng mutex"));
+        self.logprobs_from_probs(tokens[idx], reporting_probs, return_logprobs)
     }
 
     pub(crate) fn sample_from_probs(

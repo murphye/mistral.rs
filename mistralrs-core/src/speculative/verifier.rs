@@ -1324,6 +1324,52 @@ async fn finish_verified_step_stochastic<P: Pipeline>(
             continue;
         }
 
+        // The residual max(p - q, 0) is nonzero only where the target has mass, so a known
+        // target support bounds it to a few candidates instead of the whole vocabulary.
+        if let Some(support) = target_probs.support.as_deref() {
+            let mut weights = support
+                .iter()
+                .map(|&token| {
+                    let token = token as usize;
+                    (target_probs.sampling[token] - candidate_probs.probability(token)).max(0.0)
+                })
+                .collect::<Vec<_>>();
+            if !(weights.iter().sum::<f32>() > 0.0) {
+                weights = support
+                    .iter()
+                    .map(|&token| target_probs.sampling[token as usize])
+                    .collect();
+            }
+            let sampled = sample_weighted_tokens(
+                &sampler,
+                support,
+                &weights,
+                &target_probs.reporting,
+                return_logprobs,
+                fallback_uniforms.map(|uniforms| uniforms.sample),
+                rng,
+            )?;
+            let sampled_token = sampled.token;
+            let keep_len = base_len + 1 + accepted;
+            finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, sampled, eos_tok, false)
+                .await?;
+            if matches!(seq.getstate(), SequenceState::Done(_)) {
+                seq.clear_staged_speculative_tokens();
+                return Ok(VerificationOutcome {
+                    accepted_drafts: accepted,
+                    proposed_drafts: proposal.len(),
+                    keep_len,
+                    continuation_token: None,
+                });
+            }
+            return Ok(VerificationOutcome {
+                accepted_drafts: accepted,
+                proposed_drafts: proposal.len(),
+                keep_len,
+                continuation_token: Some(sampled_token),
+            });
+        }
+
         let mut adjusted_probs = target_probs.sampling.clone();
         candidate_probs.subtract_from(&mut adjusted_probs)?;
         for prob in &mut adjusted_probs {
@@ -1380,15 +1426,30 @@ async fn finish_verified_step_stochastic<P: Pipeline>(
             seq.prompt_tokens(),
         )?,
     };
-    let continuation = match fallback_uniforms {
-        Some(uniforms) => sample_from_probs_with_uniform(
+    let continuation = match (fallback_uniforms, target_probs.support.as_deref()) {
+        (fallback_uniforms, Some(support)) => {
+            let weights = support
+                .iter()
+                .map(|&token| target_probs.sampling[token as usize])
+                .collect::<Vec<_>>();
+            sample_weighted_tokens(
+                &sampler,
+                support,
+                &weights,
+                &target_probs.reporting,
+                return_logprobs,
+                fallback_uniforms.map(|uniforms| uniforms.sample),
+                rng,
+            )?
+        }
+        (Some(uniforms), None) => sample_from_probs_with_uniform(
             &sampler,
             &target_probs.sampling,
             &target_probs.reporting,
             return_logprobs,
             uniforms.sample,
         )?,
-        None => sampler.sample_from_probs(
+        (None, None) => sampler.sample_from_probs(
             &target_probs.sampling,
             &target_probs.reporting,
             return_logprobs,
@@ -1501,6 +1562,46 @@ fn sample_from_probs_with_uniform(
     #[allow(clippy::cast_possible_truncation)]
     let token_id = token as u32;
     sampler.logprobs_from_probs(token_id, reporting_probs, return_logprobs)
+}
+
+/// Samples one of `tokens` in proportion to `weights`, with a precomputed uniform draw when the
+/// device verifier supplied one and the shared RNG otherwise.
+fn sample_weighted_tokens(
+    sampler: &Sampler,
+    tokens: &[u32],
+    weights: &[f32],
+    reporting_probs: &[f32],
+    return_logprobs: bool,
+    uniform: Option<f32>,
+    rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+) -> Result<Logprobs> {
+    let Some(uniform) = uniform else {
+        return sampler.sample_from_weighted_tokens(
+            tokens,
+            weights,
+            reporting_probs,
+            return_logprobs,
+            rng,
+        );
+    };
+    if !valid_uniform(uniform) {
+        candle_core::bail!("invalid speculative fallback sampling uniform {uniform}");
+    }
+    let total: f32 = weights.iter().sum();
+    if !total.is_finite() || total <= 0.0 {
+        candle_core::bail!("all speculative fallback sampling probabilities are zero");
+    }
+    let target = uniform * total;
+    let mut cumulative = 0.0f32;
+    let idx = weights
+        .iter()
+        .position(|weight| {
+            cumulative += weight;
+            target < cumulative
+        })
+        .or_else(|| weights.iter().rposition(|weight| *weight > 0.0))
+        .expect("positive fallback weight was validated");
+    sampler.logprobs_from_probs(tokens[idx], reporting_probs, return_logprobs)
 }
 
 fn valid_uniform(uniform: f32) -> bool {
