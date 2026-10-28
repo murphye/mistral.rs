@@ -3,6 +3,7 @@ pub mod ffi;
 pub mod gdn;
 pub mod moe_glue;
 pub mod moe_router;
+#[path = "../cuda/qwen4_exp.rs"]
 pub mod qwen4_exp;
 pub mod sampling;
 

@@ -197,27 +197,27 @@ impl Qwen4ExpMtpHead {
                 Vec::new(),
             ),
         };
-        #[cfg(feature = "cuda")]
-        let layout = if !res.device().is_cuda() {
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+        let layout = if !super::kernel_device(res.device()) {
             None
         } else if attention.chunk_ranges.is_some() {
-            Some(crate::cuda::qwen4_exp::TokenLayout::from_host(
+            Some(super::kernels::TokenLayout::from_host(
                 &spans,
                 &kv_lens,
                 n_tokens,
                 res.device(),
             )?)
         } else {
-            Some(crate::cuda::qwen4_exp::TokenLayout::rectangular(
+            Some(super::kernels::TokenLayout::rectangular(
                 n_tokens, 1,
             ))
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         let _ = (spans, kv_lens, n_tokens);
         let step = QsaStep {
             mode,
             positions: &[],
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
             layout: layout.as_ref(),
         };
 

@@ -2815,7 +2815,7 @@ impl PagedAttention {
     }
 
     /// Write key/value into the paged cache without running attention.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub fn write_cache(
         &self,
         key: &Tensor,

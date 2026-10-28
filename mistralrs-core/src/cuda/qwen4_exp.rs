@@ -1,9 +1,13 @@
-//! Launch wrappers for the Qwen4-Exp CUDA kernels in `qwen4_exp.cu`.
+//! Launch wrappers for the Qwen4-Exp CUDA kernels in `qwen4_exp.cu`. ROCm builds compile the
+//! same kernels with hipcc and this file as `crate::rocm::qwen4_exp`; only the device pointer
+//! and stream accessors differ.
 #![allow(clippy::cast_possible_truncation)]
+// ROCm builds use only the attention, token-layout and hyper-connection wrappers.
+#![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
-use candle_core::{
-    cuda_backend::cudarc::driver::DevicePtr, DType, Device, Result, Storage, Tensor,
-};
+#[cfg(feature = "cuda")]
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+use candle_core::{DType, Device, Result, Storage, Tensor};
 
 pub(crate) const PLE_MAX_NGRAM: usize = 8;
 pub(crate) const PLE_MAX_HEADS: usize = 64;
@@ -236,7 +240,24 @@ mod ffi {
     }
 }
 
+macro_rules! dev_ptr_by_dtype {
+    ($t:expr, $ptr:ident) => {
+        Ok(match $t.dtype() {
+            DType::BF16 => $ptr!(half::bf16),
+            DType::F16 => $ptr!(half::f16),
+            DType::F32 => $ptr!(f32),
+            DType::U32 => $ptr!(u32),
+            DType::I32 => $ptr!(i32),
+            DType::I64 => $ptr!(i64),
+            DType::U8 => $ptr!(u8),
+            DType::F8E4M3 => $ptr!(float8::F8E4M3),
+            other => candle_core::bail!("unsupported dtype {other:?} for a raw device pointer"),
+        })
+    };
+}
+
 /// Device address of a tensor's first element. The tensor must stay alive while it is used.
+#[cfg(feature = "cuda")]
 pub(crate) fn dev_ptr(t: &Tensor) -> Result<u64> {
     let (storage, layout) = t.storage_and_layout();
     let Storage::Cuda(storage) = &*storage else {
@@ -251,25 +272,39 @@ pub(crate) fn dev_ptr(t: &Tensor) -> Result<u64> {
                 .0
         }};
     }
-    Ok(match t.dtype() {
-        DType::BF16 => ptr!(half::bf16),
-        DType::F16 => ptr!(half::f16),
-        DType::F32 => ptr!(f32),
-        DType::U32 => ptr!(u32),
-        DType::I32 => ptr!(i32),
-        DType::I64 => ptr!(i64),
-        DType::U8 => ptr!(u8),
-        DType::F8E4M3 => ptr!(float8::F8E4M3),
-        other => candle_core::bail!("unsupported dtype {other:?} for a raw device pointer"),
-    })
+    dev_ptr_by_dtype!(t, ptr)
+}
+
+/// Device address of a tensor's first element. The tensor must stay alive while it is used.
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn dev_ptr(t: &Tensor) -> Result<u64> {
+    let (storage, layout) = t.storage_and_layout();
+    let Storage::Rocm(storage) = &*storage else {
+        candle_core::bail!("expected a ROCm tensor");
+    };
+    macro_rules! ptr {
+        ($ty:ty) => {{
+            storage
+                .as_rocm_slice::<$ty>()?
+                .slice(layout.start_offset()..)
+                .device_ptr()
+        }};
+    }
+    dev_ptr_by_dtype!(t, ptr)
 }
 
 fn opt_ptr(t: Option<&Tensor>) -> Result<u64> {
     t.map_or(Ok(0), dev_ptr)
 }
 
+#[cfg(feature = "cuda")]
 fn stream(device: &Device) -> Result<i64> {
     Ok(device.as_cuda_device()?.cuda_stream().cu_stream() as i64)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn stream(device: &Device) -> Result<i64> {
+    Ok(device.as_rocm_device()?.hip_stream().raw() as i64)
 }
 
 fn dtype_code(dtype: DType) -> Result<i32> {

@@ -49,12 +49,12 @@ pub(super) struct QsaStep<'a> {
     pub mode: QsaMode,
     /// Absolute kv position of every flattened token, host side (non-paged path only).
     pub positions: &'a [Option<usize>],
-    #[cfg(feature = "cuda")]
-    pub layout: Option<&'a crate::cuda::qwen4_exp::TokenLayout>,
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub layout: Option<&'a super::kernels::TokenLayout>,
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 struct QsaAuxCache {
     raw: Tensor,
     block_keys: Tensor,
@@ -316,7 +316,7 @@ impl QsaAttention {
         rope_partial_neox(&q, cos, sin)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     fn aux_cache(
         &self,
         key_cache: &Tensor,
@@ -380,9 +380,9 @@ impl QsaAttention {
             step,
         } = inputs;
         let (b_sz, _, seq_len, _) = q.dims4()?;
-        #[cfg(feature = "cuda")]
-        if q.device().is_cuda() {
-            use crate::cuda::qwen4_exp as kernels;
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+        if super::kernel_device(q.device()) {
+            use super::kernels;
             let block_size = metadata
                 .block_size
                 .ok_or_else(|| candle_core::Error::msg("QSA requires a paged block size"))?;
@@ -702,7 +702,7 @@ struct UnpagedQsaInputs<'a> {
     step: &'a QsaStep<'a>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn per_sequence_block_tables(block_tables: &Tensor, n_seqs: usize) -> Result<Tensor> {
     let (rows, width) = block_tables.dims2()?;
     if rows == n_seqs {
@@ -717,7 +717,7 @@ fn per_sequence_block_tables(block_tables: &Tensor, n_seqs: usize) -> Result<Ten
         .contiguous()
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn last_row_per_sequence(lens: &Tensor, n_seqs: usize) -> Result<Tensor> {
     let rows = lens.dim(0)?;
     if rows == n_seqs {

@@ -8389,7 +8389,7 @@ impl MultimodalModelLoader for Qwen4ExpLoader {
         Arc::new(Qwen4ExpProcessor::new(max_edge))
     }
     fn supports_paged_attention(&self, _config: &str) -> bool {
-        cfg!(all(feature = "cuda", target_family = "unix"))
+        cfg!(all(any(feature = "cuda", feature = "rocm"), target_family = "unix"))
     }
     fn supports_encoder_cache(&self, _config: &str) -> bool {
         true

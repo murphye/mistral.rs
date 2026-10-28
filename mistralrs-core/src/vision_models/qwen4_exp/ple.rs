@@ -864,8 +864,9 @@ pub(super) struct PleState<'a> {
 /// Where each logical sequence sits on the flattened token axis.
 pub(super) struct PleBatch<'a> {
     pub seqs: &'a [(usize, usize)],
-    #[cfg(feature = "cuda")]
-    pub layout: Option<&'a crate::cuda::qwen4_exp::TokenLayout>,
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub layout: Option<&'a super::kernels::TokenLayout>,
 }
 
 /// Hashed n-gram embedding injected into every hyper-connection stream (HF `Qwen4ExpTextPLELayer`).

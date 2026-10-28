@@ -45,6 +45,18 @@ pub(crate) use config::Config;
 #[cfg(feature = "cuda")]
 pub(crate) use ple::planned_resident_table_bytes;
 
+/// The Qwen4-Exp kernels of `src/cuda/qwen4_exp.cu`, built by nvcc or hipcc.
+#[cfg(feature = "cuda")]
+use crate::cuda::qwen4_exp as kernels;
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+use crate::rocm::qwen4_exp as kernels;
+
+/// Whether `device` runs the Qwen4-Exp GPU kernels.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn kernel_device(device: &Device) -> bool {
+    device.is_cuda() || device.is_rocm()
+}
+
 /// Hybrid paged config that also budgets for the per-token QSA aux cache beside the KV cache.
 pub(crate) struct Qwen4ExpPagedConfig {
     inner: HybridPagedKvCacheConfig,

@@ -863,7 +863,7 @@ impl Qwen4ExpTextModel {
                 }
             }
         }
-        #[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
         let mut layouts = HashMap::new();
 
         let mut res = xs.repeat((1, 1, self.hc))?;
@@ -871,14 +871,14 @@ impl Qwen4ExpTextModel {
         let n_layers = self.layers.len();
         for (i, layer) in self.layers.iter().enumerate() {
             res = self.mapper.map(res, i)?;
-            #[cfg(feature = "cuda")]
-            let layout = if res.device().is_cuda() {
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+            let layout = if super::kernel_device(res.device()) {
                 let location = res.device().location();
                 if let std::collections::hash_map::Entry::Vacant(entry) = layouts.entry(location) {
                     entry.insert(if rectangular {
-                        crate::cuda::qwen4_exp::TokenLayout::rectangular(batch, seq_len)
+                        super::kernels::TokenLayout::rectangular(batch, seq_len)
                     } else {
-                        crate::cuda::qwen4_exp::TokenLayout::from_host(
+                        super::kernels::TokenLayout::from_host(
                             &spans,
                             &kv_lens,
                             batch * seq_len,
@@ -893,7 +893,7 @@ impl Qwen4ExpTextModel {
             let step = QsaStep {
                 mode,
                 positions: &positions,
-                #[cfg(feature = "cuda")]
+                #[cfg(any(feature = "cuda", feature = "rocm"))]
                 layout,
             };
             if let Some(ple) = &layer.ple {
@@ -923,7 +923,7 @@ impl Qwen4ExpTextModel {
                     &state,
                     &PleBatch {
                         seqs: &spans,
-                        #[cfg(feature = "cuda")]
+                        #[cfg(any(feature = "cuda", feature = "rocm"))]
                         layout,
                     },
                     pre_state.as_ref().map(|_| &mut conv_inputs),
