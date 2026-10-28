@@ -66,6 +66,10 @@ impl GatedResidual {
         if res.device().is_cuda() {
             return crate::cuda::qwen4_exp::hc_norm(res, &self.norm_weight, self.hc, self.eps);
         }
+        #[cfg(feature = "rocm")]
+        if res.device().is_rocm() {
+            return crate::rocm::qwen4_exp::hc_norm(res, &self.norm_weight, self.hc, self.eps);
+        }
         grouped_rms_norm(res, &self.norm_weight, self.hc, self.eps)
     }
 
@@ -77,6 +81,10 @@ impl GatedResidual {
         #[cfg(feature = "cuda")]
         if xn.device().is_cuda() {
             return crate::cuda::qwen4_exp::hc_mix(xn, &gate, self.hc);
+        }
+        #[cfg(feature = "rocm")]
+        if xn.device().is_rocm() {
+            return crate::rocm::qwen4_exp::hc_mix(xn, &gate, self.hc);
         }
         let mut shape = xn.dims().to_vec();
         let last = shape.len() - 1;
@@ -109,6 +117,17 @@ impl GatedResidual {
         #[cfg(feature = "cuda")]
         if res.device().is_cuda() {
             return crate::cuda::qwen4_exp::hc_combine(
+                res,
+                out,
+                inject,
+                next.map(|next| &next.norm_weight),
+                self.hc,
+                self.eps,
+            );
+        }
+        #[cfg(feature = "rocm")]
+        if res.device().is_rocm() {
+            return crate::rocm::qwen4_exp::hc_combine(
                 res,
                 out,
                 inject,

@@ -309,6 +309,7 @@ struct ResidentTable {
     format: crate::cuda::qwen4_exp::PleTableFormat,
 }
 
+#[cfg(feature = "cuda")]
 fn iq4_nl_row_bytes(head_dim: usize) -> usize {
     head_dim / IQ4_NL_BLOCK * IQ4_NL_BLOCK_BYTES
 }
