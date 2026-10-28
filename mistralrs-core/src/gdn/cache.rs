@@ -139,7 +139,18 @@ fn pooled_kernels_cover(pool: &RecurrentStatePool, batch_kind: RecurrentBatchKin
                 && matches!(pool.conv_state.dtype(), DType::F16 | DType::BF16)
                 && matches!(pool.recurrent_state.dim(2), Ok(64 | 128))
         }
-        // The ROCm backend runs the generic (non-pooled) path.
-        Device::Cpu | Device::Rocm(_) => false,
+        // ROCm runs the CUDA kernels for f16/bf16 activations over a key-major state
+        // with K up to 256 (the fused decode kernel's limit).
+        Device::Rocm(_) => {
+            cfg!(feature = "rocm")
+                && pool.state_layout() == RecurrentStateLayout::GdnKeyMajor
+                && matches!(pool.conv_state.dtype(), DType::F16 | DType::BF16)
+                && matches!(
+                    pool.recurrent_state.dtype(),
+                    DType::F16 | DType::BF16 | DType::F32
+                )
+                && pool.recurrent_state.dim(2).is_ok_and(|k| k <= 256)
+        }
+        Device::Cpu => false,
     }
 }
