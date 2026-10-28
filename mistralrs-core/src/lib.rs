@@ -54,6 +54,8 @@ mod device_map;
 mod engine;
 mod lora;
 mod metal;
+#[cfg(feature = "rocm")]
+mod rocm;
 pub use metal::warmup_metal_kernels;
 mod model_loader;
 mod moe;

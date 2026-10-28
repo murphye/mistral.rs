@@ -51,7 +51,7 @@ impl RmsNormGated {
     }
 
     pub fn forward(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
-        #[cfg(any(feature = "cuda", feature = "metal"))]
+        #[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
         if self.fused_kernel_applies(x, gate)? {
             let weight = self.weight.to_dtype(x.dtype())?;
             #[cfg(feature = "cuda")]
@@ -67,6 +67,16 @@ impl RmsNormGated {
             #[cfg(feature = "metal")]
             if x.device().is_metal() {
                 return crate::metal::gdn::rmsnorm_gated_metal(x, gate, &weight, self.eps);
+            }
+            #[cfg(feature = "rocm")]
+            if x.device().is_rocm() {
+                return crate::rocm::gdn::rmsnorm_gated_rocm(
+                    x,
+                    gate,
+                    &weight,
+                    self.eps,
+                    self.activation,
+                );
             }
         }
 
@@ -85,9 +95,10 @@ impl RmsNormGated {
         out.to_dtype(dtype)
     }
 
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
     fn fused_kernel_applies(&self, x: &Tensor, gate: &Tensor) -> Result<bool> {
         Ok((x.device().is_cuda()
+            || x.device().is_rocm()
             || (x.device().is_metal() && self.activation == GdnGateActivation::Silu))
             && (2..=4).contains(&x.rank())
             && (2..=4).contains(&gate.rank())

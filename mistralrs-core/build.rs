@@ -91,6 +91,9 @@ fn main() {
     #[cfg(feature = "cudnn")]
     add_cudnn_link_search();
 
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    build_rocm_kernels();
+
     #[cfg(feature = "cuda")]
     {
         use std::path::PathBuf;
@@ -235,6 +238,95 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=stdc++");
         }
     }
+}
+
+/// CUDA kernels from `src/cuda` that the ROCm backend uses.
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+const ROCM_SOURCES: &[&str] = &["src/cuda/gdn.cu"];
+
+/// Compiles `ROCM_SOURCES` with hipcc into a static library, using
+/// candle-rocm-kernels' CUDA compatibility headers and target list.
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+fn build_rocm_kernels() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/cuda");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    let rocm_path =
+        PathBuf::from(std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into()));
+    let hip_compat = PathBuf::from(
+        std::env::var("DEP_CANDLE_ROCM_KERNELS_HIP_COMPAT")
+            .expect("candle-rocm-kernels did not export its HIP compatibility headers"),
+    );
+    let archs: Vec<String> = std::env::var("DEP_CANDLE_ROCM_KERNELS_ARCHS")
+        .expect("candle-rocm-kernels did not export its target architectures")
+        .split(',')
+        .filter(|arch| !arch.is_empty())
+        .map(String::from)
+        .collect();
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let hipcc = rocm_path.join("bin/hipcc");
+
+    let objects: Vec<PathBuf> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = ROCM_SOURCES
+            .iter()
+            .map(|src| {
+                let (hipcc, hip_compat, archs, out_dir) = (&hipcc, &hip_compat, &archs, &out_dir);
+                scope.spawn(move || {
+                    let stem = std::path::Path::new(src)
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy();
+                    let obj = out_dir.join(format!("{stem}.o"));
+                    let mut cmd = Command::new(hipcc);
+                    cmd.args(["-c", "-fPIC", "-O3", "-std=c++17", "-munsafe-fp-atomics"])
+                        .args(["-DUSE_ROCM", "-Wno-unused-result"])
+                        .arg("-include")
+                        .arg(hip_compat.join("candle_hip_prelude.h"))
+                        .arg("-I")
+                        .arg(hip_compat)
+                        .args(["-I", "src/cuda"]);
+                    for arch in archs {
+                        cmd.arg(format!("--offload-arch={arch}"));
+                    }
+                    let output = cmd
+                        .arg("-o")
+                        .arg(&obj)
+                        .arg(src)
+                        .output()
+                        .expect("failed to run hipcc");
+                    if !output.status.success() {
+                        panic!(
+                            "hipcc failed for {src}:\n{}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    obj
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|job| job.join().unwrap()).collect()
+    });
+
+    let lib = out_dir.join("libmistralrscore_rocm.a");
+    let _ = std::fs::remove_file(&lib);
+    let status = Command::new("ar")
+        .arg("crs")
+        .arg(&lib)
+        .args(&objects)
+        .status()
+        .expect("failed to run ar");
+    assert!(status.success(), "failed to archive the ROCm kernels");
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=mistralrscore_rocm");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        rocm_path.join("lib").display()
+    );
+    println!("cargo:rustc-link-lib=dylib=amdhip64");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
 }
 
 #[cfg(feature = "cuda")]

@@ -51,7 +51,7 @@ pub enum GdnGateActivation {
 }
 
 impl GdnGateActivation {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub(crate) fn sigmoid_flag(self) -> i32 {
         i32::from(self == Self::Sigmoid)
     }

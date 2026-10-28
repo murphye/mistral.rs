@@ -10,6 +10,8 @@ pub mod fast_mmvq;
 mod ffi;
 #[cfg(all(feature = "cuda", has_marlin_kernels))]
 mod packed_affine;
+#[cfg(feature = "rocm")]
+mod rocm;
 mod weight_source;
 
 pub use weight_source::{
@@ -513,6 +515,12 @@ impl QuantMethod for GgufMatMul {
         // - x: (n_tokens, 1, hidden_dim) or (n_tokens, n_experts_per_tok, hidden_dim)
         // - indices: (n_tokens, n_experts_per_tok)
         // - weights (self): (n_experts, out_features, in_features)
+        #[cfg(feature = "rocm")]
+        if x.device().is_rocm() {
+            if let Some(res) = rocm::rocm_indexed_moe_forward(&self.w, x, indices)? {
+                return add_moe_bias(self.b.as_ref(), res, indices);
+            }
+        }
         // For CPU and Metal: use dequantize-then-matmul approach
         #[cfg(feature = "cuda")]
         let res = if x.device().is_cuda() {
@@ -524,20 +532,7 @@ impl QuantMethod for GgufMatMul {
         #[cfg(not(feature = "cuda"))]
         let res = cpu::cpu_indexed_moe_forward(&self.w, x, indices)?;
 
-        if let Some(b) = &self.b {
-            if b.rank() == 2 {
-                let mut shape = indices.dims().to_vec();
-                shape.push(b.dim(1)?);
-                let bias = b
-                    .index_select(&indices.flatten_all()?, 0)?
-                    .reshape(Shape::from(shape))?;
-                res.broadcast_add(&bias)
-            } else {
-                res.broadcast_add(b)
-            }
-        } else {
-            Ok(res)
-        }
+        add_moe_bias(self.b.as_ref(), res, indices)
     }
 
     fn get_qtensor(&self) -> Option<Arc<candle_core::quantized::QTensor>> {
@@ -1181,5 +1176,21 @@ mod tests {
             assert_embedding_matches_dequantized_gather(&device, dtype)?;
         }
         Ok(())
+    }
+}
+
+/// Adds the per-expert (rank 2) or shared bias to an indexed MoE output.
+fn add_moe_bias(bias: Option<&Tensor>, res: Tensor, indices: &Tensor) -> Result<Tensor> {
+    match bias {
+        Some(b) if b.rank() == 2 => {
+            let mut shape = indices.dims().to_vec();
+            shape.push(b.dim(1)?);
+            let bias = b
+                .index_select(&indices.flatten_all()?, 0)?
+                .reshape(Shape::from(shape))?;
+            res.broadcast_add(&bias)
+        }
+        Some(b) => res.broadcast_add(b),
+        None => Ok(res),
     }
 }

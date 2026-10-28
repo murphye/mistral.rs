@@ -1892,7 +1892,7 @@ __device__ __forceinline__ float gdn_grouped_k_sum(float value) {
 
 __device__ __forceinline__ void gdn_cp_async_cg_16(void *dst,
                                                    const void *src) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(USE_ROCM)
   const uint32_t dst_smem = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
                : : "r"(dst_smem), "l"(src));
@@ -1902,13 +1902,13 @@ __device__ __forceinline__ void gdn_cp_async_cg_16(void *dst,
 }
 
 __device__ __forceinline__ void gdn_cp_async_commit() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(USE_ROCM)
   asm volatile("cp.async.commit_group;\n" : :);
 #endif
 }
 
 __device__ __forceinline__ void gdn_cp_async_wait() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(USE_ROCM)
   asm volatile("cp.async.wait_group 0;\n" : :);
 #endif
 }

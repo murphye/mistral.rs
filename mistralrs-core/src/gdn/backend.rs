@@ -8,17 +8,19 @@ use crate::cuda::gdn::{
     FusedDecodeRecurrence, FusedPrefillOutput, FusedPrefillRecurrence, GdnStateSlots,
     RecurrenceInputs,
 };
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+use crate::cuda::gdn::{GdnStateSlots, RecurrenceInputs};
 use crate::kv_cache::RecurrentStateLayout;
 use crate::pipeline::RecurrentBatchKind;
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
 const RECURRENCE_CHUNK_THRESHOLD: usize = 64;
 const QK_NORM_EPS: f64 = 1e-6;
 const QK_NORM_EPS_F32: f32 = 1e-6;
 const SOFTPLUS_LINEAR_THRESHOLD: f32 = 20.0;
 const DECODE_STACK_HEAD_K_DIM: usize = 256;
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
 enum RecurrenceOutput {
     BatchHeadMajor(Tensor),
     #[allow(dead_code)]
@@ -171,6 +173,18 @@ pub fn compute_beta_g(
         let dt_bias_f32 = dt_bias.to_dtype(DType::F32)?.contiguous()?;
         let (beta_flat, g_flat) =
             crate::cuda::gdn::fused_gdn_gating_cuda(&b_flat, &a_flat, &a_log_f32, &dt_bias_f32)?;
+        let shape = b.shape();
+        return Ok((beta_flat.reshape(shape)?, g_flat.reshape(shape)?));
+    }
+
+    #[cfg(feature = "rocm")]
+    if b.device().is_rocm() {
+        let b_flat = b.contiguous()?.flatten_all()?;
+        let a_flat = a.contiguous()?.flatten_all()?;
+        let a_log_f32 = a_log.to_dtype(DType::F32)?.contiguous()?;
+        let dt_bias_f32 = dt_bias.to_dtype(DType::F32)?.contiguous()?;
+        let (beta_flat, g_flat) =
+            crate::rocm::gdn::fused_gdn_gating_rocm(&b_flat, &a_flat, &a_log_f32, &dt_bias_f32)?;
         let shape = b.shape();
         return Ok((beta_flat.reshape(shape)?, g_flat.reshape(shape)?));
     }
@@ -588,6 +602,11 @@ pub fn apply_recurrence(
         return recurrence_metal(q, k, v, g, beta, dims, batch_size, seq_len, cache, dtype);
     }
 
+    #[cfg(feature = "rocm")]
+    if q.device().is_rocm() && cache.state_layout == RecurrentStateLayout::GdnKeyMajor {
+        return recurrence_rocm(q, k, v, g, beta, dims, batch_size, seq_len, cache, dtype);
+    }
+
     if cache.state_layout != RecurrentStateLayout::GdnKeyMajor {
         candle_core::bail!(
             "CPU GDN recurrence requires key-major state, got {:?}",
@@ -641,6 +660,58 @@ fn recurrence_cuda(
         crate::cuda::gdn::gated_delta_rule_recurrence_cuda(inputs, &mut state_flat, slots)?
     };
 
+    finish_recurrence(
+        RecurrenceOutput::BatchHeadMajor(out_bh),
+        state_flat,
+        dims,
+        batch_size,
+        seq_len,
+        cache,
+        dtype,
+    )
+}
+
+/// Key-major recurrence with the CUDA kernels compiled for ROCm.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn recurrence_rocm(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    dims: &GdnDims,
+    batch_size: usize,
+    seq_len: usize,
+    cache: &mut GdnLayerCache,
+    dtype: DType,
+) -> Result<Tensor> {
+    use crate::rocm::gdn::RecurrenceKernel;
+
+    let q_bh = prepare_q_for_backend(q, dims, batch_size, seq_len)?;
+    let k_bh = prepare_kv_for_backend(k, dims, batch_size, seq_len, dims.head_k_dim)?;
+    let v_bh = prepare_kv_for_backend(v, dims, batch_size, seq_len, dims.head_v_dim)?;
+    let g_bh = prepare_gate_for_backend(g, dims, batch_size, seq_len)?;
+    let beta_bh = prepare_gate_for_backend(beta, dims, batch_size, seq_len)?;
+    let mut state_flat = prepare_state_for_backend(cache, dims, batch_size)?;
+    let slots = GdnStateSlots::from_option(cache.slots.as_ref());
+    let inputs = RecurrenceInputs {
+        q: &q_bh,
+        k: &k_bh,
+        v: &v_bh,
+        g: &g_bh,
+        beta: &beta_bh,
+    };
+    // Same policy as the CUDA backend's key-major path.
+    let kernel = if seq_len >= RECURRENCE_CHUNK_THRESHOLD && matches!(dims.head_k_dim, 64 | 128) {
+        RecurrenceKernel::Warp
+    } else if seq_len >= RECURRENCE_CHUNK_THRESHOLD {
+        RecurrenceKernel::Chunked
+    } else {
+        RecurrenceKernel::Scalar
+    };
+    let out_bh =
+        crate::rocm::gdn::gated_delta_rule_recurrence_rocm(kernel, inputs, &mut state_flat, slots)?;
     finish_recurrence(
         RecurrenceOutput::BatchHeadMajor(out_bh),
         state_flat,
@@ -775,7 +846,7 @@ fn recurrence_metal_from_convolved(
     )
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
 fn prepare_q_for_backend(
     q: &Tensor,
     dims: &GdnDims,
@@ -788,7 +859,7 @@ fn prepare_q_for_backend(
         .contiguous()
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
 fn prepare_kv_for_backend(
     x: &Tensor,
     dims: &GdnDims,
@@ -803,7 +874,7 @@ fn prepare_kv_for_backend(
         .contiguous()
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
 fn prepare_gate_for_backend(
     x: &Tensor,
     dims: &GdnDims,
@@ -817,7 +888,7 @@ fn prepare_gate_for_backend(
         .contiguous()
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
 fn recurrent_physical_dims(layout: RecurrentStateLayout, dims: &GdnDims) -> Result<(usize, usize)> {
     match layout {
         RecurrentStateLayout::GdnKeyMajor => Ok((dims.head_k_dim, dims.head_v_dim)),
@@ -826,7 +897,7 @@ fn recurrent_physical_dims(layout: RecurrentStateLayout, dims: &GdnDims) -> Resu
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
 fn prepare_state_for_backend(
     cache: &GdnLayerCache,
     dims: &GdnDims,
@@ -866,7 +937,7 @@ fn prepare_state_for_backend(
         .contiguous()
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
 fn finish_recurrence(
     output: RecurrenceOutput,
     state_flat: Tensor,
@@ -935,6 +1006,25 @@ fn causal_conv1d_update(
             .contiguous()?;
         let conv_state = cache.conv_state.contiguous()?;
         let (output, new_conv_state) = crate::cuda::gdn::causal_conv1d_cuda(
+            x,
+            &weight,
+            &conv_state,
+            dims.conv_kernel_size,
+            true,
+            GdnStateSlots::from_option(cache.slots.as_ref()),
+        )?;
+        cache.conv_state = new_conv_state;
+        return Ok(output);
+    }
+
+    #[cfg(feature = "rocm")]
+    if x.device().is_rocm() && matches!(x.dtype(), DType::F16 | DType::BF16) {
+        let weight = conv1d_weight
+            .squeeze(1)?
+            .to_dtype(x.dtype())?
+            .contiguous()?;
+        let conv_state = cache.conv_state.contiguous()?;
+        let (output, new_conv_state) = crate::rocm::gdn::causal_conv1d_rocm(
             x,
             &weight,
             &conv_state,
@@ -1070,6 +1160,25 @@ fn causal_conv1d_full(
             x,
             &weight,
             &cache.conv_state,
+            dims.conv_kernel_size,
+            false,
+            GdnStateSlots::from_option(cache.slots.as_ref()),
+        )?;
+        cache.conv_state = new_conv_state;
+        return Ok(output);
+    }
+
+    #[cfg(feature = "rocm")]
+    if x.device().is_rocm() && matches!(x.dtype(), DType::F16 | DType::BF16) {
+        let weight = conv1d_weight
+            .squeeze(1)?
+            .to_dtype(x.dtype())?
+            .contiguous()?;
+        let conv_state = cache.conv_state.contiguous()?;
+        let (output, new_conv_state) = crate::rocm::gdn::causal_conv1d_rocm(
+            x,
+            &weight,
+            &conv_state,
             dims.conv_kernel_size,
             false,
             GdnStateSlots::from_option(cache.slots.as_ref()),
@@ -1237,6 +1346,189 @@ mod tests {
                 diff <= ASSERT_EPS,
                 "idx={idx} lhs={lhs} rhs={rhs} diff={diff}"
             );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "rocm")]
+    fn max_abs_diff(lhs: &Tensor, rhs: &Tensor) -> CandleResult<f32> {
+        let lhs = lhs.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        let rhs = rhs.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        assert_eq!(lhs.shape(), rhs.shape());
+        (lhs - rhs)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn rocm_causal_conv1d_matches_cpu() -> CandleResult<()> {
+        const BATCH: usize = 2;
+        let rocm = Device::new_rocm(0)?;
+        for (dtype, tolerance) in [(DType::F16, 2e-3f32), (DType::BF16, 2e-2)] {
+            let dims = dims(2, 4, 64, 64);
+            let kernel_size = dims.conv_kernel_size;
+            for seq_len in [1usize, 7, 300] {
+                let x_cpu = Tensor::from_vec(
+                    patterned(BATCH * seq_len * dims.conv_dim, 1, 0.5, 0.1),
+                    (BATCH, seq_len, dims.conv_dim),
+                    &Device::Cpu,
+                )?
+                .to_dtype(dtype)?;
+                let weight = Tensor::from_vec(
+                    patterned(dims.conv_dim * kernel_size, 2, 0.4, -0.1),
+                    (dims.conv_dim, 1, kernel_size),
+                    &Device::Cpu,
+                )?
+                .to_dtype(dtype)?;
+                let state = Tensor::from_vec(
+                    patterned(BATCH * dims.conv_dim * kernel_size, 3, 0.5, 0.2),
+                    (BATCH, dims.conv_dim, kernel_size),
+                    &Device::Cpu,
+                )?
+                .to_dtype(dtype)?;
+                let cache = |device: &Device, dtype| -> CandleResult<GdnLayerCache> {
+                    Ok(GdnLayerCache::gathered(
+                        state.to_dtype(dtype)?.to_device(device)?,
+                        Tensor::zeros(
+                            (BATCH, dims.num_v_heads, dims.head_k_dim, dims.head_v_dim),
+                            DType::F32,
+                            device,
+                        )?,
+                        RecurrentStateLayout::GdnKeyMajor,
+                    ))
+                };
+                let to_f32 = |t: &Tensor| t.to_dtype(DType::F32);
+                let mut cpu_cache = cache(&Device::Cpu, DType::F32)?;
+                let mut rocm_cache = cache(&rocm, dtype)?;
+                let expected =
+                    causal_conv1d_full(&to_f32(&x_cpu)?, &to_f32(&weight)?, &dims, &mut cpu_cache)?;
+                let actual = causal_conv1d_full(
+                    &x_cpu.to_device(&rocm)?,
+                    &weight.to_device(&rocm)?,
+                    &dims,
+                    &mut rocm_cache,
+                )?;
+                let diff = max_abs_diff(&expected, &actual)?;
+                assert!(diff <= tolerance, "{dtype:?} full T={seq_len}: diff {diff}");
+                let diff = max_abs_diff(&cpu_cache.conv_state, &rocm_cache.conv_state)?;
+                assert!(
+                    diff <= tolerance,
+                    "{dtype:?} full state T={seq_len}: diff {diff}"
+                );
+
+                // One decode step on top of the prefilled state.
+                let step = Tensor::from_vec(
+                    patterned(BATCH * dims.conv_dim, 4, 0.5, 0.0),
+                    (BATCH, 1, dims.conv_dim),
+                    &Device::Cpu,
+                )?
+                .to_dtype(dtype)?;
+                let expected = causal_conv1d_update(
+                    &to_f32(&step)?,
+                    &to_f32(&weight)?,
+                    &dims,
+                    &mut cpu_cache,
+                )?;
+                let actual = causal_conv1d_update(
+                    &step.to_device(&rocm)?,
+                    &weight.to_device(&rocm)?,
+                    &dims,
+                    &mut rocm_cache,
+                )?;
+                let diff = max_abs_diff(&expected, &actual)?;
+                assert!(
+                    diff <= tolerance,
+                    "{dtype:?} update T={seq_len}: diff {diff}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn rocm_recurrence_from_convolved_matches_cpu() -> CandleResult<()> {
+        const BATCH: usize = 2;
+        let rocm = Device::new_rocm(0)?;
+        let dims = dims(2, 4, 128, 128);
+        let dtype = DType::BF16;
+        // Lengths that select the scalar, warp and chunked kernels.
+        for prefill_len in [5usize, 70, 300] {
+            let mixed = |len: usize, salt: usize| -> CandleResult<Tensor> {
+                Tensor::from_vec(
+                    patterned(BATCH * len * dims.conv_dim, salt, 0.5, 0.0),
+                    (BATCH, len, dims.conv_dim),
+                    &Device::Cpu,
+                )?
+                .to_dtype(dtype)
+            };
+            let gate_input = |len: usize, salt: usize| -> CandleResult<Tensor> {
+                Tensor::from_vec(
+                    patterned(BATCH * len * dims.num_v_heads, salt, 1.0, 0.0),
+                    (BATCH, len, dims.num_v_heads),
+                    &Device::Cpu,
+                )?
+                .to_dtype(dtype)
+            };
+            let a_log = Tensor::from_vec(
+                patterned(dims.num_v_heads, 11, 0.5, 0.0),
+                dims.num_v_heads,
+                &Device::Cpu,
+            )?;
+            let dt_bias = Tensor::from_vec(
+                patterned(dims.num_v_heads, 12, 0.5, 0.0),
+                dims.num_v_heads,
+                &Device::Cpu,
+            )?;
+            let new_cache = |device: &Device| -> CandleResult<GdnLayerCache> {
+                Ok(GdnLayerCache::gathered(
+                    Tensor::zeros((BATCH, dims.conv_dim, dims.conv_kernel_size), dtype, device)?,
+                    Tensor::zeros(
+                        (BATCH, dims.num_v_heads, dims.head_k_dim, dims.head_v_dim),
+                        DType::F32,
+                        device,
+                    )?,
+                    RecurrentStateLayout::GdnKeyMajor,
+                ))
+            };
+            let mut cpu_cache = new_cache(&Device::Cpu)?;
+            let mut rocm_cache = new_cache(&rocm)?;
+            for (step, len) in [prefill_len, 1, 1].into_iter().enumerate() {
+                let (x, b, a) = (
+                    mixed(len, step)?,
+                    gate_input(len, step + 20)?,
+                    gate_input(len, step + 40)?,
+                );
+                let run = |device: &Device, cache: &mut GdnLayerCache| {
+                    apply_recurrence_from_convolved(
+                        &x.to_device(device)?,
+                        &b.to_device(device)?,
+                        &a.to_device(device)?,
+                        &a_log.to_device(device)?,
+                        &dt_bias.to_device(device)?,
+                        &dims,
+                        BATCH,
+                        len,
+                        cache,
+                        dtype,
+                    )
+                };
+                let expected = run(&Device::Cpu, &mut cpu_cache)?;
+                let actual = run(&rocm, &mut rocm_cache)?;
+                let diff = max_abs_diff(&expected, &actual)?;
+                assert!(
+                    diff <= 2e-2,
+                    "T={prefill_len} step {step}: output diff {diff}"
+                );
+                let diff = max_abs_diff(&cpu_cache.recurrent_state, &rocm_cache.recurrent_state)?;
+                assert!(
+                    diff <= 1e-2,
+                    "T={prefill_len} step {step}: state diff {diff}"
+                );
+            }
         }
         Ok(())
     }
