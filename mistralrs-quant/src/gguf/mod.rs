@@ -480,6 +480,13 @@ impl QuantMethod for GgufMatMul {
             }
         }
 
+        // Candle's ROCm QMatMul takes half precision activations directly and only
+        // uses its (slower) f32 kernels for f32 inputs.
+        if a.device().is_rocm() && matches!(a.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+            let x = self.w.forward(a)?;
+            return self.add_bias(x);
+        }
+
         // Fallback: Candle QMatMul requires F32
         let original_dtype = a.dtype();
         let a_f32 = if original_dtype == DType::F32 {
@@ -575,9 +582,10 @@ impl QuantMethod for GgufMatMul {
         ) {
             return None;
         }
-        // cpu handles bf16 activations natively (widened once inside the packed matmul)
+        // cpu handles bf16 activations natively (widened once inside the packed matmul),
+        // and candle's ROCm QMatMul runs half precision activations without widening.
         if let QMatMul::QTensor(qt) = &self.w {
-            if qt.device().is_cpu() {
+            if qt.device().is_cpu() || qt.device().is_rocm() {
                 return None;
             }
         }
