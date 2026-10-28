@@ -1,5 +1,6 @@
 // Elementwise kernels that replace short chains of generic ops on ROCm: the
-// gated activation of GLU MLPs and the top-k weighted sum of MoE outputs.
+// gated activation of GLU MLPs, the top-k weighted sum of MoE outputs and the
+// partial NeoX RoPE of the Qwen4-Exp indexer.
 #include "cuda_bf16.h"
 #include "cuda_fp16.h"
 #include <stdint.h>
@@ -79,3 +80,41 @@ __global__ void moe_weighted_reduce_kernel(const T *__restrict__ ys, const float
 GLUE_OPS(float, f32)
 GLUE_OPS(__half, f16)
 GLUE_OPS(__nv_bfloat16, bf16)
+
+// NeoX RoPE over the first 2 * half dims of each head, in f32. x and out are
+// contiguous [rows, heads, d]; cos and sin are f32 [rows, half].
+template <typename T>
+__global__ void rope_partial_neox_kernel(const T *__restrict__ x, const float *__restrict__ cos,
+                                         const float *__restrict__ sin, T *__restrict__ out,
+                                         const int64_t n, const int heads, const int d,
+                                         const int half) {
+  const int64_t stride = (int64_t)gridDim.x * blockDim.x;
+  for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+    const int c = i % d;
+    const int64_t row = i / d / heads;
+    const float v = to_float(x[i]);
+    float r = v;
+    if (c < half) {
+      r = v * cos[row * half + c] - to_float(x[i + half]) * sin[row * half + c];
+    } else if (c < 2 * half) {
+      const int j = c - half;
+      r = v * cos[row * half + j] + to_float(x[i - half]) * sin[row * half + j];
+    }
+    out[i] = from_float<T>(r);
+  }
+}
+
+#define ROPE_OP(T, SUFFIX)                                                                     \
+  extern "C" void rope_partial_neox_##SUFFIX(const void *x, const float *cos, const float *sin, \
+                                             void *out, int64_t n, int heads, int d, int half, \
+                                             int64_t stream) {                                 \
+    const int threads = 256;                                                                   \
+    const int64_t blocks = (n + threads - 1) / threads;                                        \
+    rope_partial_neox_kernel<T><<<(unsigned)(blocks < 65535 ? blocks : 65535), threads, 0,     \
+                                  (cudaStream_t)stream>>>((const T *)x, cos, sin, (T *)out, n, \
+                                                          heads, d, half);                     \
+  }
+
+ROPE_OP(float, f32)
+ROPE_OP(__half, f16)
+ROPE_OP(__nv_bfloat16, bf16)

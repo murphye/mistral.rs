@@ -1,4 +1,4 @@
-//! Fused GLU activation and MoE top-k weighted sum.
+//! Fused GLU activation, MoE top-k weighted sum and partial NeoX RoPE.
 
 use std::ffi::c_void;
 
@@ -71,6 +71,40 @@ pub fn moe_weighted_reduce(ys: &Tensor, weights: &Tensor) -> Result<Tensor> {
             top_k as i32,
             hidden as i32,
             stream(&ys)?,
+        );
+    }
+    Ok(out)
+}
+
+/// NeoX RoPE over the first `2 * half` dims of `x: [b, s, heads, d]`, computed in
+/// f32, with `cos`/`sin` of shape `[b, s, half]`.
+pub fn rope_partial_neox(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let (b, s, heads, d) = x.dims4()?;
+    let half = cos.dim(candle_core::D::Minus1)?;
+    if cos.elem_count() != b * s * half || sin.elem_count() != b * s * half || 2 * half > d {
+        candle_core::bail!("rope_partial_neox: bad cos/sin shapes {:?} for x {:?}", cos.shape(), x.shape());
+    }
+    let x = x.contiguous()?;
+    let cos = cos.to_dtype(DType::F32)?.contiguous()?;
+    let sin = sin.to_dtype(DType::F32)?.contiguous()?;
+    let out = unsafe { Tensor::empty(x.shape(), x.dtype(), x.device()) }?;
+    let launch = match x.dtype() {
+        DType::F32 => crate::rocm::ffi::rope_partial_neox_f32,
+        DType::F16 => crate::rocm::ffi::rope_partial_neox_f16,
+        DType::BF16 => crate::rocm::ffi::rope_partial_neox_bf16,
+        dt => candle_core::bail!("rope_partial_neox: unsupported dtype {dt:?}"),
+    };
+    unsafe {
+        launch(
+            half_or_f32_ptr(&x, "x")? as *const c_void,
+            rocm_ptr::<f32>(&cos, "cos")? as *const f32,
+            rocm_ptr::<f32>(&sin, "sin")? as *const f32,
+            half_or_f32_ptr(&out, "out")? as *mut c_void,
+            x.elem_count() as i64,
+            heads as i32,
+            d as i32,
+            half as i32,
+            stream(&x)?,
         );
     }
     Ok(out)

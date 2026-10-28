@@ -246,7 +246,12 @@ impl QsaAttention {
             self.qsa.n_heads,
             self.qsa.head_dim,
         ))?;
-        let index_q = self.index_query(&index_q, &cos_sin)?;
+        // Unpaged dense steps attend to every key and never read the indexer query.
+        let index_q = if self.paged_attn.is_some() || matches!(step.mode, QsaMode::Sparse { .. }) {
+            self.index_query(&index_q, &cos_sin)?
+        } else {
+            index_q
+        };
         let raw_key = index_qk.narrow(D::Minus1, index_q_dim, self.qsa.head_dim)?;
 
         let y = match (&self.paged_attn, metadata) {
@@ -714,6 +719,10 @@ fn last_row_per_sequence(lens: &Tensor, n_seqs: usize) -> Result<Tensor> {
 
 /// NeoX RoPE over the first `2 * half` dims of `x: [b, s, heads, d]`; `cos`/`sin` are `[b, s, half]`.
 pub(super) fn rope_partial_neox(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "rocm")]
+    if x.device().is_rocm() {
+        return crate::rocm::moe_glue::rope_partial_neox(x, cos, sin);
+    }
     let half = cos.dim(D::Minus1)?;
     let d = x.dim(D::Minus1)?;
     let cos = cos.to_dtype(DType::F32)?.unsqueeze(2)?;
@@ -745,6 +754,26 @@ mod tests {
             .to_vec1::<f32>()?;
         // pairs (0, 2) rotate by 90 degrees, (1, 3) stay, dims 4.. pass through
         assert_eq!(out, [-2.0, 1.0, 0.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        Ok(())
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn rocm_partial_rope_matches_cpu() -> Result<()> {
+        let rocm = Device::new_rocm(0)?;
+        let x = Tensor::randn(0f32, 1.0, (2, 3, 4, 128), &Device::Cpu)?.to_dtype(DType::BF16)?;
+        let cos = Tensor::randn(0f32, 1.0, (2, 3, 32), &Device::Cpu)?;
+        let sin = Tensor::randn(0f32, 1.0, (2, 3, 32), &Device::Cpu)?;
+        let expected = rope_partial_neox(&x, &cos, &sin)?.to_dtype(DType::F32)?;
+        let got = rope_partial_neox(
+            &x.to_device(&rocm)?,
+            &cos.to_device(&rocm)?,
+            &sin.to_device(&rocm)?,
+        )?
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?;
+        let diff = (expected - got)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-2, "max diff {diff}");
         Ok(())
     }
 

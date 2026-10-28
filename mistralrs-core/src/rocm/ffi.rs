@@ -240,4 +240,7 @@ extern "C" {
     pub fn moe_weighted_reduce_f32(ys: *const c_void, weights: *const f32, out: *mut c_void, tokens: i32, top_k: i32, hidden: i32, stream: i64);
     pub fn moe_weighted_reduce_f16(ys: *const c_void, weights: *const f32, out: *mut c_void, tokens: i32, top_k: i32, hidden: i32, stream: i64);
     pub fn moe_weighted_reduce_bf16(ys: *const c_void, weights: *const f32, out: *mut c_void, tokens: i32, top_k: i32, hidden: i32, stream: i64);
+    pub fn rope_partial_neox_f32(x: *const c_void, cos: *const f32, sin: *const f32, out: *mut c_void, n: i64, heads: i32, d: i32, half: i32, stream: i64);
+    pub fn rope_partial_neox_f16(x: *const c_void, cos: *const f32, sin: *const f32, out: *mut c_void, n: i64, heads: i32, d: i32, half: i32, stream: i64);
+    pub fn rope_partial_neox_bf16(x: *const c_void, cos: *const f32, sin: *const f32, out: *mut c_void, n: i64, heads: i32, d: i32, half: i32, stream: i64);
 }
