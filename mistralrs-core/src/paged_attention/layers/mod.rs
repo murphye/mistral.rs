@@ -1,9 +1,21 @@
-#[cfg(any(all(feature = "cuda", target_family = "unix"), feature = "metal"))]
+#[cfg(any(
+    all(feature = "cuda", target_family = "unix"),
+    feature = "metal",
+    all(feature = "rocm", target_family = "unix")
+))]
 pub mod paged_attention;
-#[cfg(any(all(feature = "cuda", target_family = "unix"), feature = "metal"))]
+#[cfg(any(
+    all(feature = "cuda", target_family = "unix"),
+    feature = "metal",
+    all(feature = "rocm", target_family = "unix")
+))]
 pub use paged_attention::PagedAttention;
 
-#[cfg(not(any(all(feature = "cuda", target_family = "unix"), feature = "metal")))]
+#[cfg(not(any(
+    all(feature = "cuda", target_family = "unix"),
+    feature = "metal",
+    all(feature = "rocm", target_family = "unix")
+)))]
 pub mod paged_attention {
     use candle_core::{Device, Result, Tensor};
 
@@ -109,5 +121,9 @@ pub mod paged_attention {
     }
 }
 
-#[cfg(not(any(all(feature = "cuda", target_family = "unix"), feature = "metal")))]
+#[cfg(not(any(
+    all(feature = "cuda", target_family = "unix"),
+    feature = "metal",
+    all(feature = "rocm", target_family = "unix")
+)))]
 pub use paged_attention::PagedAttention;

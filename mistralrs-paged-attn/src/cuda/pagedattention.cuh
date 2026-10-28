@@ -34,7 +34,9 @@
 
 #include <algorithm>
 
-#ifndef USE_ROCM
+// MISTRALRS_ROCM_WAVE32: mistral.rs ROCm builds target wave32 GPUs (RDNA), where
+// the warp size is a compile-time 32 like on CUDA.
+#if !defined(USE_ROCM) || defined(MISTRALRS_ROCM_WAVE32)
 #define WARP_SIZE 32
 #else
 #define WARP_SIZE warpSize
@@ -92,7 +94,7 @@ inline __device__ float block_sum(float *red_smem, float sum) {
 }
 
 inline __device__ float fast_tanh(float x) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) && !defined(USE_ROCM)
 #if (__CUDACC_VER_MAJOR__ >= 11) && (__CUDA_ARCH__ >= 750)
   float y;
   asm volatile("tanh.approx.f32 %0, %1; " : "=f"(y) : "f"(x));

@@ -1416,7 +1416,7 @@ fn paged_flash_attention_supports(
         && block_size.is_multiple_of(32)
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", test))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "rocm", test))]
 #[allow(dead_code)]
 pub(crate) struct DecodePlanInput {
     pub attention_backend: AttentionBackendKind,
@@ -1426,7 +1426,7 @@ pub(crate) struct DecodePlanInput {
     pub has_sliding_window: bool,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", test))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "rocm", test))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DecodePlan {
     #[cfg(all(feature = "cuda", target_family = "unix"))]
@@ -1435,7 +1435,7 @@ pub(crate) enum DecodePlan {
     PagedAttention,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", test))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "rocm", test))]
 impl DecodePlan {
     pub(crate) fn requires_host_context_lengths(
         attention_backend: AttentionBackendKind,

@@ -264,7 +264,127 @@ fn main() -> Result<(), String> {
     mistralrs_metal_compile::compile_metallibs(&PAGED_ATTENTION_METAL_SOURCE_SET)
 }
 
-#[cfg(not(any(all(feature = "cuda", target_family = "unix"), feature = "metal")))]
+/// Kernels shared with the CUDA backend that the ROCm build compiles.
+#[cfg(all(feature = "rocm", not(feature = "cuda"), target_family = "unix"))]
+const ROCM_SOURCES: &[&str] = &[
+    "src/cuda/pagedattention_v1_f16.cu",
+    "src/cuda/pagedattention_v1_bf16.cu",
+    "src/cuda/pagedattention_v1_f32.cu",
+    "src/cuda/pagedattention_v2_f16.cu",
+    "src/cuda/pagedattention_v2_bf16.cu",
+    "src/cuda/pagedattention_v2_f32.cu",
+    "src/cuda/reshape_and_cache_kernel.cu",
+    "src/cuda/copy_blocks_kernel.cu",
+    "src/cuda/gather_kv_cache_kernel.cu",
+    "src/cuda/update_kvscales.cu",
+];
+
+/// Compiles the CUDA paged attention kernels with hipcc into a static library.
+///
+/// The CUDA toolkit names map onto HIP through candle-rocm-kernels' compatibility
+/// headers, and `USE_ROCM` selects vLLM's AMD code paths. The kernels assume a
+/// 32-wide warp, so only wave32 (RDNA) targets are built.
+#[cfg(all(feature = "rocm", not(feature = "cuda"), target_family = "unix"))]
+fn main() -> Result<()> {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    println!("cargo::rustc-check-cfg=cfg(has_fp8)");
+    println!("cargo::rustc-check-cfg=cfg(has_fa3_fp8_paged)");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/cuda");
+    println!("cargo:rerun-if-changed=src/rocm/compat");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
+
+    let rocm_path =
+        PathBuf::from(std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into()));
+    let hip_compat = PathBuf::from(
+        std::env::var("DEP_CANDLE_ROCM_KERNELS_HIP_COMPAT")
+            .expect("candle-rocm-kernels did not export its HIP compatibility headers"),
+    );
+    let archs: Vec<String> = std::env::var("DEP_CANDLE_ROCM_KERNELS_ARCHS")
+        .expect("candle-rocm-kernels did not export its target architectures")
+        .split(',')
+        .filter(|arch| {
+            ["gfx10", "gfx11", "gfx12"]
+                .iter()
+                .any(|p| arch.starts_with(p))
+        })
+        .map(String::from)
+        .collect();
+    if archs.is_empty() {
+        anyhow::bail!("paged attention on ROCm needs a wave32 (gfx10/gfx11/gfx12) target");
+    }
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+    let hipcc = rocm_path.join("bin/hipcc");
+    let objects = std::thread::scope(|scope| -> Result<Vec<PathBuf>> {
+        let jobs: Vec<_> = ROCM_SOURCES
+            .iter()
+            .map(|src| {
+                let (hipcc, hip_compat, archs, out_dir) = (&hipcc, &hip_compat, &archs, &out_dir);
+                scope.spawn(move || -> Result<PathBuf> {
+                    let stem = std::path::Path::new(src)
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy();
+                    let obj = out_dir.join(format!("{stem}.o"));
+                    let mut cmd = Command::new(hipcc);
+                    cmd.args(["-c", "-fPIC", "-O3", "-std=c++17", "-munsafe-fp-atomics"])
+                        .args([
+                            "-DUSE_ROCM",
+                            "-DMISTRALRS_ROCM_WAVE32",
+                            "-Wno-unused-result",
+                        ])
+                        .arg("-include")
+                        .arg(hip_compat.join("candle_hip_prelude.h"))
+                        .arg("-I")
+                        .arg(hip_compat)
+                        .args(["-I", "src/rocm/compat", "-I", "src/cuda"]);
+                    for arch in archs {
+                        cmd.arg(format!("--offload-arch={arch}"));
+                    }
+                    let output = cmd.arg("-o").arg(&obj).arg(src).output()?;
+                    if !output.status.success() {
+                        anyhow::bail!(
+                            "hipcc failed for {src}:\n{}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    Ok(obj)
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|job| job.join().unwrap()).collect()
+    })?;
+
+    let lib = out_dir.join("libmistralrspagedattention_rocm.a");
+    let _ = std::fs::remove_file(&lib);
+    let status = Command::new("ar")
+        .arg("crs")
+        .arg(&lib)
+        .args(&objects)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to archive the ROCm paged attention kernels");
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=mistralrspagedattention_rocm");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        rocm_path.join("lib").display()
+    );
+    println!("cargo:rustc-link-lib=dylib=amdhip64");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+    Ok(())
+}
+
+#[cfg(not(any(
+    all(feature = "cuda", target_family = "unix"),
+    feature = "metal",
+    all(feature = "rocm", target_family = "unix")
+)))]
 fn main() -> Result<()> {
     // Declare expected cfg values for check-cfg lint
     println!("cargo::rustc-check-cfg=cfg(has_fp8)");

@@ -135,6 +135,7 @@ pub mod defaults {
     pub const PAGED_ATTN_CPU: bool = false;
     pub const PAGED_ATTN_CUDA: bool = true;
     pub const PAGED_ATTN_METAL: bool = true;
+    pub const PAGED_ATTN_ROCM: bool = true;
     pub const CPU: bool = false;
     pub const ENABLE_SEARCH: bool = false;
     pub const SEARCH_EMBEDDING_MODEL: Option<SearchEmbeddingModel> = None;
@@ -251,7 +252,7 @@ pub struct MistralRsForServerBuilder {
     /// PagedAttention tokens per block, defaulting to 32 on CUDA and Metal.
     paged_attn_block_size: Option<usize>,
 
-    /// Enables or disables PagedAttention. By default, PagedAttention is enabled on CUDA and Metal (and not supported on CPU). Use this to override the default behavior.
+    /// Enables or disables PagedAttention. By default, PagedAttention is enabled on CUDA, Metal and ROCm (and not supported on CPU). Use this to override the default behavior.
     paged_attn: Option<bool>,
 
     /// Use CPU only
@@ -1429,6 +1430,8 @@ fn configure_paged_attn(device: &Device, paged_attn: Option<bool>) -> Result<boo
         paged_attn.unwrap_or(defaults::PAGED_ATTN_CUDA)
     } else if device.is_metal() {
         paged_attn.unwrap_or(defaults::PAGED_ATTN_METAL)
+    } else if device.is_rocm() {
+        paged_attn.unwrap_or(defaults::PAGED_ATTN_ROCM)
     } else {
         false
     })

@@ -11,6 +11,11 @@ mod cuda;
 #[cfg(all(feature = "cuda", target_family = "unix"))]
 pub use cuda::*;
 
+#[cfg(all(feature = "rocm", not(feature = "cuda"), target_family = "unix"))]
+mod rocm;
+#[cfg(all(feature = "rocm", not(feature = "cuda"), target_family = "unix"))]
+pub use rocm::*;
+
 #[cfg(feature = "metal")]
 mod metal;
 #[cfg(feature = "metal")]

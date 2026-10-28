@@ -16,7 +16,7 @@ pub struct CacheOptions {
 #[serde(deny_unknown_fields)]
 pub struct PagedAttentionOptions {
     /// PagedAttention mode
-    /// - auto: enabled on CUDA and Metal, disabled on CPU (default)
+    /// - auto: enabled on CUDA, Metal and ROCm, disabled on CPU (default)
     /// - on: force enable (fails if unsupported)
     /// - off: force disable
     #[arg(long = "paged-attn", default_value = "auto", value_enum)]
@@ -57,7 +57,7 @@ impl Default for PagedAttentionOptions {
 #[derive(Clone, Copy, ValueEnum, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PagedAttnMode {
-    /// Automatic: enabled on CUDA and Metal, disabled on CPU
+    /// Automatic: enabled on CUDA, Metal and ROCm, disabled on CPU
     #[default]
     Auto,
     /// Force enable (error if device doesn't support it)
