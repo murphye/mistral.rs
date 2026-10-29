@@ -243,6 +243,7 @@ fn main() {
 /// CUDA kernels from `src/cuda` that the ROCm backend uses.
 #[cfg(all(feature = "rocm", not(feature = "cuda")))]
 const ROCM_SOURCES: &[&str] = &[
+    "src/cuda/attention_prep.cu",
     "src/cuda/gdn.cu",
     "src/cuda/moe_router.cu",
     "src/cuda/qwen4_exp.cu",

@@ -3045,6 +3045,25 @@ pub fn qk_rms_norm_mrope_layout(
         };
     }
 
+    #[cfg(feature = "rocm")]
+    if let Some((q, k)) = crate::ops::try_rocm_qk_rms_norm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        q_eps as f32,
+        k_eps as f32,
+        &cos,
+        &sin,
+        is_gpt_neox,
+        tokens_first,
+    )? {
+        return if tokens_first {
+            Ok((q.transpose(1, 2)?, k.transpose(1, 2)?))
+        } else {
+            Ok((q, k))
+        };
+    }
     let q = candle_nn::ops::rms_norm(&q.contiguous()?, q_weight, q_eps as f32)?;
     let k = candle_nn::ops::rms_norm(&k.contiguous()?, k_weight, k_eps as f32)?;
     apply_rotary_preselected_qk(&q, &k, &cos, &sin, is_gpt_neox)

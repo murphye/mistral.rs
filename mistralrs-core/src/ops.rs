@@ -5594,6 +5594,120 @@ pub(crate) enum QkRopeOutputLayout {
     TokensFirst,
 }
 
+/// ROCm counterpart of [`try_cuda_qk_rms_norm_rope`] for q `[batch, heads, seq, head_dim]`
+/// (any strides) and k of the same layout, cos/sin `[rows, rot_dim]`: RMSNorm per head and
+/// RoPE in one launch, written head-major or token-major.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_rocm_qk_rms_norm_rope(
+    q: &Tensor,
+    k: &Tensor,
+    q_weight: &Tensor,
+    k_weight: &Tensor,
+    q_eps: f32,
+    k_eps: f32,
+    cos: &Tensor,
+    sin: &Tensor,
+    is_neox: bool,
+    tokens_first: bool,
+) -> Result<Option<(Tensor, Tensor)>> {
+    use std::ffi::c_void;
+    if !q.device().is_rocm() {
+        return Ok(None);
+    }
+    let dtype = q.dtype();
+    // attention_prep.cu's dtype ids: 0 f16, 1 bf16, 2 f32.
+    let dtype_id = match dtype {
+        DType::F16 => 0,
+        DType::BF16 => 1,
+        DType::F32 => 2,
+        _ => return Ok(None),
+    };
+    if [k, q_weight, k_weight, cos, sin].iter().any(|t| t.dtype() != dtype || !t.device().same_device(q.device())) {
+        return Ok(None);
+    }
+    let (batch, q_heads, seq_len, head_dim) = q.dims4()?;
+    let (k_batch, k_heads, k_seq_len, k_head_dim) = k.dims4()?;
+    if (k_batch, k_seq_len, k_head_dim) != (batch, seq_len, head_dim)
+        || q_weight.dims1()? != head_dim
+        || k_weight.dims1()? != head_dim
+    {
+        return Ok(None);
+    }
+    let (cos_rows, rot_dim) = cos.dims2()?;
+    if sin.dims2()? != (cos_rows, rot_dim) || rot_dim == 0 || rot_dim * 2 > head_dim {
+        return Ok(None);
+    }
+    let cos_batch_stride = if cos_rows == seq_len {
+        0
+    } else if cos_rows == batch * seq_len {
+        seq_len
+    } else {
+        return Ok(None);
+    };
+    let cos = cos.contiguous()?;
+    let sin = sin.contiguous()?;
+    let q_weight = q_weight.contiguous()?;
+    let k_weight = k_weight.contiguous()?;
+    fn ptr(t: &Tensor) -> Result<u64> {
+        let (storage, layout) = t.storage_and_layout();
+        let candle_core::Storage::Rocm(s) = &*storage else {
+            candle_core::bail!("fused qk norm rope needs rocm tensors");
+        };
+        let off = layout.start_offset();
+        Ok(match t.dtype() {
+            DType::F32 => s.as_rocm_slice::<f32>()?.slice(off..).device_ptr(),
+            DType::F16 => s.as_rocm_slice::<half::f16>()?.slice(off..).device_ptr(),
+            DType::BF16 => s.as_rocm_slice::<half::bf16>()?.slice(off..).device_ptr(),
+            dt => candle_core::bail!("fused qk norm rope: unsupported dtype {dt:?}"),
+        })
+    }
+    let (q_shape, k_shape) = if tokens_first {
+        ((batch, seq_len, q_heads, head_dim), (batch, seq_len, k_heads, head_dim))
+    } else {
+        ((batch, q_heads, seq_len, head_dim), (batch, k_heads, seq_len, head_dim))
+    };
+    let q_out = unsafe { Tensor::empty(q_shape, dtype, q.device()) }?;
+    let k_out = unsafe { Tensor::empty(k_shape, dtype, q.device()) }?;
+    let q_stride = q.layout().stride().to_vec();
+    let k_stride = k.layout().stride().to_vec();
+    let stream = q.device().as_rocm_device()?.hip_stream().raw() as i64;
+    unsafe {
+        crate::rocm::ffi::qk_rms_norm_rope(
+            ptr(q)? as *const c_void,
+            ptr(k)? as *const c_void,
+            ptr(&q_weight)? as *const c_void,
+            ptr(&k_weight)? as *const c_void,
+            ptr(&cos)? as *const c_void,
+            ptr(&sin)? as *const c_void,
+            ptr(&q_out)? as *mut c_void,
+            ptr(&k_out)? as *mut c_void,
+            q_stride[0] as i64,
+            q_stride[1] as i64,
+            q_stride[2] as i64,
+            q_stride[3] as i64,
+            k_stride[0] as i64,
+            k_stride[1] as i64,
+            k_stride[2] as i64,
+            k_stride[3] as i64,
+            batch as i32,
+            q_heads as i32,
+            k_heads as i32,
+            seq_len as i32,
+            head_dim as i32,
+            rot_dim as i32,
+            cos_batch_stride as i32,
+            q_eps,
+            k_eps,
+            i32::from(is_neox),
+            dtype_id,
+            i32::from(tokens_first),
+            stream,
+        );
+    }
+    Ok(Some((q_out, k_out)))
+}
+
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_cuda_qk_rms_norm_rope(

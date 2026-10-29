@@ -199,6 +199,38 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn qk_rms_norm_rope(
+        q: *const c_void,
+        k: *const c_void,
+        q_weight: *const c_void,
+        k_weight: *const c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        q_stride_b: i64,
+        q_stride_h: i64,
+        q_stride_s: i64,
+        q_stride_d: i64,
+        k_stride_b: i64,
+        k_stride_h: i64,
+        k_stride_s: i64,
+        k_stride_d: i64,
+        batch: i32,
+        q_heads: i32,
+        k_heads: i32,
+        seq_len: i32,
+        head_dim: i32,
+        rot_dim: i32,
+        cos_batch_stride: i32,
+        q_eps: f32,
+        k_eps: f32,
+        is_neox: i32,
+        dtype: i32,
+        output_token_major: i32,
+        stream: i64,
+    );
+
     pub fn moe_router_topk_f32(
         logits: *const c_void,
         weights: *mut c_void,
