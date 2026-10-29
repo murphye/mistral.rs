@@ -179,6 +179,24 @@ pub fn set_control_comm(comm: &std::sync::Arc<Comm>) {
     }
 }
 
+/// The smallest `value` over the tensor-parallel ranks, or `value` itself without tensor
+/// parallelism. Ranks size shared resources (the KV cache) from their own device's free memory,
+/// which differs between cards; the scheduler's decisions must not, so they take the minimum.
+pub fn min_across_ranks(value: usize) -> Result<usize> {
+    let Some(comm) = CONTROL_COMM.get() else {
+        return Ok(value);
+    };
+    match &**comm {
+        #[cfg(feature = "rccl")]
+        Comm::Rccl(rccl_comm) => {
+            let clipped = u32::try_from(value).unwrap_or(u32::MAX);
+            let max_negated = rccl::all_reduce_max_u32(rccl_comm, u32::MAX - clipped)?;
+            Ok((u32::MAX - max_negated) as usize)
+        }
+        _ => Ok(value),
+    }
+}
+
 /// Rank 0's `value` on every tensor-parallel rank (the others pass anything; it is ignored), or
 /// `value` itself without tensor parallelism or on backends that keep ranks in step another way.
 pub fn broadcast_from_first_rank(value: usize) -> Result<usize> {

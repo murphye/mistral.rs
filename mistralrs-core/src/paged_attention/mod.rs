@@ -876,7 +876,12 @@ pub fn calculate_cache_config(
             allocation_budget,
         ));
     }
-    let num_gpu_blocks = requested_blocks.unwrap_or(available_blocks);
+    // Tensor-parallel ranks plan from their own card's free memory, which differs by what else
+    // the card holds; the schedulers must see one block count or they preempt at different
+    // moments and the ranks' collectives stop matching.
+    let num_gpu_blocks = mistralrs_quant::distributed::min_across_ranks(
+        requested_blocks.unwrap_or(available_blocks),
+    )?;
     if num_gpu_blocks < 2 {
         anyhow::bail!("Insufficient memory for a usable KV cache after weights and runtime reservations. Reduce concurrency or prefill work, change device placement, or disable paged attention.");
     }
