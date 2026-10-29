@@ -233,10 +233,11 @@ __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
   __threadfence_system();
   __syncthreads();
   if (threadIdx.x == 0) {
-    const unsigned int done = atomicAdd(pushed, 1u);
+    // Every workgroup's pushes are fenced before its increment; an acquire-release increment
+    // at system scope orders them all before the last workgroup's flag stores.
+    const unsigned int done =
+        __hip_atomic_fetch_add(pushed, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
     if (done == (unsigned int)rows - 1) {
-      // Every workgroup's pushes are fenced before its increment; publish them.
-      __threadfence_system();
       for (int peer = 0; peer < world; ++peer) {
         if (peer != rank) {
           int *flags = reinterpret_cast<int *>(peers[world + peer]);
