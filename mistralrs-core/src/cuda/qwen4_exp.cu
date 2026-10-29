@@ -79,6 +79,45 @@ __device__ __forceinline__ void q4_load8(const T *__restrict__ p, float *out) {
   }
 }
 
+// An OCP e4m3 (fp8) KV cache element: sign, four exponent bits (bias 7), three mantissa bits;
+// exponent 0 is subnormal and 0x7f / 0xff are NaN. Decoded in software so the CUDA and HIP
+// builds agree bit for bit.
+__device__ __forceinline__ float q4_fp8_f(uint8_t v) {
+  const int sign = v >> 7, exp = (v >> 3) & 0xF, man = v & 0x7;
+  float f;
+  if (exp == 0) {
+    f = ldexpf((float)man, -9);  // 2^-6 * man / 8
+  } else if (exp == 15 && man == 7) {
+    f = __int_as_float(0x7fc00000);
+  } else {
+    f = ldexpf(1.0f + (float)man * 0.125f, exp - 7);
+  }
+  return sign ? -f : f;
+}
+
+// A cache element as a float: the activation type as is, fp8 decoded and scaled.
+template <typename TC> __device__ __forceinline__ float q4_cache_f(TC v, float scale) {
+  return q4_f(v);
+}
+template <> __device__ __forceinline__ float q4_cache_f<uint8_t>(uint8_t v, float scale) {
+  return q4_fp8_f(v) * scale;
+}
+
+// Eight consecutive cache elements as floats.
+template <typename TC>
+__device__ __forceinline__ void q4_load8c(const TC *__restrict__ p, float scale, float *out) {
+  const Q4Vec8<TC> vec = *reinterpret_cast<const Q4Vec8<TC> *>(p);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    out[i] = q4_cache_f<TC>(vec.v[i], scale);
+  }
+}
+
+// The key cache packs `Q4_CACHE_X<TC>` elements (16 bytes) per [block_size] column group.
+template <typename TC> struct Q4CacheX {
+  static constexpr int value = 16 / (int)sizeof(TC);
+};
+
 // Flattened token -> logical sequence mapping. A null tok_seq is the
 // rectangular layout: every sequence has q_len consecutive new tokens (decode
 // is q_len 1). tok_seq < 0 marks padding.
@@ -931,13 +970,13 @@ __global__ void q4_qsa_topk_kernel(const float *__restrict__ scores,
 // flashinfer_layout: K and V are [blocks, kv_heads, block_size, 256]; otherwise
 // K is [blocks, kv_heads, 256/8, block_size, 8] and V is [blocks, kv_heads,
 // 256, block_size].
-template <typename T>
+template <typename T, typename TC>
 __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
-    const T *__restrict__ q, const T *__restrict__ k_cache,
-    const T *__restrict__ v_cache, Q4Tokens l, Q4Paged pg,
+    const T *__restrict__ q, const TC *__restrict__ k_cache,
+    const TC *__restrict__ v_cache, Q4Tokens l, Q4Paged pg,
     const int *__restrict__ selected, const int *__restrict__ n_selected,
     int topk, int ratio, int n_q_heads, int n_kv_heads, int items_per_split,
-    float scale, int flashinfer_layout, T *__restrict__ out,
+    float scale, int flashinfer_layout, float k_scale, float v_scale, T *__restrict__ out,
     float *__restrict__ part_acc, float *__restrict__ part_ml,
     const T *__restrict__ gate, int64_t gate_tok_stride, int gate_head_stride,
     Q4Q8Block *__restrict__ q8_out) {
@@ -991,10 +1030,11 @@ __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
   }
 
   const size_t head_stride_fi = (size_t)pg.block_size * Q4_ATTN_HEAD_DIM;
+  constexpr int X = Q4CacheX<TC>::value;
   for (int it0 = begin; it0 < end; it0 += Q4_ATTN_ITEMS) {
     // Resolve and load a batch of items up front so the dependent loads overlap
-    const T *kp[Q4_ATTN_ITEMS];
-    const T *vp[Q4_ATTN_ITEMS];
+    const TC *kp[Q4_ATTN_ITEMS];
+    const TC *vp[Q4_ATTN_ITEMS];
 #pragma unroll
     for (int j = 0; j < Q4_ATTN_ITEMS; ++j) {
       const int it = min(it0 + j, end - 1);
@@ -1014,10 +1054,11 @@ __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
         kp[j] = k_cache + base;
         vp[j] = v_cache + base;
       } else {
-        kp[j] =
-            k_cache +
-            (head_base * (Q4_ATTN_HEAD_DIM / 8) + lane) * pg.block_size * 8 +
-            (size_t)off * 8;
+        // K: [blocks, kv_heads, 256/X, block_size, X]; the lane's eight elements
+        // d = lane * 8 .. +8 lie in one X-wide column group.
+        kp[j] = k_cache +
+                (head_base * (Q4_ATTN_HEAD_DIM / X) + (lane * 8) / X) * pg.block_size * X +
+                (size_t)off * X + (lane * 8) % X;
         vp[j] = v_cache +
                 (head_base * Q4_ATTN_HEAD_DIM + lane * 8) * pg.block_size + off;
       }
@@ -1026,13 +1067,13 @@ __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
     float vf[Q4_ATTN_ITEMS][8];
 #pragma unroll
     for (int j = 0; j < Q4_ATTN_ITEMS; ++j) {
-      q4_load8(kp[j], kf[j]);
+      q4_load8c<TC>(kp[j], k_scale, kf[j]);
       if (flashinfer_layout) {
-        q4_load8(vp[j], vf[j]);
+        q4_load8c<TC>(vp[j], v_scale, vf[j]);
       } else {
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-          vf[j][i] = q4_f(vp[j][(size_t)i * pg.block_size]);
+          vf[j][i] = q4_cache_f<TC>(vp[j][(size_t)i * pg.block_size], v_scale);
         }
       }
     }
@@ -1226,14 +1267,15 @@ q4_qsa_attention_reduce_kernel(const float *__restrict__ part_acc,
 #define Q4W_LD (Q4_ATTN_HEAD_DIM + 8)
 #define Q4W_THREADS 128
 
-template <typename T>
+template <typename T, typename TC>
 __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
-    const T *__restrict__ q, const T *__restrict__ k_cache,
-    const T *__restrict__ v_cache, Q4Tokens l, Q4Paged pg,
+    const T *__restrict__ q, const TC *__restrict__ k_cache,
+    const TC *__restrict__ v_cache, Q4Tokens l, Q4Paged pg,
     const int *__restrict__ selected, const int *__restrict__ n_selected,
     int topk, int ratio, int n_q_heads, int n_kv_heads, float scale,
-    int flashinfer_layout, T *__restrict__ out) {
+    int flashinfer_layout, float k_scale, float v_scale, T *__restrict__ out) {
   using namespace rocwmma;
+  constexpr int X = Q4CacheX<TC>::value;
   // fp16 operands: after the q/k norms the scores, probabilities and values are small,
   // and fp16's mantissa keeps the products ~8x closer to the f32 kernel than bf16.
   using bf = rocwmma::float16_t;
@@ -1243,8 +1285,8 @@ __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
   __shared__ float s_part[4][Q4W_ROWS * Q4W_ITEMS];
   __shared__ bf p_lds[Q4W_ROWS * (Q4W_ITEMS + 8)];
   __shared__ float m_row[Q4W_ROWS], l_row[Q4W_ROWS], corr_row[Q4W_ROWS];
-  __shared__ const T *k_item[Q4W_ITEMS];
-  __shared__ const T *v_item[Q4W_ITEMS];
+  __shared__ const TC *k_item[Q4W_ITEMS];
+  __shared__ const TC *v_item[Q4W_ITEMS];
 
   const int t = blockIdx.x;
   const int g = blockIdx.y;
@@ -1286,7 +1328,7 @@ __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
     __syncthreads();
     if (tid < Q4W_ITEMS) {
       const int it = it0 + tid;
-      const T *kp = nullptr, *vp = nullptr;
+      const TC *kp = nullptr, *vp = nullptr;
       if (it < n_items) {
         const int p = it < n_block_items
                           ? selected[(size_t)t * topk + it / ratio] * ratio + it % ratio
@@ -1298,8 +1340,8 @@ __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
           kp = k_cache + head_base * head_stride_fi + (size_t)off * Q4_ATTN_HEAD_DIM;
           vp = v_cache + head_base * head_stride_fi + (size_t)off * Q4_ATTN_HEAD_DIM;
         } else {
-          // K: [blocks, kv_heads, 256/8, block_size, 8]; V: [blocks, kv_heads, 256, block_size].
-          kp = k_cache + head_base * Q4_ATTN_HEAD_DIM * pg.block_size + (size_t)off * 8;
+          // K: [blocks, kv_heads, 256/X, block_size, X]; V: [blocks, kv_heads, 256, block_size].
+          kp = k_cache + head_base * Q4_ATTN_HEAD_DIM * pg.block_size + (size_t)off * X;
           vp = v_cache + head_base * Q4_ATTN_HEAD_DIM * pg.block_size + off;
         }
       }
@@ -1307,12 +1349,17 @@ __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
       v_item[tid] = vp;
     }
     __syncthreads();
+    // K in groups of eight elements; with X elements per 16-byte column group, group c of
+    // eight sits at column group c * 8 / X, offset (c * 8) % X.
     for (int e = tid; e < Q4W_ITEMS * (Q4_ATTN_HEAD_DIM / 8); e += Q4W_THREADS) {
       const int j = e / (Q4_ATTN_HEAD_DIM / 8), c = e % (Q4_ATTN_HEAD_DIM / 8);
-      const T *kp = k_item[j];
+      const TC *kp = k_item[j];
       float kv[8];
       if (kp) {
-        q4_load8(flashinfer_layout ? kp + c * 8 : kp + (size_t)c * pg.block_size * 8, kv);
+        const TC *src = flashinfer_layout
+                            ? kp + c * 8
+                            : kp + (size_t)((c * 8) / X) * pg.block_size * X + (c * 8) % X;
+        q4_load8c<TC>(src, k_scale, kv);
       } else {
 #pragma unroll
         for (int i = 0; i < 8; ++i) kv[i] = 0.0f;
@@ -1324,20 +1371,26 @@ __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
     // the ratio (4), so a full group is four consecutive positions of one paged block.
     for (int e = tid; e < (Q4W_ITEMS / 4) * Q4_ATTN_HEAD_DIM; e += Q4W_THREADS) {
       const int a = e / Q4_ATTN_HEAD_DIM, d = e % Q4_ATTN_HEAD_DIM;
-      const T *v0 = v_item[4 * a];
+      const TC *v0 = v_item[4 * a];
       const bool full = !flashinfer_layout && v0 && v_item[4 * a + 3] && ratio == 4 &&
                         v_item[4 * a + 3] == v0 + 3;
       if (full) {
-        const uint2 packed = *(const uint2 *)(v0 + (size_t)d * pg.block_size);
-        const T *vals = (const T *)&packed;
+        struct __align__(4 * sizeof(TC)) Vec4 {
+          TC v[4];
+        };
+        const Vec4 packed = *reinterpret_cast<const Vec4 *>(v0 + (size_t)d * pg.block_size);
 #pragma unroll
-        for (int u = 0; u < 4; ++u) v_lds[(4 * a + u) * Q4W_LD + d] = static_cast<bf>(q4_f(vals[u]));
+        for (int u = 0; u < 4; ++u) {
+          v_lds[(4 * a + u) * Q4W_LD + d] = static_cast<bf>(q4_cache_f<TC>(packed.v[u], v_scale));
+        }
       } else {
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
-          const T *vp = v_item[4 * a + u];
+          const TC *vp = v_item[4 * a + u];
           float v = 0.0f;
-          if (vp) v = q4_f(flashinfer_layout ? vp[d] : vp[(size_t)d * pg.block_size]);
+          if (vp) {
+            v = q4_cache_f<TC>(flashinfer_layout ? vp[d] : vp[(size_t)d * pg.block_size], v_scale);
+          }
           v_lds[(4 * a + u) * Q4W_LD + d] = static_cast<bf>(v);
         }
       }
@@ -1716,34 +1769,51 @@ extern "C" void qwen4_qsa_attention(
     int ratio, int n_q_heads, int n_kv_heads, int splits, int items_per_split,
     float scale, int flashinfer_layout, void *out, float *part_acc,
     float *part_ml, const void *gate, int64_t gate_tok_stride,
-    int gate_head_stride, void *q8_out, int dtype, int64_t stream) {
+    int gate_head_stride, void *q8_out, int dtype, int cache_fp8, float k_scale,
+    float v_scale, int64_t stream) {
   if (layout.n_tokens == 0) {
     return;
   }
   const cudaStream_t s = (cudaStream_t)stream;
+  // `cache_fp8` selects an OCP e4m3 cache (elements decoded with k_scale / v_scale);
+  // otherwise the cache holds the activation type.
+#define Q4_QSA_WITH_CACHE_T(...)                                               \
+  do {                                                                         \
+    if (cache_fp8) {                                                           \
+      using cache_t = uint8_t;                                                 \
+      __VA_ARGS__;                                                             \
+    } else {                                                                   \
+      using cache_t = scalar_t;                                                \
+      __VA_ARGS__;                                                             \
+    }                                                                          \
+  } while (0)
 #ifdef USE_ROCM
   // Prefill batches take the WMMA kernel; decode keeps the split kernel below.
   if (gate == nullptr && q8_out == nullptr && layout.n_tokens >= 64 && n_q_heads % n_kv_heads == 0 &&
       n_q_heads / n_kv_heads <= Q4W_ROWS) {
     const dim3 wgrid(layout.n_tokens, n_kv_heads);
     Q4_DISPATCH_HALF(dtype, {
-      q4_qsa_attention_wmma_kernel<scalar_t><<<wgrid, Q4W_THREADS, 0, s>>>(
-          (const scalar_t *)q, (const scalar_t *)k_cache,
-          (const scalar_t *)v_cache, layout, paged, selected, n_selected, topk,
-          ratio, n_q_heads, n_kv_heads, scale, flashinfer_layout,
-          (scalar_t *)out);
+      Q4_QSA_WITH_CACHE_T({
+        q4_qsa_attention_wmma_kernel<scalar_t, cache_t><<<wgrid, Q4W_THREADS, 0, s>>>(
+            (const scalar_t *)q, (const cache_t *)k_cache,
+            (const cache_t *)v_cache, layout, paged, selected, n_selected, topk,
+            ratio, n_q_heads, n_kv_heads, scale, flashinfer_layout, k_scale, v_scale,
+            (scalar_t *)out);
+      });
     });
     return;
   }
 #endif
   const dim3 grid(layout.n_tokens, n_kv_heads, splits);
   Q4_DISPATCH_HALF(dtype, {
-    q4_qsa_attention_kernel<scalar_t><<<grid, Q4_ATTN_WARPS * 32, 0, s>>>(
-        (const scalar_t *)q, (const scalar_t *)k_cache,
-        (const scalar_t *)v_cache, layout, paged, selected, n_selected, topk,
-        ratio, n_q_heads, n_kv_heads, items_per_split, scale, flashinfer_layout,
-        (scalar_t *)out, part_acc, part_ml, (const scalar_t *)gate, gate_tok_stride,
-        gate_head_stride, (Q4Q8Block *)q8_out);
+    Q4_QSA_WITH_CACHE_T({
+      q4_qsa_attention_kernel<scalar_t, cache_t><<<grid, Q4_ATTN_WARPS * 32, 0, s>>>(
+          (const scalar_t *)q, (const cache_t *)k_cache,
+          (const cache_t *)v_cache, layout, paged, selected, n_selected, topk,
+          ratio, n_q_heads, n_kv_heads, items_per_split, scale, flashinfer_layout,
+          k_scale, v_scale, (scalar_t *)out, part_acc, part_ml, (const scalar_t *)gate,
+          gate_tok_stride, gate_head_stride, (Q4Q8Block *)q8_out);
+    });
     if (splits > 1) {
       q4_qsa_attention_reduce_kernel<scalar_t>
           <<<layout.n_tokens * n_q_heads, Q4_ATTN_HEAD_DIM, 0, s>>>(

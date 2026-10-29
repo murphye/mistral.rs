@@ -488,9 +488,9 @@ impl QsaAttention {
                 .slot_mappings
                 .get(&location)
                 .ok_or_else(|| candle_core::Error::msg("QSA requires paged slot mappings"))?;
-            if key_cache.dtype() != q.dtype() {
+            if key_cache.dtype() != q.dtype() && key_cache.dtype() != DType::F8E4M3 {
                 candle_core::bail!(
-                    "Qwen4-Exp QSA needs a {:?} KV cache, got {:?} (FP8 KV cache is unsupported)",
+                    "Qwen4-Exp QSA needs a {:?} or f8e4m3 KV cache, got {:?}",
                     q.dtype(),
                     key_cache.dtype()
                 );
@@ -591,6 +591,11 @@ impl QsaAttention {
                 n_kv_heads: self.num_kv_heads,
                 scale: self.sdpa_params.softmax_scale,
                 gate,
+                // Dequantization scales of an fp8 cache (unit for bf16/f16 caches).
+                kv_scales: {
+                    let scales = paged_attn.fp8_attention_scales();
+                    (scales.k, scales.v)
+                },
             };
             let (y, gated) = match kernels::qsa_attention_cutile(&attn_args)? {
                 Some(y) => (y, false),

@@ -276,6 +276,9 @@ mod ffi {
             gate_head_stride: i32,
             q8_out: *mut c_void,
             dtype: i32,
+            cache_fp8: i32,
+            k_scale: f32,
+            v_scale: f32,
             stream: i64,
         );
     }
@@ -1157,6 +1160,8 @@ pub(crate) struct QsaAttentionArgs<'a> {
     /// The output gate to fold in: `(tensor, element offset, token stride, head stride)` of a
     /// `[tokens] x [heads] x 256` view holding the gate logits (sigmoid applied in the kernel).
     pub gate: Option<(&'a Tensor, usize, usize, usize)>,
+    /// `(k, v)` dequantization scales of an f8e4m3 cache; ignored for other cache dtypes.
+    pub kv_scales: (f32, f32),
 }
 
 /// Attention of `q: [tokens, q_heads, 256]` over each query's selected blocks plus its tail.
@@ -1169,6 +1174,14 @@ pub(crate) fn qsa_attention(args: QsaAttentionArgs<'_>) -> Result<(Tensor, bool)
     }
     let device = q.device();
     let flashinfer_layout = args.key_cache.rank() == 4;
+    let cache_fp8 = match args.key_cache.dtype() {
+        DType::F8E4M3 => true,
+        dtype if dtype == q.dtype() => false,
+        dtype => candle_core::bail!(
+            "QSA attention needs a {:?} or f8e4m3 KV cache, got {dtype:?}",
+            q.dtype()
+        ),
+    };
     let max_items = args.shape.topk * args.shape.ratio + args.shape.ratio - 1;
     let ctas = n_tokens * args.n_kv_heads;
     let splits = ATTN_TARGET_CTAS
@@ -1243,6 +1256,9 @@ pub(crate) fn qsa_attention(args: QsaAttentionArgs<'_>) -> Result<(Tensor, bool)
                 p as *mut _
             },
             half_dtype_code(q.dtype())?,
+            i32::from(cache_fp8),
+            args.kv_scales.0,
+            args.kv_scales.1,
             stream(device)?,
         );
     }

@@ -111,9 +111,14 @@ impl PagedCacheType {
             } else if layer_device.is_metal() {
                 #[cfg(not(feature = "metal"))]
                 return Err("FP8 KV cache requires the Metal paged-attention backend".to_string());
+            } else if layer_device.is_rocm() {
+                // The HIP build of the paged-attention kernels carries the OCP e4m3 cache paths,
+                // and the Qwen4-Exp QSA kernels decode fp8 keys and values.
+                #[cfg(not(feature = "rocm"))]
+                return Err("FP8 KV cache requires the ROCm paged-attention backend".to_string());
             } else {
                 return Err(format!(
-                    "FP8 KV cache is only supported on CUDA or Metal, got {layer_device:?} for layer {layer_idx}"
+                    "FP8 KV cache is only supported on CUDA, Metal or ROCm, got {layer_device:?} for layer {layer_idx}"
                 ));
             }
         }
@@ -778,7 +783,7 @@ mod tests {
                 &[],
             )
             .unwrap_err();
-        assert!(err.contains("only supported on CUDA or Metal"));
+        assert!(err.contains("only supported on CUDA, Metal or ROCm"));
     }
 
     #[test]

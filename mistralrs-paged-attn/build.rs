@@ -334,6 +334,9 @@ fn main() -> Result<()> {
                         .args([
                             "-DUSE_ROCM",
                             "-DMISTRALRS_ROCM_WAVE32",
+                            // fp8 KV caches: HIP's hip_fp8.h provides the OCP e4m3 conversions
+                            // (hardware-backed on gfx12 and gfx942/950).
+                            "-DENABLE_FP8",
                             "-Wno-unused-result",
                         ])
                         .arg("-include")
