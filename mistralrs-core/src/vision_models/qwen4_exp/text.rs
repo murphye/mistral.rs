@@ -102,6 +102,12 @@ pub(super) struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
+    /// (token, slot) pairs from which a ROCm batch is prefill-sized: the indexed expert kernels
+    /// stream every expert row once per pair, and from here the grouped WMMA GEMM the unfused
+    /// path reaches (candle's `ROCM_GROUPED_MOE_MIN_PAIRS`) is far faster.
+    #[cfg(feature = "rocm")]
+    const INDEXED_MAX_PAIRS: usize = 1536;
+
     pub(super) fn new(
         cfg: &TextConfig,
         vb: ShardedVarBuilder,
@@ -190,13 +196,15 @@ impl SparseMoeBlock {
             logit_clip: None,
         };
         // ROCm decode: the stacked gate launch fills the routing table's shared-expert slot and
-        // the router writes the top-k into the same `[tokens, top_k + 1]` table.
+        // the router writes the top-k into the same `[tokens, top_k + 1]` table. Prefill-sized
+        // batches keep the dense router GEMM: the gemv kernel re-reads the gate weights once
+        // per token, and their experts take the grouped GEMM anyway.
         #[cfg(feature = "rocm")]
-        if let Some(stacked) = self
-            .stacked_gates
-            .as_ref()
-            .filter(|stacked| xs.device().is_rocm() && xs.dtype() == stacked.dtype())
-        {
+        if let Some(stacked) = self.stacked_gates.as_ref().filter(|stacked| {
+            xs.device().is_rocm()
+                && xs.dtype() == stacked.dtype()
+                && b_size * seq_len * (self.num_experts_per_tok + 1) < Self::INDEXED_MAX_PAIRS
+        }) {
             let tokens = b_size * seq_len;
             let slots = self.num_experts_per_tok + 1;
             let slot_weights =
@@ -317,11 +325,7 @@ impl SparseMoeBlock {
         }
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let tokens = b_size * seq_len;
-        // The indexed kernels stream every expert row once per (token, slot) pair; from about
-        // 1.5K pairs the grouped WMMA GEMM the unfused path reaches (candle's
-        // `ROCM_GROUPED_MOE_MIN_PAIRS`) is far faster, so prefill chunks take that path.
-        const INDEXED_MAX_PAIRS: usize = 1536;
-        if tokens * (self.num_experts_per_tok + 1) >= INDEXED_MAX_PAIRS {
+        if tokens * (self.num_experts_per_tok + 1) >= Self::INDEXED_MAX_PAIRS {
             return Ok(None);
         }
         let x3 = xs_flat.reshape((tokens, 1, hidden_dim))?.contiguous()?;
