@@ -808,6 +808,24 @@ impl QuantizedWeightSource for GgufWeightSource {
         self.materialize_tensor(name, device).map(Some)
     }
 
+    fn load_linear_input_ranges(
+        &self,
+        key: &str,
+        device: &Device,
+        ranges: &[(usize, usize)],
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        self.load_linear_ranges(key, device, ranges, 1)
+    }
+
+    fn load_linear_output_ranges(
+        &self,
+        key: &str,
+        device: &Device,
+        ranges: &[(usize, usize)],
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        self.load_linear_ranges(key, device, ranges, 0)
+    }
+
     fn shard_alignment(&self, key: &str) -> Result<usize> {
         let weight_name = self.weight_name(key);
         let binding = self.binding(&weight_name)?;
@@ -1034,6 +1052,97 @@ impl GgufTensorBackend {
 impl TensorShapes for GgufTensorBackend {
     fn tensor_shapes(&self) -> HashMap<String, Vec<usize>> {
         self.source.shapes.clone()
+    }
+}
+
+impl GgufWeightSource {
+    /// A linear layer over `(start, len)` ranges of its weight's dim `dim` (0: output
+    /// features, 1: input features), joined in order. Quantized weights are sliced block-wise
+    /// without dequantizing.
+    fn load_linear_ranges(
+        &self,
+        key: &str,
+        device: &Device,
+        ranges: &[(usize, usize)],
+        dim: usize,
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        let key = self.layer_key(key);
+        let weight_name = self.weight_name(key);
+        let Some(binding) = self.bindings.get(&weight_name) else {
+            return Ok(None);
+        };
+        if self.load_bias(key, device, None, 2)?.is_some() {
+            return Ok(None);
+        }
+        let Some(source_name) = binding.direct_tensor() else {
+            return Ok(None);
+        };
+        let info = self.archive.tensor_info(source_name)?;
+        let dims = info.shape().to_vec();
+        let [rows, cols] = dims[..] else {
+            return Ok(None);
+        };
+        let joined_len = ranges.iter().map(|(_, len)| len).sum::<usize>();
+        let out_dims = if dim == 0 {
+            vec![joined_len, cols]
+        } else {
+            vec![rows, joined_len]
+        };
+        if matches!(info.dtype().raw(), 0 | 1 | 30) {
+            let weight = self.materialize_binding(binding, &Device::Cpu)?;
+            let parts = ranges
+                .iter()
+                .map(|&(start, len)| weight.narrow(dim, start, len))
+                .collect::<Result<Vec<_>>>()?;
+            let dtype = *self
+                .output_dtypes
+                .get(&weight_name)
+                .expect("every GGUF binding has an output dtype");
+            let weight = Tensor::cat(&parts, dim)?
+                .to_dtype(dtype)?
+                .contiguous()?
+                .to_device(device)?;
+            return Ok(Some(Arc::new(UnquantLinear::new(
+                QuantMethodConfig::Unquantized(Linear::new(weight, None)),
+            )?)));
+        }
+        if self.archive.shards()[info.shard_index()].endian() != GgufEndian::Little {
+            candle_core::bail!("big-endian GGUF tensor loading is not supported");
+        }
+        let dtype = info.dtype().candle_dtype()?;
+        let data = self.archive.tensor_data(source_name)?;
+        // Each range comes out as its own row-major block matrix.
+        let slices = ranges
+            .iter()
+            .map(|&(start, len)| {
+                slice_blocked_data(
+                    data.bytes(),
+                    &dims,
+                    dtype.block_size(),
+                    dtype.type_size(),
+                    dim,
+                    start,
+                    len,
+                )
+                .map(|bytes| (bytes, len))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let joined = if dim == 0 {
+            slices.into_iter().flat_map(|(bytes, _)| bytes).collect::<Vec<u8>>()
+        } else {
+            // Rejoin each row from its pieces.
+            let row_bytes = |len: usize| len / dtype.block_size() * dtype.type_size();
+            let mut joined = Vec::with_capacity(slices.iter().map(|(b, _)| b.len()).sum());
+            for row in 0..rows {
+                for (bytes, len) in &slices {
+                    let n = row_bytes(*len);
+                    joined.extend_from_slice(&bytes[row * n..(row + 1) * n]);
+                }
+            }
+            joined
+        };
+        let weight = qtensor_from_gguf_data(dtype, &joined, out_dims, device)?;
+        Ok(Some(Arc::new(GgufMatMul::from_qtensor(weight, None))))
     }
 }
 

@@ -81,6 +81,28 @@ pub trait QuantizedWeightSource: Send + Sync {
 
     fn load_optional_tensor(&self, name: &str, device: &Device) -> Result<Option<Tensor>>;
 
+    /// A linear layer over the given `(start, len)` ranges of the input features, joined in
+    /// order, when the source can slice its weights that way.
+    fn load_linear_input_ranges(
+        &self,
+        _key: &str,
+        _device: &Device,
+        _ranges: &[(usize, usize)],
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        Ok(None)
+    }
+
+    /// A linear layer over the given `(start, len)` ranges of the output features, joined in
+    /// order, when the source can slice its weights that way.
+    fn load_linear_output_ranges(
+        &self,
+        _key: &str,
+        _device: &Device,
+        _ranges: &[(usize, usize)],
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        Ok(None)
+    }
+
     fn shard_alignment(&self, key: &str) -> Result<usize>;
 
     fn pack_factor(&self, dtype: DType) -> Result<usize>;
@@ -117,6 +139,24 @@ impl<T: QuantizedWeightSource + ?Sized> QuantizedWeightSource for Arc<T> {
 
     fn load_optional_tensor(&self, name: &str, device: &Device) -> Result<Option<Tensor>> {
         (**self).load_optional_tensor(name, device)
+    }
+
+    fn load_linear_input_ranges(
+        &self,
+        key: &str,
+        device: &Device,
+        ranges: &[(usize, usize)],
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        (**self).load_linear_input_ranges(key, device, ranges)
+    }
+
+    fn load_linear_output_ranges(
+        &self,
+        key: &str,
+        device: &Device,
+        ranges: &[(usize, usize)],
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        (**self).load_linear_output_ranges(key, device, ranges)
     }
 
     fn shard_alignment(&self, key: &str) -> Result<usize> {

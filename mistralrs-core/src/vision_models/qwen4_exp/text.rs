@@ -76,6 +76,9 @@ impl GdnConfig for TextConfig {
     fn v_head_layout(&self) -> GdnVHeadLayout {
         self.gdn_v_head_layout
     }
+    fn shard_heads_across_ranks(&self) -> bool {
+        true
+    }
     fn output_gate_activation(&self) -> GdnGateActivation {
         self.output_gate_activation()
             .expect("output gate activation is validated at load")
@@ -465,11 +468,12 @@ impl Qwen4ExpTextModel {
             HybridCacheConfig {
                 layer_types: hybrid_layer_types,
                 max_seq_len: cfg.max_position_embeddings,
+                // Tensor-parallel ranks split the GDN heads, so each holds its share of the state.
                 recurrent: RecurrentLayerConfig {
-                    conv_dim: cfg.linear_conv_dim(),
+                    conv_dim: cfg.linear_conv_dim() / tp_world,
                     conv_width: cfg.linear_conv_kernel_dim,
                     state: RecurrentStateSpec::Gdn {
-                        heads: cfg.linear_num_value_heads,
+                        heads: cfg.linear_num_value_heads / tp_world,
                         key_dim: cfg.linear_key_head_dim,
                         value_dim: cfg.linear_value_head_dim,
                     },

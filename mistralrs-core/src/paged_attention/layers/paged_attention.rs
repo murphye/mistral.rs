@@ -1801,7 +1801,11 @@ impl PagedAttention {
         }
         let adjusted_mask = match tensors.attention_mask {
             AttentionMask::Custom(t) => AttentionMask::Custom(adjust_kv_mask(t, max_kv)?),
-            AttentionMask::CausalFlash if simple_full_causal => AttentionMask::None,
+            // Kernels that align causality bottom-right need no mask; ROCm's eager attention
+            // has no causal mode, so it gets the explicit prefix mask below.
+            AttentionMask::CausalFlash if simple_full_causal && !device.is_rocm() => {
+                AttentionMask::None
+            }
             AttentionMask::CausalFlash if dense_flash_causal => AttentionMask::CausalFlash,
             AttentionMask::CausalFlash => prefix_gather_causal_mask(
                 PrefixMaskRequest {
@@ -1822,7 +1826,7 @@ impl PagedAttention {
                     prefix_causal,
                     ctx.has_noncausal_mm_context(),
                     has_padding_or_window,
-                ) =>
+                ) || (device.is_rocm() && prefix_causal) =>
             {
                 prefix_gather_causal_mask(
                     PrefixMaskRequest {

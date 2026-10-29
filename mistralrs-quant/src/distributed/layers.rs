@@ -797,6 +797,16 @@ impl RowParallelLayer {
         }
     }
 
+    /// A row-parallel layer around a weight already sliced to this rank's input features
+    /// (for slices [`Self::new`]'s even split can't express).
+    pub fn from_weight(weight: Arc<dyn QuantMethod>, comm: &Arc<crate::Comm>) -> Arc<dyn QuantMethod> {
+        Arc::new(Self {
+            weight,
+            bias: None,
+            all_reduce: distributed::SumAllReduce::new(comm),
+        })
+    }
+
     /// Like [`Self::new`], but the layer returns this rank's partial sum: the caller reduces
     /// it, so several partial sums can share one all-reduce.
     #[allow(clippy::new_ret_no_self)]

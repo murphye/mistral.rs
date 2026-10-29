@@ -1,6 +1,7 @@
 use candle_core::{DType, Device, Result, Tensor};
 use mistralrs_quant::{
-    Comm, LoraLinearSpec, QuantMethod, ReplicatedLayer, RowParallelLayer, Shard, ShardedVarBuilder,
+    ColumnParallelLayer, Comm, LoraLinearSpec, QuantMethod, ReplicatedLayer, RowParallelLayer,
+    Shard, ShardedVarBuilder,
 };
 use std::sync::Arc;
 
@@ -147,7 +148,10 @@ pub struct GdnWeights {
 
 pub struct GdnWeightLoadCtx<'a> {
     pub cfg: &'a dyn GdnConfig,
+    /// This rank's dims: all heads, or its share when heads are split across ranks.
     pub dims: &'a GdnDims,
+    /// The checkpoint's dims when heads are split across ranks.
+    pub full_dims: Option<&'a GdnDims>,
     pub mapper: &'a dyn DeviceMapper,
     pub layer_idx: usize,
     pub loading_isq: bool,
@@ -160,6 +164,7 @@ impl GdnWeights {
         let GdnWeightLoadCtx {
             cfg,
             dims,
+            full_dims,
             mapper,
             layer_idx,
             loading_isq,
@@ -179,7 +184,15 @@ impl GdnWeights {
             None
         };
 
-        let input_proj = match input_projection_kind {
+        let head_split = full_dims.map(|full| HeadSplit::new(full, dims, comm.rank()));
+        let input_proj = match (input_projection_kind, &head_split) {
+            (GdnInputProjectionKind::Split, Some(split)) => {
+                split.input_projection(cfg, comm, &vb_la)?
+            }
+            (_, Some(_)) => candle_core::bail!(
+                "splitting GDN heads across ranks needs separate qkv/z/b/a projections"
+            ),
+            (input_projection_kind, None) => match input_projection_kind {
             GdnInputProjectionKind::Grouped => GdnInputProjection::Grouped {
                 in_proj_qkvz: ReplicatedLayer::new(
                     dims.hidden_size,
@@ -331,26 +344,39 @@ impl GdnWeights {
                     merged_qkv_z,
                 }
             }
+            },
         };
+        let checkpoint_dims = full_dims.unwrap_or(dims);
         let conv1d_weight = if conv1d_is_channels_last(vb_la.tensor_shape("conv1d.weight")) {
             vb_la
-                .get((dims.conv_dim, dims.conv_kernel_size, 1), "conv1d.weight")?
+                .get(
+                    (checkpoint_dims.conv_dim, checkpoint_dims.conv_kernel_size, 1),
+                    "conv1d.weight",
+                )?
                 .transpose(1, 2)?
                 .contiguous()?
         } else {
-            vb_la.get((dims.conv_dim, 1, dims.conv_kernel_size), "conv1d.weight")?
+            vb_la.get(
+                (checkpoint_dims.conv_dim, 1, checkpoint_dims.conv_kernel_size),
+                "conv1d.weight",
+            )?
+        };
+        let conv1d_weight = match &head_split {
+            Some(split) => split.conv_channels(&conv1d_weight)?,
+            None => conv1d_weight,
         };
         let conv1d_weight = move_to_target(conv1d_weight, isq_target_device.as_ref())?;
         // The recurrence consumes these in f32 every step; A_log is f32 in the checkpoint anyway
         let vb_f32 = vb_la.clone().set_dtype(DType::F32);
-        let dt_bias = move_to_target(
-            vb_f32.get(dims.num_v_heads, "dt_bias")?,
-            isq_target_device.as_ref(),
-        )?;
-        let a_log = move_to_target(
-            vb_f32.get(dims.num_v_heads, "A_log")?,
-            isq_target_device.as_ref(),
-        )?;
+        let per_head = |name: &str| -> Result<Tensor> {
+            let full = vb_f32.get(checkpoint_dims.num_v_heads, name)?;
+            match &head_split {
+                Some(split) => split.per_head(&full),
+                None => Ok(full),
+            }
+        };
+        let dt_bias = move_to_target(per_head("dt_bias")?, isq_target_device.as_ref())?;
+        let a_log = move_to_target(per_head("A_log")?, isq_target_device.as_ref())?;
 
         let norm = RmsNormGated::new(
             dims.head_v_dim,
@@ -360,18 +386,21 @@ impl GdnWeights {
             isq_target_device.as_ref(),
         )?;
         let out_spec = row_input_lora_spec(
-            dims.value_dim,
+            checkpoint_dims.value_dim,
             dims.hidden_size,
             comm,
             split_lora_maps.as_ref().map(|maps| maps.value.clone()),
         )?;
-        let out_proj = RowParallelLayer::new_with_lora_spec(
-            out_spec,
-            cfg.quantization_config(),
-            false,
-            comm,
-            vb_la.pp("out_proj"),
-        )?;
+        let out_proj = match &head_split {
+            Some(split) => split.out_proj(cfg, comm, &vb_la.pp("out_proj"))?,
+            None => RowParallelLayer::new_with_lora_spec(
+                out_spec,
+                cfg.quantization_config(),
+                false,
+                comm,
+                vb_la.pp("out_proj"),
+            )?,
+        };
 
         Ok(Self {
             input_proj,
@@ -381,6 +410,199 @@ impl GdnWeights {
             norm,
             out_proj,
         })
+    }
+}
+
+/// Where one rank's heads sit in the checkpoint's projections when heads are split across
+/// ranks. Rank `r` owns key heads `[r * k, (r + 1) * k)` and the value heads of those groups:
+/// one run of value heads when they are grouped by key head, one run per group member when
+/// they are tiled across key heads. Either way the rank's own heads keep the same layout.
+struct HeadSplit {
+    full_key_dim: usize,
+    full_conv_dim: usize,
+    full_value_dim: usize,
+    full_v_heads: usize,
+    head_v_dim: usize,
+    key_start: usize,
+    key_len: usize,
+    /// `(first value head, count)` runs, in this rank's head order.
+    v_runs: Vec<(usize, usize)>,
+}
+
+impl HeadSplit {
+    fn new(full: &GdnDims, local: &GdnDims, rank: usize) -> Self {
+        let v_runs = match full.v_head_layout {
+            GdnVHeadLayout::Grouped => vec![(rank * local.num_v_heads, local.num_v_heads)],
+            // Value head `m * K + c` belongs to key head `c`.
+            GdnVHeadLayout::Tiled => (0..full.v_per_group)
+                .map(|m| (m * full.num_k_heads + rank * local.num_k_heads, local.num_k_heads))
+                .collect(),
+        };
+        Self {
+            full_key_dim: full.key_dim,
+            full_conv_dim: full.conv_dim,
+            full_value_dim: full.value_dim,
+            full_v_heads: full.num_v_heads,
+            head_v_dim: full.head_v_dim,
+            key_start: rank * local.key_dim,
+            key_len: local.key_dim,
+            v_runs,
+        }
+    }
+
+    fn rows(offset: usize, len: usize) -> Shard {
+        Shard::Offset { dim: 0, offset, len }
+    }
+
+    /// The rank's value channels as `(start, len)` runs.
+    fn value_channel_runs(&self) -> Vec<(usize, usize)> {
+        self.v_runs
+            .iter()
+            .map(|&(head, n)| (head * self.head_v_dim, n * self.head_v_dim))
+            .collect()
+    }
+
+    /// The rank's rows of the fused `[q | k | v]` channel axis.
+    fn qkv_runs(&self) -> Vec<(usize, usize)> {
+        let mut runs = vec![
+            (self.key_start, self.key_len),
+            (self.full_key_dim + self.key_start, self.key_len),
+        ];
+        runs.extend(
+            self.value_channel_runs()
+                .into_iter()
+                .map(|(start, len)| (2 * self.full_key_dim + start, len)),
+        );
+        runs
+    }
+
+    /// One matmul per projection (qkv, z, b, a) over this rank's rows of it. The projections
+    /// stay separate: their checkpoint tensors may be quantized differently.
+    fn input_projection(
+        &self,
+        cfg: &dyn GdnConfig,
+        comm: &Arc<Comm>,
+        vb: &ShardedVarBuilder,
+    ) -> Result<GdnInputProjection> {
+        let head_runs = self
+            .v_runs
+            .iter()
+            .map(|&(head, n)| (head, n))
+            .collect::<Vec<_>>();
+        let rows_of = |name: &str, full_rows: usize, runs: &[(usize, usize)]| {
+            Self::row_runs(cfg, comm, vb, name, full_rows, runs)
+        };
+        Ok(GdnInputProjection::Split {
+            in_proj_qkv: rows_of("in_proj_qkv", self.full_conv_dim, &self.qkv_runs())?,
+            in_proj_z: rows_of("in_proj_z", self.full_value_dim, &self.value_channel_runs())?,
+            in_proj_b: rows_of("in_proj_b", self.full_v_heads, &head_runs)?,
+            in_proj_a: rows_of("in_proj_a", self.full_v_heads, &head_runs)?,
+            merged_qkv_z: None,
+            merged_b_a: None,
+        })
+    }
+
+    /// A linear layer over the given `(start, len)` output rows of `name`, joined in order.
+    fn row_runs(
+        cfg: &dyn GdnConfig,
+        comm: &Arc<Comm>,
+        vb: &ShardedVarBuilder,
+        name: &str,
+        full_rows: usize,
+        runs: &[(usize, usize)],
+    ) -> Result<Arc<dyn QuantMethod>> {
+        if let Some(source) = vb.pp(name).weight_source() {
+            let layer = source.load_linear_output_ranges(
+                &vb.pp(name).prefix(),
+                &mistralrs_quant::weight_source_load_device(&vb.pp(name)),
+                runs,
+            )?;
+            if let Some(layer) = layer {
+                return Ok(layer);
+            }
+        }
+        if let [(start, len)] = runs {
+            return ColumnParallelLayer::new_with_shard(
+                cfg.hidden_size(),
+                full_rows,
+                cfg.quantization_config(),
+                false,
+                comm,
+                Self::rows(*start, *len),
+                vb.pp(name),
+            );
+        }
+        let shards = runs
+            .iter()
+            .map(|&(start, len)| Self::rows(start, len))
+            .collect::<Vec<_>>();
+        let packed = ColumnParallelLayer::new_packed(
+            cfg.hidden_size(),
+            &vec![full_rows; runs.len()],
+            &vec![name; runs.len()],
+            cfg.quantization_config(),
+            false,
+            comm,
+            Some(&shards),
+            vb.clone(),
+        )?
+        .ok_or_else(|| {
+            candle_core::Error::msg(format!("GDN head split cannot join the row runs of {name}"))
+        })?;
+        Ok(packed.packed)
+    }
+
+    /// The rank's channels of the conv weight `[conv_dim, 1, kernel]`.
+    fn conv_channels(&self, weight: &Tensor) -> Result<Tensor> {
+        let parts = self
+            .qkv_runs()
+            .into_iter()
+            .map(|(start, len)| weight.narrow(0, start, len))
+            .collect::<Result<Vec<_>>>()?;
+        Tensor::cat(&parts, 0)?.contiguous()
+    }
+
+    /// The rank's entries of a per-value-head vector.
+    fn per_head(&self, full: &Tensor) -> Result<Tensor> {
+        let parts = self
+            .v_runs
+            .iter()
+            .map(|&(head, n)| full.narrow(0, head, n))
+            .collect::<Result<Vec<_>>>()?;
+        Tensor::cat(&parts, 0)?.contiguous()
+    }
+
+    /// out_proj over the rank's value channels, reduced across ranks.
+    fn out_proj(
+        &self,
+        cfg: &dyn GdnConfig,
+        comm: &Arc<Comm>,
+        vb: &ShardedVarBuilder,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        if self.v_runs.len() == 1 {
+            // One run is exactly the even split a row-parallel layer makes.
+            return RowParallelLayer::new(
+                self.full_value_dim,
+                cfg.hidden_size(),
+                cfg.quantization_config(),
+                false,
+                comm,
+                vb.clone(),
+            );
+        }
+        let source = vb.weight_source().ok_or_else(|| {
+            candle_core::Error::msg("splitting tiled GDN heads needs a GGUF weight source")
+        })?;
+        let weight = source
+            .load_linear_input_ranges(
+                &vb.prefix(),
+                &mistralrs_quant::weight_source_load_device(vb),
+                &self.value_channel_runs(),
+            )?
+            .ok_or_else(|| {
+                candle_core::Error::msg("GDN out_proj cannot be sliced by value-head runs")
+            })?;
+        Ok(RowParallelLayer::from_weight(weight, comm))
     }
 }
 

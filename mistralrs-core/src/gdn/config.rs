@@ -73,6 +73,12 @@ pub trait GdnConfig {
     fn output_gate_activation(&self) -> GdnGateActivation {
         GdnGateActivation::Silu
     }
+    /// Whether tensor-parallel ranks split the heads (each holds its slice of the projections,
+    /// conv and recurrent state) rather than all running the full layer and splitting only
+    /// the output projection.
+    fn shard_heads_across_ranks(&self) -> bool {
+        false
+    }
 
     fn linear_key_dim(&self) -> usize {
         self.linear_num_key_heads() * self.linear_key_head_dim()
@@ -128,6 +134,32 @@ impl GdnDims {
             v_per_group,
             v_head_layout: cfg.v_head_layout(),
         }
+    }
+
+    /// This rank's share of the heads when they are split across `world_size` ranks: whole
+    /// key heads with their value heads, in the same value layout.
+    pub fn for_rank(&self, world_size: usize) -> candle_core::Result<Self> {
+        if world_size == 1 {
+            return Ok(*self);
+        }
+        if !self.num_k_heads.is_multiple_of(world_size) {
+            candle_core::bail!(
+                "{} GDN key heads cannot be split across {world_size} ranks",
+                self.num_k_heads
+            );
+        }
+        let num_k_heads = self.num_k_heads / world_size;
+        let num_v_heads = self.num_v_heads / world_size;
+        let key_dim = num_k_heads * self.head_k_dim;
+        let value_dim = num_v_heads * self.head_v_dim;
+        Ok(Self {
+            num_k_heads,
+            num_v_heads,
+            key_dim,
+            value_dim,
+            conv_dim: key_dim * 2 + value_dim,
+            ..*self
+        })
     }
 
     pub fn qkvz_out_dim(&self) -> usize {

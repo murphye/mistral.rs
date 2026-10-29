@@ -406,12 +406,19 @@ impl GatedDeltaNet {
         comm: &Arc<Comm>,
         input_projection_kind: GdnInputProjectionKind,
     ) -> Result<Self> {
-        let dims = GdnDims::new(cfg);
+        let full_dims = GdnDims::new(cfg);
+        let split_heads = comm.world_size() > 1 && cfg.shard_heads_across_ranks();
+        let dims = if split_heads {
+            full_dims.for_rank(comm.world_size())?
+        } else {
+            full_dims
+        };
         let weights = GdnWeights::load(
             vb,
             GdnWeightLoadCtx {
                 cfg,
                 dims: &dims,
+                full_dims: split_heads.then_some(&full_dims),
                 mapper,
                 layer_idx,
                 loading_isq,
@@ -427,7 +434,8 @@ impl GatedDeltaNet {
                 dims.head_k_dim,
             )?;
         }
-        let out_proj_input_shard = (comm.world_size() > 1).then_some(Shard::Simple {
+        // With split heads the core output is already this rank's slice of out_proj's input.
+        let out_proj_input_shard = (comm.world_size() > 1 && !split_heads).then_some(Shard::Simple {
             dim: 2,
             rank: comm.rank(),
             world_size: comm.world_size(),

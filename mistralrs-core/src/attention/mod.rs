@@ -339,9 +339,11 @@ impl Sdpa {
             AttentionMask::ChunkedCausal { chunk_size } => Some(*chunk_size),
             _ => None,
         };
+        // Backends without a structured-mask kernel get the mask materialized; on ROCm the
+        // eager path would otherwise attend to future tokens.
         if bidirectional
             || chunk_size.is_some()
-            || (q.device().is_metal() || q.device().is_cpu())
+            || (q.device().is_metal() || q.device().is_cpu() || q.device().is_rocm())
                 && matches!(mask, AttentionMask::CausalFlash)
         {
             let causal = chunk_size.is_some()
@@ -733,6 +735,52 @@ mod tests {
         Ok(())
     }
 
+    /// A tensor-parallel rank attends with a slice of the query heads and of the KV heads;
+    /// its output must equal the same heads of the full attention.
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn grouped_attention_slices_match_full_heads_on_rocm() -> CandleResult<()> {
+        let Ok(device) = Device::new_rocm(0) else {
+            return Ok(());
+        };
+        let (heads, kv_heads, seq, dim) = (24, 2, 40, 256);
+        let make = |h: usize, salt: f32| -> CandleResult<Tensor> {
+            Tensor::from_vec(
+                (0..h * seq * dim)
+                    .map(|i| ((i as f32 * 0.37 + salt).sin()) * 0.5)
+                    .collect::<Vec<_>>(),
+                (1, h, seq, dim),
+                &Device::Cpu,
+            )?
+            .to_dtype(DType::BF16)?
+            .to_device(&device)
+        };
+        let (q, k, v) = (make(heads, 0.1)?, make(kv_heads, 0.7)?, make(kv_heads, 1.3)?);
+        let params = |groups| SdpaParams {
+            n_kv_groups: groups,
+            softcap: None,
+            softmax_scale: 1.0 / (dim as f32).sqrt(),
+            sliding_window: None,
+            sinks: None,
+        };
+        let full = Sdpa.run_attention(&q, &k, &v, &AttentionMask::CausalFlash, None, &params(12))?;
+        for rank in 0..2 {
+            let part = Sdpa.run_attention(
+                &q.narrow(1, rank * 12, 12)?.contiguous()?,
+                &k.narrow(1, rank, 1)?.contiguous()?,
+                &v.narrow(1, rank, 1)?.contiguous()?,
+                &AttentionMask::CausalFlash,
+                None,
+                &params(12),
+            )?;
+            let want = full.narrow(1, rank * 12, 12)?.to_dtype(DType::F32)?;
+            let got = part.to_dtype(DType::F32)?;
+            let err = (want - got)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert!(err < 2e-2, "rank {rank} slice differs from full attention by {err}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn causal_flash_has_attention_intent_without_a_custom_tensor() {
         let mask = AttentionMask::CausalFlash;
@@ -822,6 +870,15 @@ mod tests {
     #[test]
     fn structured_attention_preserves_cpu_dense_semantics() -> CandleResult<()> {
         structured_mask_matches_dense(&Device::Cpu)
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn structured_mask_matches_dense_rocm() -> CandleResult<()> {
+        let Ok(device) = Device::new_rocm(0) else {
+            return Ok(());
+        };
+        structured_mask_matches_dense(&device)
     }
 
     #[cfg(feature = "metal")]
