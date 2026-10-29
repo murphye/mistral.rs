@@ -242,6 +242,9 @@ pub struct Qwen4ExpTextModel {
     pub(super) layer_types: Vec<LayerType>,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     lm_head: Arc<dyn QuantMethod>,
+    /// Set when `lm_head` holds this rank's slice of the vocabulary: logits are gathered from
+    /// every rank before sampling.
+    lm_head_comm: Option<Arc<mistralrs_quant::Comm>>,
     rotary_emb: Arc<Qwen3VLRotaryEmbedding>,
     qsa: QsaConfig,
     hc: usize,
@@ -420,7 +423,21 @@ impl Qwen4ExpTextModel {
             mapper.set_nm_device(vb_m.pp("hyper_connection_mixer"), false),
             false,
         )?;
-        let lm_head = if !tie {
+        let lm_comm = mapper.get_comm_for(0)?;
+        let tp_world = lm_comm.world_size();
+        // Under tensor parallelism each rank scores its share of the vocabulary: the head is
+        // the largest single read of a decode step.
+        let shard_vocab = !tie && tp_world > 1 && cfg.vocab_size % tp_world == 0;
+        let lm_head = if shard_vocab {
+            mistralrs_quant::ColumnParallelLayer::new(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                &cfg.quantization_config,
+                false,
+                &lm_comm,
+                mapper.set_nm_device(vb.pp("lm_head"), normal_loading_metadata.loading_isq),
+            )?
+        } else if !tie {
             ReplicatedLayer::new(
                 cfg.hidden_size,
                 cfg.vocab_size,
@@ -431,8 +448,8 @@ impl Qwen4ExpTextModel {
         } else {
             embed_tokens.clone()
         };
+        let lm_head_comm = shard_vocab.then(|| lm_comm.clone());
 
-        let tp_world = mapper.get_comm_for(0)?.world_size();
         let mut hybrid_layer_types = layer_types
             .iter()
             .map(|lt| match lt {
@@ -497,6 +514,7 @@ impl Qwen4ExpTextModel {
             dense_kv_cap: qsa.max_selected_tokens(),
             hc: cfg.hc_count,
             lm_head,
+            lm_head_comm,
             cache: EitherCache::Hybrid(Arc::new(Mutex::new(hybrid_cache))),
             max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {
@@ -530,6 +548,24 @@ impl Qwen4ExpTextModel {
 
     pub(super) fn lm_head(&self) -> &Arc<dyn QuantMethod> {
         &self.lm_head
+    }
+
+    /// Full-vocabulary logits from this rank's `lm_head` output.
+    pub(super) fn gather_logits(&self, logits: Tensor) -> Result<Tensor> {
+        match &self.lm_head_comm {
+            Some(comm) => mistralrs_quant::distributed::AllGather::new(comm, logits.rank() - 1)
+                .all_gather(&logits),
+            None => Ok(logits),
+        }
+    }
+
+    fn head_logits(&self, ctx: &ModelForwardContext<'_>, xs: &Tensor) -> Result<Tensor> {
+        let logits = ctx.lm_head(&*self.lm_head, xs)?;
+        if ctx.needs_logits() {
+            self.gather_logits(logits)
+        } else {
+            Ok(logits)
+        }
     }
 
     pub(super) fn set_store_spec_hidden(&self, store: bool) {
@@ -1150,7 +1186,7 @@ impl Qwen4ExpTextModel {
             let rows = rows.to_device(&self.device)?;
             let xn = self.final_mixer.norm(&rows)?;
             let xs = self.final_mixer.mix(&xn)?;
-            return ctx.lm_head(&*self.lm_head, &xs);
+            return self.head_logits(ctx, &xs);
         }
         let res = res.to_device(&self.device)?;
         if store_spec {
@@ -1185,7 +1221,7 @@ impl Qwen4ExpTextModel {
         };
         let xn = ctx.logits(&xn)?;
         let xs = self.final_mixer.mix(&xn)?;
-        ctx.lm_head(&*self.lm_head, &xs)
+        self.head_logits(ctx, &xs)
     }
 }
 

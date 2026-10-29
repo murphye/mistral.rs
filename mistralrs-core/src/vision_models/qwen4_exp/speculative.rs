@@ -75,7 +75,7 @@ impl BuiltinMtpHost for Qwen4ExpModel {
     fn mtp_draft_logits(&self, hidden: &Tensor) -> Result<Tensor> {
         let draft_head = self.draft_lm_head.lock().expect("draft lm_head poisoned");
         let head = draft_head.as_ref().unwrap_or_else(|| self.text.lm_head());
-        head.forward(hidden)?.squeeze(0)
+        self.text.gather_logits(head.forward(hidden)?)?.squeeze(0)
     }
 
     fn mtp_spec_capture(&self) -> Option<SpecCapture> {

@@ -19,9 +19,10 @@ const NCCL_SUM: c_int = 0;
 const NCCL_MAX: c_int = 2;
 const NCCL_UINT8: c_int = 1;
 const NCCL_UINT32: c_int = 3;
-/// Largest reduction (in bf16 elements) the peer all-reduce takes; a decode step's are a few
-/// tens of thousands, and larger ones (prefill chunks) go through RCCL.
-const PEER_ALLREDUCE_MAX_ELEMS: usize = 1 << 16;
+/// Largest collective (in bf16 elements per rank) the peer kernels take: decode-step
+/// reductions are tens of thousands of elements and a vocabulary-sharded logit gather for
+/// 8 sequences about a million. Larger ones (prefill chunks) go through RCCL.
+const PEER_MAX_ELEMS: usize = 1 << 20;
 const NCCL_FLOAT16: c_int = 6;
 const NCCL_FLOAT32: c_int = 7;
 const NCCL_BFLOAT16: c_int = 9;
@@ -136,7 +137,7 @@ impl RcclComm {
             self.device.as_rocm_device()?,
             self.rank,
             self.world_size,
-            PEER_ALLREDUCE_MAX_ELEMS,
+            PEER_MAX_ELEMS,
         )?;
         let local = Tensor::from_vec(handle.to_vec(), HANDLE_BYTES, &self.device)?;
         let gathered = unsafe { Tensor::empty(HANDLE_BYTES * self.world_size, DType::U8, &self.device) }?;
@@ -244,6 +245,16 @@ pub fn sum_all_reduce(comm: &RcclComm, xs: &Tensor) -> Result<Tensor> {
 /// Concatenates every rank's `xs` along `dim`.
 pub fn all_gather(comm: &RcclComm, xs: &Tensor, dim: usize) -> Result<Tensor> {
     let world = comm.world_size;
+    if let Some(peer) = comm.peer.as_ref().filter(|peer| peer.supports(xs)) {
+        // Rank-major `[world, ..dims]` from the peer kernel; move the rank axis next to `dim`
+        // and merge the two.
+        let stacked = peer.all_gather(&xs.contiguous()?)?;
+        let mut perm = (1..=xs.rank()).collect::<Vec<_>>();
+        perm.insert(dim, 0);
+        let mut dims = xs.dims().to_vec();
+        dims[dim] *= world;
+        return stacked.permute(perm)?.contiguous()?.reshape(dims);
+    }
     // RCCL gathers rank-major, so move `dim` to the front, gather, and move it back.
     let front = if dim == 0 {
         xs.contiguous()?
