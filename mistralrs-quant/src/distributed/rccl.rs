@@ -17,7 +17,11 @@ type RawComm = *mut c_void;
 const NCCL_SUCCESS: c_int = 0;
 const NCCL_SUM: c_int = 0;
 const NCCL_MAX: c_int = 2;
+const NCCL_UINT8: c_int = 1;
 const NCCL_UINT32: c_int = 3;
+/// Largest reduction (in bf16 elements) the peer all-reduce takes; a decode step's are a few
+/// tens of thousands, and larger ones (prefill chunks) go through RCCL.
+const PEER_ALLREDUCE_MAX_ELEMS: usize = 1 << 16;
 const NCCL_FLOAT16: c_int = 6;
 const NCCL_FLOAT32: c_int = 7;
 const NCCL_BFLOAT16: c_int = 9;
@@ -74,6 +78,7 @@ pub struct RcclComm {
     rank: usize,
     world_size: usize,
     device: Device,
+    peer: Option<candle_core::rocm_backend::peer::PeerAllReduce>,
 }
 
 // RCCL communicators may be used from any thread as long as calls are not concurrent; each rank
@@ -107,12 +112,62 @@ impl RcclComm {
                 "ncclCommInitRank",
             )?;
         }
-        Ok(Self {
+        let mut this = Self {
             comm,
             rank,
             world_size,
             device: dev.clone(),
-        })
+            peer: None,
+        };
+        if std::env::var_os("MISTRALRS_NO_PEER_ALLREDUCE").is_none() {
+            match this.connect_peers() {
+                Ok(peer) => this.peer = Some(peer),
+                Err(err) => tracing::warn!("Peer all-reduce unavailable, using RCCL only: {err}"),
+            }
+        }
+        Ok(this)
+    }
+
+    /// Shares each rank's peer all-reduce buffer with the others through an RCCL all-gather
+    /// of their IPC handles.
+    fn connect_peers(&self) -> Result<candle_core::rocm_backend::peer::PeerAllReduce> {
+        use candle_core::rocm_backend::peer::{PeerAllReduceSetup, HANDLE_BYTES};
+        let (setup, handle) = PeerAllReduceSetup::new(
+            self.device.as_rocm_device()?,
+            self.rank,
+            self.world_size,
+            PEER_ALLREDUCE_MAX_ELEMS,
+        )?;
+        let local = Tensor::from_vec(handle.to_vec(), HANDLE_BYTES, &self.device)?;
+        let gathered = unsafe { Tensor::empty(HANDLE_BYTES * self.world_size, DType::U8, &self.device) }?;
+        let ptr = |t: &Tensor| -> Result<u64> {
+            let (s, l) = t.storage_and_layout();
+            let candle_core::Storage::Rocm(s) = &*s else {
+                candle_core::bail!("RCCL collectives need rocm tensors");
+            };
+            Ok(s.as_rocm_slice::<u8>()?.slice(l.start_offset()..).device_ptr())
+        };
+        unsafe {
+            check(
+                ncclAllGather(
+                    ptr(&local)? as *const c_void,
+                    ptr(&gathered)? as *mut c_void,
+                    HANDLE_BYTES,
+                    NCCL_UINT8,
+                    self.comm,
+                    stream(&local)?,
+                ),
+                "ncclAllGather",
+            )?;
+        }
+        let bytes = gathered.to_vec1::<u8>()?;
+        let handles = bytes
+            .chunks_exact(HANDLE_BYTES)
+            .map(|c| c.try_into().expect("handle-sized chunk"))
+            .collect::<Vec<[u8; HANDLE_BYTES]>>();
+        let peer = setup.connect(&handles)?;
+        tracing::info!("Peer all-reduce connected across {} ranks", self.world_size);
+        Ok(peer)
     }
 
     pub fn rank(&self) -> usize {
@@ -164,6 +219,9 @@ fn stream(t: &Tensor) -> Result<*mut c_void> {
 }
 
 pub fn sum_all_reduce(comm: &RcclComm, xs: &Tensor) -> Result<Tensor> {
+    if let Some(peer) = comm.peer.as_ref().filter(|peer| peer.supports(xs)) {
+        return peer.all_reduce(xs);
+    }
     let xs = xs.contiguous()?;
     let out = unsafe { Tensor::empty(xs.shape(), xs.dtype(), xs.device()) }?;
     unsafe {
