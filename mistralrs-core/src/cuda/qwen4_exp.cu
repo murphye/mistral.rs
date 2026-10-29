@@ -83,6 +83,11 @@ __device__ __forceinline__ void q4_load8(const T *__restrict__ p, float *out) {
 // exponent 0 is subnormal and 0x7f / 0xff are NaN. Decoded in software so the CUDA and HIP
 // builds agree bit for bit.
 __device__ __forceinline__ float q4_fp8_f(uint8_t v) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                                            \
+    (defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx950__) || defined(__gfx1250__))
+  // These parts convert OCP e4m3 in hardware (gfx942's instruction is the fnuz format).
+  return __builtin_amdgcn_cvt_f32_fp8((unsigned)v, 0);
+#else
   const int sign = v >> 7, exp = (v >> 3) & 0xF, man = v & 0x7;
   float f;
   if (exp == 0) {
@@ -93,6 +98,7 @@ __device__ __forceinline__ float q4_fp8_f(uint8_t v) {
     f = ldexpf(1.0f + (float)man * 0.125f, exp - 7);
   }
   return sign ? -f : f;
+#endif
 }
 
 // A cache element as a float: the activation type as is, fp8 decoded and scaled.
