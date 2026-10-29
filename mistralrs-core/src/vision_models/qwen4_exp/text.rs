@@ -258,16 +258,13 @@ impl SparseMoeBlock {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let tokens = b_size * seq_len;
         let num_experts = self.experts.num_experts();
-        let shared_gate = candle_nn::ops::sigmoid(
-            &self
-                .shared_expert_gate
-                .forward(xs_flat)?
-                .to_dtype(DType::F32)?,
-        )?
-        .reshape((tokens, 1))?;
-        let shared_id = Tensor::full(num_experts as u32, (tokens, 1), xs.device())?;
-        let ids = Tensor::cat(&[&topk_indices.to_dtype(DType::U32)?, &shared_id], 1)?.contiguous()?;
-        let weights = Tensor::cat(&[&topk_values.to_dtype(DType::F32)?, &shared_gate], 1)?.contiguous()?;
+        let shared_logit = self.shared_expert_gate.forward(xs_flat)?;
+        let (ids, weights) = crate::rocm::moe_glue::moe_append_shared_slot(
+            &topk_indices.to_dtype(DType::U32)?,
+            &topk_values.to_dtype(DType::F32)?,
+            &shared_logit,
+            num_experts as u32,
+        )?;
         let x3 = xs_flat.reshape((tokens, 1, hidden_dim))?.contiguous()?;
         let down_in = indexed_moe_glu_forward_with_extra(&gate, &up, 0, &s_gate, &s_up, &x3, &ids)?;
         let ys = indexed_moe_forward_with_extra(&down, &s_down, &down_in, &ids)?;

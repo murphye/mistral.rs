@@ -112,6 +112,54 @@ pub fn rope_partial_neox(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tenso
 
 /// `y + sigmoid(gate) * shared` for `y`, `shared` of shape `[.., hidden]` and one
 /// gate logit per row, all in the same dtype.
+/// `ids: [tokens, top_k]` u32 and `weights: [tokens, top_k]` f32 with one more slot per token:
+/// expert `shared_id` weighted by `sigmoid(gate[t])` (`gate: [tokens]` or `[tokens, 1]`).
+pub fn moe_append_shared_slot(
+    ids: &Tensor,
+    weights: &Tensor,
+    gate: &Tensor,
+    shared_id: u32,
+) -> Result<(Tensor, Tensor)> {
+    let (tokens, top_k) = ids.dims2()?;
+    if weights.dims() != [tokens, top_k]
+        || gate.elem_count() != tokens
+        || ids.dtype() != DType::U32
+        || weights.dtype() != DType::F32
+    {
+        candle_core::bail!(
+            "moe_append_shared_slot: mismatched inputs {:?} {:?} {:?}",
+            ids.shape(),
+            weights.shape(),
+            gate.shape()
+        );
+    }
+    let ids = ids.contiguous()?;
+    let weights = weights.contiguous()?;
+    let gate = gate.contiguous()?;
+    let ids_out = unsafe { Tensor::empty((tokens, top_k + 1), DType::U32, ids.device()) }?;
+    let weights_out = unsafe { Tensor::empty((tokens, top_k + 1), DType::F32, ids.device()) }?;
+    let launch = match gate.dtype() {
+        DType::F32 => crate::rocm::ffi::moe_append_shared_slot_f32,
+        DType::F16 => crate::rocm::ffi::moe_append_shared_slot_f16,
+        DType::BF16 => crate::rocm::ffi::moe_append_shared_slot_bf16,
+        dt => candle_core::bail!("moe_append_shared_slot: unsupported gate dtype {dt:?}"),
+    };
+    unsafe {
+        launch(
+            rocm_ptr::<u32>(&ids, "ids")? as *const u32,
+            rocm_ptr::<f32>(&weights, "weights")? as *const f32,
+            half_or_f32_ptr(&gate, "gate")? as *const c_void,
+            rocm_ptr::<u32>(&ids_out, "ids_out")? as *mut u32,
+            rocm_ptr::<f32>(&weights_out, "weights_out")? as *mut f32,
+            tokens as i32,
+            top_k as i32,
+            shared_id,
+            stream(&ids)?,
+        );
+    }
+    Ok((ids_out, weights_out))
+}
+
 pub fn add_sigmoid_gated(y: &Tensor, shared: &Tensor, gate: &Tensor) -> Result<Tensor> {
     let hidden = y.dim(candle_core::D::Minus1)?;
     if y.shape() != shared.shape()

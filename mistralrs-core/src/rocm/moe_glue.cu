@@ -148,6 +148,47 @@ GATED_ADD_OP(float, f32)
 GATED_ADD_OP(__half, f16)
 GATED_ADD_OP(__nv_bfloat16, bf16)
 
+// Appends a shared-expert slot to every token's routing: ids gain `shared_id`, weights gain
+// sigmoid(gate[t]). ids/weights are [tokens, top_k]; the outputs [tokens, top_k + 1].
+template <typename T>
+__global__ void moe_append_shared_slot_kernel(const unsigned int *__restrict__ ids,
+                                              const float *__restrict__ weights,
+                                              const T *__restrict__ gate,
+                                              unsigned int *__restrict__ ids_out,
+                                              float *__restrict__ weights_out, const int tokens,
+                                              const int top_k, const unsigned int shared_id) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int width = top_k + 1;
+  if (i >= tokens * width) {
+    return;
+  }
+  const int t = i / width, j = i - t * width;
+  if (j < top_k) {
+    ids_out[i] = ids[t * top_k + j];
+    weights_out[i] = weights[t * top_k + j];
+  } else {
+    ids_out[i] = shared_id;
+    weights_out[i] = 1.0f / (1.0f + expf(-to_float(gate[t])));
+  }
+}
+
+#define APPEND_SHARED_OP(T, SUFFIX)                                                                \
+  extern "C" void moe_append_shared_slot_##SUFFIX(const unsigned int *ids, const float *weights,   \
+                                                  const void *gate, unsigned int *ids_out,          \
+                                                  float *weights_out, int tokens, int top_k,        \
+                                                  unsigned int shared_id, int64_t stream) {         \
+    const int threads = 128;                                                                        \
+    const int n = tokens * (top_k + 1);                                                             \
+    moe_append_shared_slot_kernel<T><<<(n + threads - 1) / threads, threads, 0,                     \
+                                       (cudaStream_t)stream>>>(ids, weights, (const T *)gate,       \
+                                                               ids_out, weights_out, tokens, top_k, \
+                                                               shared_id);                          \
+  }
+
+APPEND_SHARED_OP(float, f32)
+APPEND_SHARED_OP(__half, f16)
+APPEND_SHARED_OP(__nv_bfloat16, bf16)
+
 // out = act(x * scale), contiguous with n elements.
 template <typename T>
 __global__ void act_scaled_kernel(const T *__restrict__ x, T *__restrict__ out, const int64_t n,

@@ -266,6 +266,9 @@ extern "C" {
     pub fn rope_partial_neox_f32(x: *const c_void, cos: *const f32, sin: *const f32, out: *mut c_void, n: i64, heads: i32, d: i32, half: i32, stream: i64);
     pub fn rope_partial_neox_f16(x: *const c_void, cos: *const f32, sin: *const f32, out: *mut c_void, n: i64, heads: i32, d: i32, half: i32, stream: i64);
     pub fn rope_partial_neox_bf16(x: *const c_void, cos: *const f32, sin: *const f32, out: *mut c_void, n: i64, heads: i32, d: i32, half: i32, stream: i64);
+    pub fn moe_append_shared_slot_f32(ids: *const u32, weights: *const f32, gate: *const c_void, ids_out: *mut u32, weights_out: *mut f32, tokens: i32, top_k: i32, shared_id: u32, stream: i64);
+    pub fn moe_append_shared_slot_f16(ids: *const u32, weights: *const f32, gate: *const c_void, ids_out: *mut u32, weights_out: *mut f32, tokens: i32, top_k: i32, shared_id: u32, stream: i64);
+    pub fn moe_append_shared_slot_bf16(ids: *const u32, weights: *const f32, gate: *const c_void, ids_out: *mut u32, weights_out: *mut f32, tokens: i32, top_k: i32, shared_id: u32, stream: i64);
     pub fn add_sigmoid_gated_f32(y: *const c_void, shared: *const c_void, gate: *const c_void, out: *mut c_void, n: i64, hidden: i32, stream: i64);
     pub fn add_sigmoid_gated_f16(y: *const c_void, shared: *const c_void, gate: *const c_void, out: *mut c_void, n: i64, hidden: i32, stream: i64);
     pub fn add_sigmoid_gated_bf16(y: *const c_void, shared: *const c_void, gate: *const c_void, out: *mut c_void, n: i64, hidden: i32, stream: i64);
