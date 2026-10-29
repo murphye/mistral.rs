@@ -2418,6 +2418,133 @@ __global__ void gdn_decode_recurrence_kernel(
   out_bh[v_idx] = (T)y_t;
 }
 
+// The decode recurrence over `seq_len` consecutive tokens of each sequence (speculative verify
+// steps): the state tile stays in shared memory between tokens and is written back once.
+// mixed_qkv is `[batch, seq_len, conv_dim]`; b and a are `[batch, seq_len, heads]` with the given
+// strides; output is `[batch * heads, seq_len, head_v_dim]`.
+template <typename T, typename StateT, int BK, int BV>
+__global__ void gdn_decode_recurrence_multi_kernel(
+    const T *__restrict__ mixed_qkv, const T *__restrict__ b,
+    const T *__restrict__ a, const float *__restrict__ a_log,
+    const float *__restrict__ dt_bias, StateT *__restrict__ state,
+    T *__restrict__ output, int batch_size, int seq_len, int num_k_heads,
+    int num_v_heads, int head_v_dim, int tiled_v_heads,
+    int64_t b_batch_stride, int64_t b_token_stride, int64_t b_head_stride,
+    int64_t a_batch_stride, int64_t a_token_stride, int64_t a_head_stride,
+    const int32_t *__restrict__ slot_indices) {
+  const int v_tile = blockIdx.x;
+  const int bh = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int v_idx = v_tile * BV + tid;
+  const int bidx = bh / num_v_heads;
+  const int hv = bh - bidx * num_v_heads;
+  if (bidx >= batch_size)
+    return;
+
+  T *out_bh = output + (size_t)bh * seq_len * head_v_dim;
+  if (gdn_is_padding_row(slot_indices, bidx)) {
+    if (v_idx < head_v_dim) {
+      for (int t = 0; t < seq_len; ++t) {
+        out_bh[t * head_v_dim + v_idx] = (T)0.0f;
+      }
+    }
+    return;
+  }
+
+  const int v_per_group = num_v_heads / num_k_heads;
+  const int hk = tiled_v_heads ? hv % num_k_heads : hv / v_per_group;
+  const int key_dim = num_k_heads * BK;
+  const int value_dim = num_v_heads * head_v_dim;
+  const int conv_dim = 2 * key_dim + value_dim;
+  StateT *state_bh =
+      state + gdn_state_row(slot_indices, bidx, hv, num_v_heads) * BK * head_v_dim;
+
+  __shared__ float red_q[BV];
+  __shared__ float red_k[BV];
+  __shared__ float q_buf[BK];
+  __shared__ float k_buf[BK];
+  __shared__ float beta_t;
+  __shared__ float decay_t;
+  __shared__ float q_mul;
+  __shared__ float k_mul;
+  __shared__ float state_buf[BK * BV];
+
+  const bool active = v_idx < head_v_dim;
+  if (active) {
+    for (int j = 0; j < BK; j++) {
+      state_buf[j * BV + tid] = (float)state_bh[j * head_v_dim + v_idx];
+    }
+  }
+
+  for (int t = 0; t < seq_len; ++t) {
+    const T *row = mixed_qkv + ((size_t)bidx * seq_len + t) * conv_dim;
+    float q_sum = 0.0f, k_sum = 0.0f;
+    for (int d = tid; d < BK; d += BV) {
+      const float q_val = (float)row[hk * BK + d];
+      const float k_val = (float)row[key_dim + hk * BK + d];
+      q_sum += q_val * q_val;
+      k_sum += k_val * k_val;
+    }
+    red_q[tid] = q_sum;
+    red_k[tid] = k_sum;
+    __syncthreads();
+    for (int stride = BV >> 1; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        red_q[tid] += red_q[tid + stride];
+        red_k[tid] += red_k[tid + stride];
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      q_mul = rsqrtf(red_q[0] + 1.0e-6f) * rsqrtf((float)BK);
+      k_mul = rsqrtf(red_k[0] + 1.0e-6f);
+      const float b_val =
+          (float)b[bidx * b_batch_stride + t * b_token_stride + hv * b_head_stride];
+      const float a_val =
+          (float)a[bidx * a_batch_stride + t * a_token_stride + hv * a_head_stride] + dt_bias[hv];
+      const float softplus_val = a_val > 20.0f
+                                     ? a_val
+                                     : (a_val > 0.0f ? a_val + log1pf(expf(-a_val))
+                                                     : log1pf(expf(a_val)));
+      beta_t = 1.0f / (1.0f + expf(-b_val));
+      decay_t = expf(-expf(a_log[hv]) * softplus_val);
+    }
+    __syncthreads();
+    for (int d = tid; d < BK; d += BV) {
+      q_buf[d] = (float)row[hk * BK + d] * q_mul;
+      k_buf[d] = (float)row[key_dim + hk * BK + d] * k_mul;
+    }
+    __syncthreads();
+
+    if (active) {
+      const float v_t = (float)row[2 * key_dim + hv * head_v_dim + v_idx];
+      float kv_mem = 0.0f;
+#pragma unroll 32
+      for (int j = 0; j < BK; j++) {
+        const float s = state_buf[j * BV + tid] * decay_t;
+        state_buf[j * BV + tid] = s;
+        kv_mem = __fmaf_rn(s, k_buf[j], kv_mem);
+      }
+      const float delta = (v_t - kv_mem) * beta_t;
+      float y_t = 0.0f;
+#pragma unroll 32
+      for (int j = 0; j < BK; j++) {
+        const float s = __fmaf_rn(k_buf[j], delta, state_buf[j * BV + tid]);
+        state_buf[j * BV + tid] = s;
+        y_t = __fmaf_rn(s, q_buf[j], y_t);
+      }
+      out_bh[t * head_v_dim + v_idx] = (T)y_t;
+    }
+    // The next token's reductions reuse red_q/red_k and the q/k buffers.
+    __syncthreads();
+  }
+  if (active) {
+    for (int j = 0; j < BK; j++) {
+      state_bh[j * head_v_dim + v_idx] = (StateT)state_buf[j * BV + tid];
+    }
+  }
+}
+
 template <typename T, typename StateT, int BV, int MAX_K>
 __global__ void gdn_decode_recurrence_kernel_fallback(
     const T *__restrict__ mixed_qkv, const T *__restrict__ b,
@@ -2673,6 +2800,76 @@ extern "C" void gdn_decode_recurrence(
         head_k_dim, head_v_dim, tiled_v_heads, b_batch_stride, b_head_stride,
         a_batch_stride, a_head_stride, slot_indices, kernel_kind, state_dtype,
         custream);
+  }
+}
+
+template <typename T, typename StateT>
+void launch_gdn_decode_recurrence_multi(
+    const T *mixed_qkv, const T *b, const T *a, const float *a_log,
+    const float *dt_bias, StateT *state, T *output, int batch_size, int seq_len,
+    int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim,
+    int tiled_v_heads, const int64_t *b_strides, const int64_t *a_strides,
+    const int32_t *slot_indices, cudaStream_t stream) {
+  constexpr int BV = GDN_DECODE_VALUE_TILE;
+  dim3 grid((head_v_dim + BV - 1) / BV, batch_size * num_v_heads);
+  dim3 block(BV);
+  if (head_k_dim == 128) {
+    gdn_decode_recurrence_multi_kernel<T, StateT, 128, BV><<<grid, block, 0, stream>>>(
+        mixed_qkv, b, a, a_log, dt_bias, state, output, batch_size, seq_len, num_k_heads,
+        num_v_heads, head_v_dim, tiled_v_heads, b_strides[0], b_strides[1], b_strides[2],
+        a_strides[0], a_strides[1], a_strides[2], slot_indices);
+  } else {
+    gdn_decode_recurrence_multi_kernel<T, StateT, 64, BV><<<grid, block, 0, stream>>>(
+        mixed_qkv, b, a, a_log, dt_bias, state, output, batch_size, seq_len, num_k_heads,
+        num_v_heads, head_v_dim, tiled_v_heads, b_strides[0], b_strides[1], b_strides[2],
+        a_strides[0], a_strides[1], a_strides[2], slot_indices);
+  }
+}
+
+template <typename T>
+void dispatch_gdn_decode_recurrence_multi(
+    const T *mixed_qkv, const T *b, const T *a, const float *a_log,
+    const float *dt_bias, void *state, T *output, int batch_size, int seq_len,
+    int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim,
+    int tiled_v_heads, const int64_t *b_strides, const int64_t *a_strides,
+    const int32_t *slot_indices, int state_dtype, cudaStream_t stream) {
+  if (state_dtype == GDN_STATE_DTYPE_F16) {
+    launch_gdn_decode_recurrence_multi(mixed_qkv, b, a, a_log, dt_bias, (__half *)state, output,
+                                       batch_size, seq_len, num_k_heads, num_v_heads, head_k_dim,
+                                       head_v_dim, tiled_v_heads, b_strides, a_strides,
+                                       slot_indices, stream);
+  } else if (state_dtype == GDN_STATE_DTYPE_BF16) {
+    launch_gdn_decode_recurrence_multi(mixed_qkv, b, a, a_log, dt_bias, (__nv_bfloat16 *)state,
+                                       output, batch_size, seq_len, num_k_heads, num_v_heads,
+                                       head_k_dim, head_v_dim, tiled_v_heads, b_strides,
+                                       a_strides, slot_indices, stream);
+  } else {
+    launch_gdn_decode_recurrence_multi(mixed_qkv, b, a, a_log, dt_bias, (float *)state, output,
+                                       batch_size, seq_len, num_k_heads, num_v_heads, head_k_dim,
+                                       head_v_dim, tiled_v_heads, b_strides, a_strides,
+                                       slot_indices, stream);
+  }
+}
+
+// `b_strides` / `a_strides`: batch, token and head strides (elements). head_k_dim must be 64 or 128.
+extern "C" void gdn_decode_recurrence_multi(
+    const void *mixed_qkv, const void *b, const void *a, const float *a_log,
+    const float *dt_bias, void *state, void *output, int batch_size, int seq_len,
+    int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim,
+    int tiled_v_heads, const int64_t *b_strides, const int64_t *a_strides,
+    const int32_t *slot_indices, int dtype, int state_dtype, int64_t stream) {
+  const cudaStream_t custream = (cudaStream_t)stream;
+  if (dtype == 0) {
+    dispatch_gdn_decode_recurrence_multi(
+        (const __half *)mixed_qkv, (const __half *)b, (const __half *)a, a_log, dt_bias, state,
+        (__half *)output, batch_size, seq_len, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
+        tiled_v_heads, b_strides, a_strides, slot_indices, state_dtype, custream);
+  } else {
+    dispatch_gdn_decode_recurrence_multi(
+        (const __nv_bfloat16 *)mixed_qkv, (const __nv_bfloat16 *)b, (const __nv_bfloat16 *)a,
+        a_log, dt_bias, state, (__nv_bfloat16 *)output, batch_size, seq_len, num_k_heads,
+        num_v_heads, head_k_dim, head_v_dim, tiled_v_heads, b_strides, a_strides, slot_indices,
+        state_dtype, custream);
   }
 }
 

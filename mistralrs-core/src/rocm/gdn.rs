@@ -522,6 +522,96 @@ const GDN_DECODE_KERNEL_BASELINE: i32 = 0;
 
 /// Single-token GDN step from the convolved projections: gating, L2 norm and the
 /// key-major recurrence in one kernel. Returns `[BH, 1, V]` in the input dtype.
+/// Tokens per sequence the fused multi-token recurrence takes (speculative verify steps).
+pub const GDN_FUSED_MULTI_MAX_TOKENS: usize = 8;
+
+/// The fused decode recurrence over `seq_len` tokens per sequence, state in shared memory
+/// between tokens. `mixed_qkv: [batch, seq_len, conv_dim]`, `b`/`a: [batch, seq_len, heads]`;
+/// returns `[batch * heads, seq_len, head_v_dim]`.
+pub fn fused_multi_recurrence_rocm(
+    launch: FusedDecodeRecurrence<'_>,
+    seq_len: usize,
+) -> Result<Tensor> {
+    use candle_core as candle;
+    use core::ffi::c_void;
+
+    let FusedDecodeRecurrence {
+        mixed_qkv,
+        b,
+        a,
+        a_log,
+        dt_bias,
+        state,
+        batch_size,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        tiled_v_heads,
+        state_layout,
+        slots,
+    } = launch;
+    if state_layout != RecurrentStateLayout::GdnKeyMajor || !matches!(head_k_dim, 64 | 128) {
+        candle::bail!("ROCm fused multi-token GDN needs a key-major state with K of 64 or 128");
+    }
+    if b.rank() != 3 || a.rank() != 3 || mixed_qkv.dims() != [batch_size, seq_len, 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim] {
+        candle::bail!("ROCm fused multi-token GDN: unexpected input shapes");
+    }
+    let dtype_code = match mixed_qkv.dtype() {
+        DType::F16 => 0,
+        DType::BF16 => 1,
+        other => candle::bail!("fused_multi_recurrence_rocm only supports f16/bf16, got {other:?}"),
+    };
+    let dev = mixed_qkv.device().as_rocm_device()?;
+    let half_ptr = |t: &Tensor, name: &str| -> Result<u64> {
+        match t.dtype() {
+            DType::F16 => rocm_ptr::<half::f16>(t, name),
+            DType::BF16 => rocm_ptr::<half::bf16>(t, name),
+            other => candle::bail!("{name} has unsupported dtype {other:?}"),
+        }
+    };
+    let mixed_ptr = half_ptr(&mixed_qkv.contiguous()?, "mixed_qkv")?;
+    let b_ptr = half_ptr(b, "b")?;
+    let a_ptr = half_ptr(a, "a")?;
+    let b_strides = b.stride().iter().map(|&s| s as i64).collect::<Vec<_>>();
+    let a_strides = a.stride().iter().map(|&s| s as i64).collect::<Vec<_>>();
+    let alog_ptr = rocm_ptr::<f32>(a_log, "a_log")?;
+    let dtb_ptr = rocm_ptr::<f32>(dt_bias, "dt_bias")?;
+    let (state_ptr, state_dtype) = rocm_recurrent_state_ptr(state, "state")?;
+    let bh = batch_size * num_v_heads;
+    let output = unsafe { Tensor::empty((bh, seq_len, head_v_dim), mixed_qkv.dtype(), mixed_qkv.device()) }?;
+    let out_ptr = half_ptr(&output, "output")?;
+    let stream = dev.hip_stream().raw() as i64;
+    with_slot_indices(slots, |slot_ptr, _| {
+        unsafe {
+            crate::rocm::ffi::gdn_decode_recurrence_multi(
+                mixed_ptr as *const c_void,
+                b_ptr as *const c_void,
+                a_ptr as *const c_void,
+                alog_ptr as *const f32,
+                dtb_ptr as *const f32,
+                state_ptr,
+                out_ptr as *mut c_void,
+                batch_size as i32,
+                seq_len as i32,
+                num_k_heads as i32,
+                num_v_heads as i32,
+                head_k_dim as i32,
+                head_v_dim as i32,
+                i32::from(tiled_v_heads),
+                b_strides.as_ptr(),
+                a_strides.as_ptr(),
+                slot_ptr,
+                dtype_code,
+                state_dtype,
+                stream,
+            );
+        }
+        Ok(())
+    })?;
+    Ok(output)
+}
+
 pub fn fused_decode_recurrence_rocm(launch: FusedDecodeRecurrence<'_>) -> Result<Tensor> {
     use candle_core as candle;
     use core::ffi::c_void;

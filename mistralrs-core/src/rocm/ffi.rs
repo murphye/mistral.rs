@@ -151,6 +151,29 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn gdn_decode_recurrence_multi(
+        mixed_qkv: *const c_void,
+        b: *const c_void,
+        a: *const c_void,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        state: *mut c_void,
+        output: *mut c_void,
+        batch_size: i32,
+        seq_len: i32,
+        num_k_heads: i32,
+        num_v_heads: i32,
+        head_k_dim: i32,
+        head_v_dim: i32,
+        tiled_v_heads: i32,
+        b_strides: *const i64,
+        a_strides: *const i64,
+        slot_indices: *const i32,
+        dtype: i32,
+        state_dtype: i32,
+        stream: i64,
+    );
+
     pub fn gdn_decode_recurrence(
         mixed_qkv: *const c_void,
         b: *const c_void,

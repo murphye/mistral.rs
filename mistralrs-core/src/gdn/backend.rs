@@ -730,6 +730,32 @@ fn recurrence_rocm_from_convolved(
             state_layout: cache.state_layout,
             slots,
         })?
+    } else if seq_len <= crate::rocm::gdn::GDN_FUSED_MULTI_MAX_TOKENS
+        && matches!(dims.head_k_dim, 64 | 128)
+        && cache.state_layout == RecurrentStateLayout::GdnKeyMajor
+        && b.rank() == 3
+        && a.rank() == 3
+    {
+        // Verify steps: the decode kernel run over the few tokens of each sequence.
+        crate::rocm::gdn::fused_multi_recurrence_rocm(
+            crate::cuda::gdn::FusedDecodeRecurrence {
+                mixed_qkv: &mixed_qkv,
+                b: &b,
+                a: &a,
+                a_log: &a_log,
+                dt_bias: &dt_bias,
+                state: &mut state_flat,
+                batch_size,
+                num_k_heads: dims.num_k_heads,
+                num_v_heads: dims.num_v_heads,
+                head_k_dim: dims.head_k_dim,
+                head_v_dim: dims.head_v_dim,
+                tiled_v_heads,
+                state_layout: cache.state_layout,
+                slots,
+            },
+            seq_len,
+        )?
     } else {
         let (q_bh, k_bh, v_bh, g_bh, beta_bh) = crate::rocm::gdn::prepare_recurrence_inputs_rocm(
             &mixed_qkv,
