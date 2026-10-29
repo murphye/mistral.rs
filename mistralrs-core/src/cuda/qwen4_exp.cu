@@ -185,14 +185,14 @@ q4_hc_combine_kernel(const T *__restrict__ res, const T *__restrict__ block_out,
 // hc_combine over a tensor-parallel partial `block_out`: the ranks exchange their
 // partials through peer memory (the receive-buffer layout of candle's
 // peer_allreduce.cu) and each combines the full sum, so the all-reduce costs no
-// launch of its own. Workgroup `row` pushes its stream's `hidden / hc` slice of
-// token `t`'s partial to every peer's slot for this rank; the last workgroup to
-// finish pushing publishes the epoch to the peers, and every workgroup waits
-// for all peers' epochs before reading their slots. Every workgroup of the grid
-// must be resident at once, so `rows` stays small (decode steps).
+// launch of its own. Workgroup 0 pushes the whole `[tokens, hidden]` partial to
+// every peer's slot for this rank and publishes the epoch (one system-scope
+// fence per launch); every workgroup waits for all peers' epochs before reading
+// their slots, and the last workgroup to finish advances the epoch. Every
+// workgroup of the grid must be resident at once, so `rows` stays small.
 #define Q4_PEER_SPIN_TIMEOUT_TICKS 1000000000ull
-// Fence between a workgroup's pushes into peer memory and its ticket increment. Peer memory
-// needs system scope; an agent-scope fence measured only ~2 us faster per combine.
+// Fence between the pushes into peer memory and the flag stores. Peer memory
+// needs system scope.
 #ifndef Q4_PEER_PUSH_FENCE
 #define Q4_PEER_PUSH_FENCE() __threadfence_system()
 #endif
@@ -206,7 +206,7 @@ __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
     const float *__restrict__ next_weight, T *__restrict__ xn_out, int hc,
     int hidden, float eps, const uint64_t *__restrict__ peers, int rank,
     int world, int max_elems, int *__restrict__ epoch,
-    unsigned int *__restrict__ pushed) {
+    unsigned int *__restrict__ finished) {
   __shared__ float smem[32];
   __shared__ int ep_s;
   const int rows = gridDim.x;
@@ -219,30 +219,24 @@ __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
   __syncthreads();
   const int ep = ep_s;
   const int half = ep & 1;
-  // Push this stream's slice of the token's partial, 16 bytes per lane.
-  const int slice = hidden / hc;
-  const size_t at = t * hidden + (size_t)stream * slice;
-  const q4_v4u *src = reinterpret_cast<const q4_v4u *>(block_out + at);
-  const int nv = slice * (int)sizeof(T) / 16;
-  for (int peer = 0; peer < world; ++peer) {
-    if (peer == rank) {
-      continue;
+  if (blockIdx.x == 0) {
+    // Push the whole partial, 16 bytes per lane.
+    const int nv = (rows / hc) * hidden * (int)sizeof(T) / 16;
+    const q4_v4u *src = reinterpret_cast<const q4_v4u *>(block_out);
+    for (int peer = 0; peer < world; ++peer) {
+      if (peer == rank) {
+        continue;
+      }
+      T *slot = reinterpret_cast<T *>(peers[peer]) +
+                (size_t)(half * world + rank) * max_elems;
+      q4_v4u *dst = reinterpret_cast<q4_v4u *>(slot);
+      for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+        dst[i] = src[i];
+      }
     }
-    T *slot = reinterpret_cast<T *>(peers[peer]) +
-              (size_t)(half * world + rank) * max_elems + at;
-    q4_v4u *dst = reinterpret_cast<q4_v4u *>(slot);
-    for (int i = threadIdx.x; i < nv; i += blockDim.x) {
-      dst[i] = src[i];
-    }
-  }
-  Q4_PEER_PUSH_FENCE();
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    // Every workgroup's pushes are fenced before its increment; an acquire-release increment
-    // at system scope orders them all before the last workgroup's flag stores.
-    const unsigned int done =
-        __hip_atomic_fetch_add(pushed, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
-    if (done == (unsigned int)rows - 1) {
+    Q4_PEER_PUSH_FENCE();
+    __syncthreads();
+    if (threadIdx.x == 0) {
       for (int peer = 0; peer < world; ++peer) {
         if (peer != rank) {
           int *flags = reinterpret_cast<int *>(peers[world + peer]);
@@ -250,10 +244,9 @@ __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
                              __HIP_MEMORY_SCOPE_SYSTEM);
         }
       }
-      // All workgroups have read the epoch and taken their ticket.
-      *pushed = 0;
-      *epoch = ep;
     }
+  }
+  if (threadIdx.x == 0) {
     int *own = reinterpret_cast<int *>(peers[world + rank]);
     const uint64_t start = wall_clock64();
     for (int peer = 0; peer < world; ++peer) {
@@ -287,15 +280,21 @@ __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
     const float vf = q4_f(v);
     ss = fmaf(vf, vf, ss);
   }
-  if (next_weight == nullptr) {
-    return;
+  if (next_weight != nullptr) {
+    ss = q4_block_sum(ss, smem);
+    const float inv = rsqrtf(ss / (float)hidden + eps);
+    const float *wr = next_weight + (size_t)stream * hidden;
+    T *xr = xn_out + row * hidden;
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+      xr[i] = q4_t<T>(q4_f(orow[i]) * inv * wr[i]);
+    }
   }
-  ss = q4_block_sum(ss, smem);
-  const float inv = rsqrtf(ss / (float)hidden + eps);
-  const float *wr = next_weight + (size_t)stream * hidden;
-  T *xr = xn_out + row * hidden;
-  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-    xr[i] = q4_t<T>(q4_f(orow[i]) * inv * wr[i]);
+  // The last workgroup to finish advances the epoch: every workgroup has read it by now.
+  if (threadIdx.x == 0) {
+    if (atomicAdd(finished, 1u) == (unsigned int)rows - 1) {
+      *finished = 0;
+      *epoch = ep;
+    }
   }
 }
 #endif
@@ -1408,7 +1407,7 @@ extern "C" void qwen4_hc_combine(const void *res, const void *block_out,
 
 #ifdef USE_ROCM
 // `peers`, `rank`, `world`, `max_elems`, `epoch`: a candle PeerAllReduce's raw handles;
-// `pushed`: its zeroed workgroup counter. `hidden / hc` must be a multiple of
+// `finished`: its zeroed workgroup counter. `hidden / hc` must be a multiple of
 // 16 bytes of T.
 extern "C" void qwen4_hc_combine_ar(const void *res, const void *block_out,
                                     const void *inject, void *res_out,
@@ -1416,7 +1415,7 @@ extern "C" void qwen4_hc_combine_ar(const void *res, const void *block_out,
                                     int rows, int hc, int hidden, float eps,
                                     int dtype, const uint64_t *peers, int rank,
                                     int world, int max_elems, int *epoch,
-                                    unsigned int *pushed, int64_t stream) {
+                                    unsigned int *finished, int64_t stream) {
   if (rows == 0) {
     return;
   }
@@ -1426,7 +1425,7 @@ extern "C" void qwen4_hc_combine_ar(const void *res, const void *block_out,
                   (const scalar_t *)res, (const scalar_t *)block_out,
                   (const scalar_t *)inject, (scalar_t *)res_out, next_weight,
                   (scalar_t *)xn_out, hc, hidden, eps, peers, rank, world,
-                  max_elems, epoch, pushed));
+                  max_elems, epoch, finished));
 }
 #endif
 

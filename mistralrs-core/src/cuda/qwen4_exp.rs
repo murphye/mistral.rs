@@ -109,7 +109,7 @@ mod ffi {
             world: i32,
             max_elems: i32,
             epoch: *mut i32,
-            pushed: *mut u32,
+            finished: *mut u32,
             stream: i64,
         );
         pub(super) fn qwen4_ple_hash(
