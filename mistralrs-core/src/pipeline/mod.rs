@@ -2034,6 +2034,7 @@ pub trait Pipeline:
                     crate::speculative::driver::clear_staged_speculative_tokens(input_seqs);
                 }
 
+                let step_timing = step_timing::begin(is_prompt);
                 let inputs_iter =
                     std::iter::once(self.get_processor().inputs_processor().process_inputs(
                         self.tokenizer(),
@@ -2089,10 +2090,13 @@ pub trait Pipeline:
                             || (self.device().is_rocm()
                                 && sampling::can_sample_batch_rocm(input_seqs)));
                     let start = Instant::now();
+                    step_timing.mark("inputs");
                     let raw_logits = self
                         .forward_inputs(inputs, return_raw_logits)?
                         .into_cpu_for_batch(input_seqs.len(), preserve_causal_generation)?;
                     let end = Instant::now();
+                    step_timing.mark("forward");
+                    crate::speculative::spec_timing("forward", start);
                     exec_duration += end.duration_since(start);
 
                     for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
@@ -2183,6 +2187,7 @@ pub trait Pipeline:
                                 logits
                             })
                             .collect::<Vec<_>>();
+                        let spec_start = Instant::now();
                         if is_prompt
                             || return_raw_logits
                             || !self
@@ -2207,6 +2212,9 @@ pub trait Pipeline:
                             )
                             .await?;
                         }
+                        crate::speculative::spec_timing("sample", spec_start);
+                        step_timing.mark("sample");
+                        step_timing.finish();
                     }
                     ForwardInputsResult::Image { .. } => {
                         response::send_image_responses(
@@ -2310,6 +2318,7 @@ pub trait Pipeline:
                 Ok(StepSubmission::ready(exec_duration))
             }
             CacheBackendMetadata::PagedAttention { mut metadata } => {
+                let step_timing = step_timing::begin(is_prompt);
                 let block_size = metadata.block_size;
                 let speculative_metadata = metadata.clone();
                 let scheduled_prompt_chunks = metadata.scheduled_prompt_chunks.take();
@@ -2620,6 +2629,7 @@ pub trait Pipeline:
                             hybrid_cache.install_sequence_state_indices(&sequence_slots)?;
                         }
                         let start = Instant::now();
+                        step_timing.mark("inputs");
                         #[cfg(feature = "cuda")]
                         let forward = if cuda_decode_lookahead {
                             self.forward_step(inputs, return_raw_logits)?
@@ -2649,6 +2659,7 @@ pub trait Pipeline:
                         }
                         let end = Instant::now();
                         exec_duration += end.duration_since(start);
+                        step_timing.mark("forward");
 
                         for (seq_idx, end) in recurrent_boundaries {
                             self.snapshot_paged_recurrent_prefix(
@@ -2822,6 +2833,8 @@ pub trait Pipeline:
                             }
                         }
                         exec_duration += start.elapsed();
+                        step_timing.mark("sample");
+                        step_timing.finish();
                         return Ok(StepSubmission::ready(exec_duration));
                     }
                     for (seq_idx, logits) in logits.iter_mut().enumerate() {
@@ -2878,6 +2891,8 @@ pub trait Pipeline:
                             )
                             .await?;
                         }
+                        step_timing.mark("sample");
+                        step_timing.finish();
                     }
                     ForwardInputsResult::Image { .. } => {
                         response::send_image_responses(
@@ -3804,5 +3819,65 @@ mod tests {
         inputs.push(message);
 
         test_with_inputs(&templates, &expected_outputs, inputs);
+    }
+}
+
+/// `MISTRALRS_STEP_TIMING`: host-side phases of each decode step (gap since the previous
+/// step's sampling finished, input preparation, forward incl. the device sync for the logits,
+/// sampling), printed per step.
+mod step_timing {
+    use std::cell::Cell;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static LAST_END: Mutex<Option<Instant>> = Mutex::new(None);
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MISTRALRS_STEP_TIMING").is_some())
+    }
+
+    pub(super) struct StepTiming {
+        start: Option<Instant>,
+        last: Cell<Option<Instant>>,
+        line: std::cell::RefCell<String>,
+    }
+
+    pub(super) fn begin(is_prompt: bool) -> StepTiming {
+        if !on() || is_prompt {
+            return StepTiming { start: None, last: Cell::new(None), line: Default::default() };
+        }
+        let now = Instant::now();
+        let gap = LAST_END.lock().unwrap().map_or(f64::NAN, |t| t.elapsed().as_secs_f64() * 1e3);
+        StepTiming {
+            start: Some(now),
+            last: Cell::new(Some(now)),
+            line: std::cell::RefCell::new(format!("STEP_TIMING gap={gap:.3}ms")),
+        }
+    }
+
+    impl StepTiming {
+        pub(super) fn mark(&self, phase: &str) {
+            if let Some(last) = self.last.get() {
+                let now = Instant::now();
+                self.line.borrow_mut().push_str(&format!(
+                    " {phase}={:.3}ms",
+                    now.duration_since(last).as_secs_f64() * 1e3
+                ));
+                self.last.set(Some(now));
+            }
+        }
+
+        pub(super) fn finish(&self) {
+            if let Some(start) = self.start {
+                let now = Instant::now();
+                eprintln!(
+                    "{} total={:.3}ms",
+                    self.line.borrow(),
+                    now.duration_since(start).as_secs_f64() * 1e3
+                );
+                *LAST_END.lock().unwrap() = Some(now);
+            }
+        }
     }
 }

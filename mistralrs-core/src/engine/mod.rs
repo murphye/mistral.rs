@@ -1254,7 +1254,9 @@ impl Engine {
             // form the same batches and their collectives match.
             let mirror_admission = mistralrs_quant::distributed::mirrors_first_rank_admission();
             let worker_budget = if mirror_admission && distributed::is_daemon() {
-                match mistralrs_quant::distributed::broadcast_from_first_rank(0) {
+                match tp_timing::barrier("worker", || {
+                    mistralrs_quant::distributed::broadcast_from_first_rank(0)
+                }) {
                     Ok(budget) => {
                         if !self.await_replicated_requests(&mut pending, budget).await {
                             break 'lp;
@@ -1292,9 +1294,9 @@ impl Engine {
                 workload_dispatches += 1;
             }
             if mirror_admission && !distributed::is_daemon() {
-                if let Err(err) =
+                if let Err(err) = tp_timing::barrier("rank0", || {
                     mistralrs_quant::distributed::broadcast_from_first_rank(workload_dispatches)
-                {
+                }) {
                     tracing::error!("Tensor-parallel admission sync failed: {err}");
                     break 'lp;
                 }
@@ -1525,6 +1527,7 @@ impl Engine {
                                 .await
                         };
 
+                        tp_timing::step_done();
                         let completion_exec_time = handle_pipeline_forward_error!(
                             "completion step",
                             res,
@@ -2615,5 +2618,40 @@ impl Engine {
                 writer.write_all(req.as_bytes()).unwrap();
             }
         }
+    }
+}
+
+/// `MISTRALRS_TP_TIMING`: per-rank timing of the tensor-parallel admission barrier, and how
+/// long after the previous decode step each rank reached it.
+mod tp_timing {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static LAST_STEP_END: Mutex<Option<Instant>> = Mutex::new(None);
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MISTRALRS_TP_TIMING").is_some())
+    }
+
+    pub(super) fn step_done() {
+        if on() {
+            *LAST_STEP_END.lock().unwrap() = Some(Instant::now());
+        }
+    }
+
+    pub(super) fn barrier<R>(role: &str, f: impl FnOnce() -> R) -> R {
+        if !on() {
+            return f();
+        }
+        let since = LAST_STEP_END.lock().unwrap().map(|t| t.elapsed());
+        let start = Instant::now();
+        let out = f();
+        eprintln!(
+            "TP_TIMING {role} since_step_end={:.3}ms barrier={:.3}ms",
+            since.map_or(f64::NAN, |since| since.as_secs_f64() * 1e3),
+            start.elapsed().as_secs_f64() * 1e3
+        );
+        out
     }
 }
