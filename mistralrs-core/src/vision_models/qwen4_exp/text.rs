@@ -174,6 +174,12 @@ impl SparseMoeBlock {
             None,
             None,
         )?;
+        #[cfg(feature = "rocm")]
+        if xs.device().is_rocm() {
+            if let Some(out) = self.forward_rocm_fused(xs, &xs_flat, &topk.values, &topk.indices)? {
+                return Ok(out);
+            }
+        }
         // Under tensor parallelism both expert outputs are partial sums. The shared expert's
         // gate is one scalar per token, so it applies to each partial sum and the two reduce
         // together.
@@ -214,6 +220,63 @@ impl SparseMoeBlock {
 
     fn all_reduce_world(&self) -> usize {
         self.experts.world_size()
+    }
+
+    /// The routed and shared experts in two indexed-MoE launches: the shared expert rides along
+    /// as expert `num_experts` on every token with its sigmoid gate as the routing weight, so
+    /// its own projections, activation and gated add disappear from the step.
+    #[cfg(feature = "rocm")]
+    fn forward_rocm_fused(
+        &self,
+        xs: &Tensor,
+        xs_flat: &Tensor,
+        topk_values: &Tensor,
+        topk_indices: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        use candle_core::quantized::rocm::{
+            indexed_moe_forward_with_extra, indexed_moe_glu_forward_with_extra,
+        };
+        let Some((gate, up, down, routed_partial)) = self.experts.rocm_quantized_tables() else {
+            return Ok(None);
+        };
+        let (Some(s_gate), Some(s_up), Some(s_down)) = (
+            self.shared_expert.gate.get_qtensor(),
+            self.shared_expert.up.get_qtensor(),
+            self.shared_expert.down.get_qtensor(),
+        ) else {
+            return Ok(None);
+        };
+        let shared_partial = !self.all_reduce.is_noop();
+        // Both partial or both complete; mixed cases keep the unfused path's rescaling.
+        if routed_partial != shared_partial
+            || s_gate.dtype() != gate.dtype()
+            || s_down.dtype() != down.dtype()
+            || xs.dtype() != DType::BF16
+        {
+            return Ok(None);
+        }
+        let (b_size, seq_len, hidden_dim) = xs.dims3()?;
+        let tokens = b_size * seq_len;
+        let num_experts = self.experts.num_experts();
+        let shared_gate = candle_nn::ops::sigmoid(
+            &self
+                .shared_expert_gate
+                .forward(xs_flat)?
+                .to_dtype(DType::F32)?,
+        )?
+        .reshape((tokens, 1))?;
+        let shared_id = Tensor::full(num_experts as u32, (tokens, 1), xs.device())?;
+        let ids = Tensor::cat(&[&topk_indices.to_dtype(DType::U32)?, &shared_id], 1)?.contiguous()?;
+        let weights = Tensor::cat(&[&topk_values.to_dtype(DType::F32)?, &shared_gate], 1)?.contiguous()?;
+        let x3 = xs_flat.reshape((tokens, 1, hidden_dim))?.contiguous()?;
+        let down_in = indexed_moe_glu_forward_with_extra(&gate, &up, 0, &s_gate, &s_up, &x3, &ids)?;
+        let ys = indexed_moe_forward_with_extra(&down, &s_down, &down_in, &ids)?;
+        let out = crate::rocm::moe_glue::moe_weighted_reduce(&ys, &weights)?
+            .reshape((b_size, seq_len, hidden_dim))?;
+        if routed_partial {
+            return self.all_reduce.sum_all_reduce(&out.contiguous()?).map(Some);
+        }
+        Ok(Some(out))
     }
 }
 
@@ -800,15 +863,16 @@ impl Qwen4ExpTextModel {
         })
     }
 
-    /// Gathers the PLE embeddings of a decode step (one token per sequence) on the host and
-    /// advances each sequence's n-gram history, as the forward pass would.
+    /// Gathers the PLE embeddings of a decode step (`input_ids: [batch, tokens]`, the same
+    /// token count per sequence) on the host and advances each sequence's n-gram history, as
+    /// the forward pass would.
     #[cfg(feature = "rocm")]
     pub(super) fn decode_ple_embeddings(&self, input_ids: &Tensor) -> Result<Option<Tensor>> {
         let Some(ple) = self.layers.iter().find_map(|layer| layer.ple.as_ref()) else {
             return Ok(None);
         };
         let n_layers = self.layers.len();
-        let batch = input_ids.dim(0)?;
+        let (batch, tokens) = input_ids.dims2()?;
         let mut hybrid_cache = self.cache.hybrid();
         let indices = hybrid_cache
             .state_indices_for_layer(n_layers)?
@@ -821,8 +885,9 @@ impl Qwen4ExpTextModel {
             history: &pool.recurrent_state,
             slots: &indices,
         };
-        let spans = (0..batch).map(|b| (b, 1)).collect::<Vec<_>>();
-        ple.host_embeddings(input_ids, &state, &spans, batch).map(Some)
+        let spans = (0..batch).map(|b| (b * tokens, tokens)).collect::<Vec<_>>();
+        ple.host_embeddings(input_ids, &state, &spans, batch * tokens)
+            .map(Some)
     }
 
     /// Embeddings the PLE layer uses in place of its own gather; `None` restores the gather.

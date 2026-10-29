@@ -344,6 +344,36 @@ impl MoEExperts {
         self.world_size
     }
 
+    /// The routed experts' GGUF gate, up and down tables (`[experts, n, k]`) and whether they
+    /// are sharded across ranks, when the block can run them through the ROCm indexed kernels
+    /// directly (plain weights, silu).
+    #[cfg(feature = "rocm")]
+    pub fn rocm_quantized_tables(
+        &self,
+    ) -> Option<(
+        Arc<candle_core::quantized::QTensor>,
+        Arc<candle_core::quantized::QTensor>,
+        Arc<candle_core::quantized::QTensor>,
+        bool,
+    )> {
+        let MoEExpertsBackendImpl::Fast(fast) = &self.backend else {
+            return None;
+        };
+        if self.lora_site.is_some() || !matches!(self.act, Activation::Silu | Activation::Swish) {
+            return None;
+        }
+        Some((
+            fast.fused_gate_proj.get_qtensor()?,
+            fast.fused_up_proj.get_qtensor()?,
+            fast.fused_down_proj.get_qtensor()?,
+            fast.sharded,
+        ))
+    }
+
+    pub fn num_experts(&self) -> usize {
+        self.num_experts
+    }
+
     /// The experts' output before the tensor-parallel reduction, and whether it is a partial
     /// sum the caller must still all-reduce.
     pub fn forward_partial(
