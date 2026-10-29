@@ -227,6 +227,9 @@ mod ffi {
         );
         pub(super) fn qwen4_qsa_finalize(
             aux: *const c_void,
+            carry: *const c_void,
+            state_slots: *const u32,
+            lanes: i32,
             block_cs: *const c_void,
             block_keys: *mut c_void,
             layout: Q4Tokens,
@@ -959,7 +962,14 @@ pub(crate) struct QsaShape {
 }
 
 pub(crate) struct QsaFinalizeArgs<'a> {
+    /// This step's raw indexer keys, one int8 row per token.
     pub aux: &'a Tensor,
+    /// Raw keys of each sequence's open block and the one before, by recurrent state slot.
+    pub carry: &'a Tensor,
+    /// Physical recurrent state slot of each sequence of the step, u32 `[seqs]`, and the
+    /// checkpoint lanes per logical slot (`physical = logical * lanes + lane`).
+    pub state_slots: &'a Tensor,
+    pub lanes: usize,
     /// cos/sin of each block's first position, `[slots / ratio, 2 * half_rot]`.
     pub block_cs: &'a Tensor,
     pub block_keys: &'a Tensor,
@@ -974,6 +984,9 @@ pub(crate) struct QsaFinalizeArgs<'a> {
 pub(crate) fn qsa_finalize(args: QsaFinalizeArgs<'_>) -> Result<()> {
     let QsaFinalizeArgs {
         aux,
+        carry,
+        state_slots,
+        lanes,
         block_cs,
         block_keys,
         layout,
@@ -982,9 +995,15 @@ pub(crate) fn qsa_finalize(args: QsaFinalizeArgs<'_>) -> Result<()> {
         shape,
         eps,
     } = args;
+    if state_slots.dtype() != DType::U32 {
+        candle_core::bail!("QSA finalize expects u32 state slots, got {:?}", state_slots.dtype());
+    }
     unsafe {
         ffi::qwen4_qsa_finalize(
             dev_ptr(aux)? as *const _,
+            dev_ptr(carry)? as *const _,
+            dev_ptr(state_slots)? as *const u32,
+            lanes.max(1) as i32,
             dev_ptr(block_cs)? as *const _,
             dev_ptr(block_keys)? as *mut _,
             layout.ffi()?,

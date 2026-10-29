@@ -1469,6 +1469,14 @@ impl HybridCache {
         Ok(bytes_by_device)
     }
 
+    /// The logical slot a sequence currently owns, if any.
+    pub(crate) fn logical_slot_of_sequence(&self, sequence_id: usize) -> Option<u32> {
+        self.slot_owners.iter().position(|owner| {
+            matches!(owner, Some(RecurrentSlotOwner::Sequence(id)) if *id == sequence_id)
+        })
+        .and_then(|slot| u32::try_from(slot).ok())
+    }
+
     pub(crate) fn recurrent_slots_for_sequences(&self, sequence_ids: &[usize]) -> Vec<u32> {
         let sequence_ids = sequence_ids.iter().copied().collect::<HashSet<_>>();
         self.slot_owners

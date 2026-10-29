@@ -971,6 +971,26 @@ impl Qwen4ExpTextModel {
         self.cache.hybrid().replace_state_indices_tensor(indices);
     }
 
+    /// The logical recurrent state slot of each sequence (u32, in `seq_ids` order) and the
+    /// slot capacity, for the MTP drafter's QSA raw-key carry; `None` when a sequence holds
+    /// no slot.
+    pub(super) fn recurrent_logical_slots(
+        &self,
+        seq_ids: &[usize],
+        device: &Device,
+    ) -> Result<Option<(Tensor, usize)>> {
+        let hybrid = self.cache.hybrid();
+        let mut slots = Vec::with_capacity(seq_ids.len());
+        for &seq_id in seq_ids {
+            match hybrid.logical_slot_of_sequence(seq_id) {
+                Some(slot) => slots.push(slot),
+                None => return Ok(None),
+            }
+        }
+        let capacity = hybrid.recurrent_capacity();
+        Ok(Some((Tensor::from_vec(slots, seq_ids.len(), device)?, capacity)))
+    }
+
     pub(super) fn store_spec_hidden_enabled(&self) -> bool {
         self.store_spec_hidden.load(Ordering::Relaxed)
     }
@@ -1123,6 +1143,26 @@ impl Qwen4ExpTextModel {
         let mut res = xs.repeat((1, 1, self.hc))?;
         let mut pending_norm: Option<Tensor> = None;
         let n_layers = self.layers.len();
+        // The paged QSA layers key their raw indexer-key carry by recurrent state slot.
+        let state_slots = match hybrid_cache.state_indices_for_layer(n_layers)? {
+            Some(indices) => {
+                let capacity = hybrid_cache.recurrent_capacity();
+                let lanes = hybrid_cache.physical_checkpoint_lanes().max(1);
+                if std::env::var_os("MISTRALRS_QSA_CARRY_DEBUG").is_some() {
+                    let host = indices.to_dtype(candle_core::DType::U32)?.to_vec1::<u32>()?;
+                    eprintln!(
+                        "QSA_CARRY slots={host:?} capacity={capacity} lanes={lanes} checkpoint_lanes={}",
+                        hybrid_cache.checkpoint_lanes()
+                    );
+                }
+                Some(super::qsa::QsaStateSlots {
+                    slots: indices.to_dtype(candle_core::DType::U32)?,
+                    capacity,
+                    lanes,
+                })
+            }
+            None => None,
+        };
         for (i, layer) in self.layers.iter().enumerate() {
             res = self.mapper.map(res, i)?;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -1149,6 +1189,7 @@ impl Qwen4ExpTextModel {
                 positions: &positions,
                 #[cfg(any(feature = "cuda", feature = "rocm"))]
                 layout,
+                state_slots: state_slots.clone(),
             };
             if let Some(ple) = &layer.ple {
                 let indices = hybrid_cache

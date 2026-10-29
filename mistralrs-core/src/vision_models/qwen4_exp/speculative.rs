@@ -60,6 +60,9 @@ impl BuiltinMtpHost for Qwen4ExpModel {
     fn mtp_embed_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
         self.text.embed_tokens(tokens)
     }
+    fn mtp_state_slots(&self, seq_ids: &[usize]) -> Result<Option<(Tensor, usize)>> {
+        self.text.recurrent_logical_slots(seq_ids, self.mtp_device())
+    }
 
     fn mtp_forward(
         &self,

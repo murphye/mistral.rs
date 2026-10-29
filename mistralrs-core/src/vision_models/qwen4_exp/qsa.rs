@@ -51,13 +51,30 @@ pub(super) struct QsaStep<'a> {
     pub positions: &'a [Option<usize>],
 #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub layout: Option<&'a super::kernels::TokenLayout>,
+    /// Each sequence's physical recurrent state slot (u32, batch order), the logical slot
+    /// capacity and the checkpoint lanes per logical slot: the paged path keys its raw
+    /// indexer-key carry by logical slot (`physical / lanes`).
+    pub state_slots: Option<QsaStateSlots>,
 }
+
+#[derive(Clone)]
+pub(super) struct QsaStateSlots {
+    pub slots: Tensor,
+    pub capacity: usize,
+    pub lanes: usize,
+}
+
+/// Bytes of one raw indexer-key row: int8 per element plus an f32 scale (the kernels'
+/// Q4_QSA_RAW_ROW_BYTES).
+const QSA_RAW_ROW_BYTES: usize = 4;
 
 #[derive(Clone)]
 #[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 struct QsaAuxCache {
-    /// Raw indexer key per KV slot as int8 with an f32 row scale, `[slots, head_dim + 4]` u8.
-    raw: Tensor,
+    /// Raw indexer keys of each sequence's open compressed block and the one before it,
+    /// `[slot_capacity * 2 * ratio, head_dim + 4]` u8, indexed by recurrent state slot. Keys
+    /// of completed blocks are not kept: only their pooled block key is.
+    carry: Tensor,
     /// cos then sin of each compressed block's first position, `[slots / ratio, 2 * half_rot]`:
     /// the finalize kernel rotates the pooled block key by the block's first position only.
     block_cs: Tensor,
@@ -397,6 +414,7 @@ impl QsaAttention {
         key_cache: &Tensor,
         block_size: usize,
         dtype: DType,
+        slot_capacity: usize,
     ) -> Result<QsaAuxCache> {
         if !block_size.is_multiple_of(self.qsa.compress_ratio) {
             candle_core::bail!(
@@ -406,21 +424,26 @@ impl QsaAttention {
         }
         let mut aux = self.aux_cache.lock().expect("QSA aux cache poisoned");
         let num_blocks = key_cache.dim(0)?;
-        if let Some(existing) = aux.as_ref() {
-            if existing.raw.dim(0)? == num_blocks * block_size
-                && existing.raw.device().same_device(key_cache.device())
+        let ratio = self.qsa.compress_ratio;
+        let carry_rows = slot_capacity * 2 * ratio;
+        let row_bytes = self.qsa.head_dim + QSA_RAW_ROW_BYTES;
+        if let Some(existing) = aux.as_mut() {
+            if existing.block_keys.dim(0)? == num_blocks * block_size / ratio
+                && existing.block_keys.device().same_device(key_cache.device())
             {
+                // The slot pool can grow; keep the carried keys of the slots that exist.
+                if existing.carry.dim(0)? < carry_rows {
+                    let grown =
+                        Tensor::zeros((carry_rows, row_bytes), DType::U8, key_cache.device())?;
+                    grown.slice_set(&existing.carry, 0, 0)?;
+                    existing.carry = grown;
+                }
                 return Ok(existing.clone());
             }
         }
         let half_rot = self.rotary_emb_half_dim();
         let cache = QsaAuxCache {
-            // int8 per element plus one f32 scale per row (the kernels' Q4_QSA_RAW_ROW_BYTES).
-            raw: Tensor::zeros(
-                (num_blocks * block_size, self.qsa.head_dim + 4),
-                DType::U8,
-                key_cache.device(),
-            )?,
+            carry: Tensor::zeros((carry_rows, row_bytes), DType::U8, key_cache.device())?,
             block_cs: Tensor::zeros(
                 (num_blocks * block_size / self.qsa.compress_ratio, 2 * half_rot),
                 dtype,
@@ -523,18 +546,32 @@ impl QsaAttention {
                 n_index_heads: self.qsa.n_heads,
             };
             let n_tokens = b_sz * seq_len;
-            let aux = self.aux_cache(&key_cache, block_size, q.dtype())?;
+            let Some(state_slots) = step.state_slots.as_ref() else {
+                candle_core::bail!("Qwen4-Exp paged QSA needs the sequences' recurrent state slots");
+            };
+            let aux = self.aux_cache(&key_cache, block_size, q.dtype(), state_slots.capacity)?;
+            // This step's raw indexer keys, consumed by the finalize and carry update below.
+            let scratch = unsafe {
+                Tensor::empty(
+                    (n_tokens, self.qsa.head_dim + QSA_RAW_ROW_BYTES),
+                    DType::U8,
+                    q.device(),
+                )
+            }?;
             kernels::qsa_aux_write(
                 &raw_key.reshape((n_tokens, self.qsa.head_dim))?,
                 &cos_sin.0.reshape((n_tokens, shape.half_rot))?,
                 &cos_sin.1.reshape((n_tokens, shape.half_rot))?,
                 slot_mapping,
-                &aux.raw,
+                &scratch,
                 &aux.block_cs,
                 shape.ratio,
             )?;
             kernels::qsa_finalize(kernels::QsaFinalizeArgs {
-                aux: &aux.raw,
+                aux: &scratch,
+                carry: &aux.carry,
+                state_slots: &state_slots.slots,
+                lanes: state_slots.lanes,
                 block_cs: &aux.block_cs,
                 block_keys: &aux.block_keys,
                 layout,

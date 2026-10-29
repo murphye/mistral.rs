@@ -38,6 +38,9 @@ pub struct MtpAttentionInputs<'a> {
     pub flash_params: &'a FlashParams,
     /// `[start, end)` of each batch row for a prompt-chunk prefill; `None` when every row is its own decode query.
     pub chunk_ranges: Option<&'a [(usize, usize)]>,
+    /// Each row's sequence's logical recurrent state slot (u32, row order) and the slot
+    /// capacity, for drafters whose attention keys per-sequence state by it.
+    pub state_slots: Option<(Tensor, usize)>,
 }
 
 /// Output of one drafter forward, `[b, rows, *]`.
@@ -56,6 +59,11 @@ impl MtpDraftOutput {
 /// Target-side hooks the built-in MTP proposer drives.
 pub(crate) trait BuiltinMtpHost {
     fn mtp_device(&self) -> &Device;
+    /// The logical recurrent state slots of `seq_ids` (row order) and the slot capacity, or
+    /// `None` when the model keeps no per-sequence recurrent slots or a sequence has none.
+    fn mtp_state_slots(&self, _seq_ids: &[usize]) -> Result<Option<(Tensor, usize)>> {
+        Ok(None)
+    }
     fn mtp_dtype(&self) -> DType;
     /// Absolute paged-KV layer index the head writes to and reads from.
     fn mtp_kv_layer_idx(&self) -> usize;
@@ -136,6 +144,7 @@ impl BuiltinMtpProposer {
         let target_hidden = target_hidden
             .to_device(device)?
             .to_dtype(host.mtp_dtype())?;
+        let state_slots = host.mtp_state_slots(&seq_ids)?;
         host.mtp_forward(
             &embeds,
             &target_hidden,
@@ -146,6 +155,7 @@ impl BuiltinMtpProposer {
                 attention_mask: &AttentionMask::None,
                 flash_params: &FlashParams::empty(false),
                 chunk_ranges: None,
+                state_slots,
             },
         )
     }
@@ -208,6 +218,7 @@ impl BuiltinMtpProposer {
                 attention_mask: &attention_mask,
                 flash_params: target.flash_params,
                 chunk_ranges: Some(ctx.chunk_ranges),
+                state_slots: host.mtp_state_slots(ctx.seq_ids)?,
             },
         )?;
         Ok(())
@@ -301,7 +312,9 @@ impl BuiltinMtpProposer {
             last_row_idx.push(rows.len() - 1);
         }
         let target_hidden = Tensor::cat(&hidden_rows, 1)?;
+        let t0 = std::time::Instant::now();
         let refreshed = Self::drafter_forward(host, &rows, &target_hidden, &kv_cache, paged_meta)?;
+        super::spec_timing("mtp_refresh", t0);
         let last_idx = Tensor::from_vec(
             last_row_idx.iter().map(|i| *i as u32).collect::<Vec<_>>(),
             (batch,),
@@ -327,8 +340,12 @@ impl BuiltinMtpProposer {
         let mut tokens: Vec<Vec<u32>> = vec![Vec::with_capacity(n_predict); batch];
         let mut logits = Vec::with_capacity(n_predict);
         for step in 0..n_predict {
+            let t0 = std::time::Instant::now();
             let step_logits = host.mtp_draft_logits(&hidden.logits_hidden)?;
+            super::spec_timing("mtp_lm_head", t0);
+            let t0 = std::time::Instant::now();
             let drafts = sample_draft_rows(&step_logits, ctx.sequences, &mut contexts, &ctx.rng)?;
+            super::spec_timing("mtp_sample", t0);
             for (i, draft) in drafts.iter().enumerate() {
                 tokens[i].push(*draft);
             }
@@ -355,7 +372,9 @@ impl BuiltinMtpProposer {
                     }
                 })
                 .collect::<Vec<_>>();
+            let t0 = std::time::Instant::now();
             hidden = Self::drafter_forward(host, &chained, hidden.chain(), &kv_cache, paged_meta)?;
+            super::spec_timing("mtp_chain", t0);
         }
 
         // [n_predict, batch, vocab] -> per sequence [n_predict, vocab]

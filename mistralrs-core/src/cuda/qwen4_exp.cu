@@ -734,9 +734,34 @@ __device__ __forceinline__ int q4_pos_of(const Q4Tokens &l, const Q4Paged &pg,
 // compressed block (block sizes are multiples of `ratio`, so slot % ratio == 0), the block's
 // cos/sin to `block_cs`: the finalize kernel rotates the pooled key by that position alone.
 // Raw keys are stored as int8 with one f32 scale per row (`Q4_QSA_RAW_ROW_BYTES` bytes):
-// the pooled, RMS-normed block key tolerates the ~0.4% per-element error, and the row is
-// half the size of a bf16 one. 128 threads per token, one element each.
+// the pooled, RMS-normed block key tolerates the ~0.4% per-element error. A key is only
+// needed until its compressed block completes, so rows live in a per-step scratch (one per
+// token of the step) plus a per-sequence carry holding the open block and the one before it
+// (speculative rollback reopens at most one block); the carry is indexed by the sequence's
+// recurrent state slot as `[(slot * 2 + (pos / ratio) % 2) * ratio + pos % ratio]`.
+// 128 threads per token, one element each.
 #define Q4_QSA_RAW_ROW_BYTES (Q4_QSA_HEAD_DIM + 4)
+
+// The carry row of position `p` for a sequence whose physical recurrent slot is `slot`:
+// physical slots are `logical * lanes + lane`, and the logical slot is what stays with the
+// sequence while speculative checkpoints switch lanes.
+__device__ __forceinline__ size_t q4_carry_row(unsigned slot, int lanes, int p, int ratio) {
+  return ((size_t)(slot / (unsigned)lanes) * 2 + (size_t)((p / ratio) & 1)) * ratio + p % ratio;
+}
+
+// The raw-key row of position `p` of sequence `seq`: this step's scratch row when the
+// position is one of the step's tokens, the sequence's carry otherwise.
+__device__ __forceinline__ const uint8_t *
+q4_raw_row(const uint8_t *__restrict__ scratch, const uint8_t *__restrict__ carry,
+           const unsigned *__restrict__ state_slots, int lanes, const Q4Tokens &l,
+           const Q4Paged &pg, int seq, int p, int aux_dim, int ratio) {
+  const int first = (int)pg.kv_lens[seq] - q4_len_of(l, seq);
+  if (p >= first) {
+    return scratch + (size_t)(q4_start_of(l, seq) + (p - first)) * aux_dim;
+  }
+  return carry + q4_carry_row(state_slots[seq], lanes, p, ratio) * aux_dim;
+}
+
 template <typename T>
 __global__ void q4_qsa_aux_write_kernel(
     const T *__restrict__ raw_key, const T *__restrict__ cos,
@@ -752,7 +777,8 @@ __global__ void q4_qsa_aux_write_kernel(
   if (slot < 0) {
     return;
   }
-  uint8_t *row = aux + slot * aux_dim;
+  // Scratch rows are per step token; only the block cos/sin lives at the KV slot's block.
+  uint8_t *row = aux + (size_t)t * aux_dim;
   const int i = threadIdx.x;
   const float x = i < key_dim ? q4_f(raw_key[(size_t)t * key_dim + i]) : 0.0f;
   float amax = fabsf(x);
@@ -786,10 +812,11 @@ __global__ void q4_qsa_aux_write_kernel(
 // key_dim must be 128.
 template <typename T>
 __global__ void
-q4_qsa_finalize_kernel(const uint8_t *__restrict__ aux, const T *__restrict__ block_cs,
-                       T *__restrict__ block_keys, Q4Tokens l, Q4Paged pg,
-                       const float *__restrict__ norm_weight, int ratio,
-                       int half_rot, int aux_dim, float eps) {
+q4_qsa_finalize_kernel(const uint8_t *__restrict__ aux, const uint8_t *__restrict__ carry,
+                       const unsigned *__restrict__ state_slots, int lanes,
+                       const T *__restrict__ block_cs, T *__restrict__ block_keys,
+                       Q4Tokens l, Q4Paged pg, const float *__restrict__ norm_weight,
+                       int ratio, int half_rot, int aux_dim, float eps) {
   const int t = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   const int lane = threadIdx.x & 31;
   if (t >= l.n_tokens) {
@@ -803,7 +830,8 @@ q4_qsa_finalize_kernel(const uint8_t *__restrict__ aux, const T *__restrict__ bl
   const int start = pos + 1 - ratio;
   float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   for (int m = 0; m < ratio; ++m) {
-    const uint8_t *row = aux + q4_slot(pg, seq, start + m) * aux_dim;
+    const uint8_t *row =
+        q4_raw_row(aux, carry, state_slots, lanes, l, pg, seq, start + m, aux_dim, ratio);
     const float row_scale = *(const float *)(row + Q4_QSA_HEAD_DIM);
     const int8_t *src = (const int8_t *)row;
 #pragma unroll
@@ -850,6 +878,33 @@ q4_qsa_finalize_kernel(const uint8_t *__restrict__ aux, const T *__restrict__ bl
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     dst[lane * 4 + i] = q4_t<T>(out[i]);
+  }
+}
+
+// After a step, each sequence's open block (positions from the last block boundary to its
+// kv length) is copied from the step's scratch into the carry; positions before this step
+// are already there. One block per sequence, one thread per row byte.
+__global__ void q4_qsa_carry_update_kernel(const uint8_t *__restrict__ scratch,
+                                           uint8_t *__restrict__ carry,
+                                           const unsigned *__restrict__ state_slots, int lanes,
+                                           Q4Tokens l, Q4Paged pg, int ratio, int aux_dim) {
+  const int seq = blockIdx.x;
+  if (seq >= l.n_seqs) {
+    return;
+  }
+  const int len = q4_len_of(l, seq);
+  if (len <= 0) {
+    return;
+  }
+  const int kv = (int)pg.kv_lens[seq];
+  const int first = kv - len;
+  const int open_start = kv - kv % ratio;
+  for (int p = max(open_start, first); p < kv; ++p) {
+    const uint8_t *src = scratch + (size_t)(q4_start_of(l, seq) + (p - first)) * aux_dim;
+    uint8_t *dst = carry + q4_carry_row(state_slots[seq], lanes, p, ratio) * aux_dim;
+    for (int b = threadIdx.x; b < aux_dim; b += blockDim.x) {
+      dst[b] = src[b];
+    }
   }
 }
 
@@ -1749,11 +1804,12 @@ extern "C" void qwen4_qsa_aux_write(const void *raw_key, const void *cos,
                        aux_dim, ratio));
 }
 
-extern "C" void qwen4_qsa_finalize(const void *aux, const void *block_cs,
-                                   void *block_keys, Q4Tokens layout,
-                                   Q4Paged paged, const float *norm_weight,
-                                   int ratio, int half_rot, int aux_dim,
-                                   float eps, int dtype, int64_t stream) {
+extern "C" void qwen4_qsa_finalize(const void *aux, const void *carry,
+                                   const unsigned *state_slots, int lanes,
+                                   const void *block_cs, void *block_keys,
+                                   Q4Tokens layout, Q4Paged paged,
+                                   const float *norm_weight, int ratio, int half_rot,
+                                   int aux_dim, float eps, int dtype, int64_t stream) {
   if (layout.n_tokens == 0) {
     return;
   }
@@ -1762,9 +1818,13 @@ extern "C" void qwen4_qsa_finalize(const void *aux, const void *block_cs,
   Q4_DISPATCH_HALF(
       dtype, q4_qsa_finalize_kernel<scalar_t>
       <<<(layout.n_tokens + warps - 1) / warps, warps * 32, 0, s>>>(
-          (const uint8_t *)aux, (const scalar_t *)block_cs,
-          (scalar_t *)block_keys, layout, paged, norm_weight, ratio, half_rot,
-          aux_dim, eps));
+          (const uint8_t *)aux, (const uint8_t *)carry, state_slots, lanes,
+          (const scalar_t *)block_cs, (scalar_t *)block_keys, layout, paged,
+          norm_weight, ratio, half_rot, aux_dim, eps));
+  // Stream order keeps the carry update behind the finalize that reads the same scratch.
+  q4_qsa_carry_update_kernel<<<layout.n_seqs, 128, 0, s>>>(
+      (const uint8_t *)aux, (uint8_t *)carry, state_slots, lanes, layout, paged, ratio,
+      aux_dim);
 }
 
 extern "C" void qwen4_qsa_select(const void *q, const void *block_keys,

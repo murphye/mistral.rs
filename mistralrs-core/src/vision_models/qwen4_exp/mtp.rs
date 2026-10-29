@@ -228,6 +228,15 @@ impl Qwen4ExpMtpHead {
             positions: &[],
             #[cfg(any(feature = "cuda", feature = "rocm"))]
             layout: layout.as_ref(),
+            // Logical slots straight from the host: one lane.
+            state_slots: attention
+                .state_slots
+                .as_ref()
+                .map(|(slots, capacity)| super::qsa::QsaStateSlots {
+                    slots: slots.clone(),
+                    capacity: *capacity,
+                    lanes: 1,
+                }),
         };
 
         let xn = self.attn_hc.norm(&res)?;
