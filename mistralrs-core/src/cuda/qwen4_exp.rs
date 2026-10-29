@@ -274,6 +274,7 @@ mod ffi {
             gate: *const c_void,
             gate_tok_stride: i64,
             gate_head_stride: i32,
+            q8_out: *mut c_void,
             dtype: i32,
             stream: i64,
         );
@@ -1187,6 +1188,17 @@ pub(crate) fn qsa_attention(args: QsaAttentionArgs<'_>) -> Result<(Tensor, bool)
     };
     // The WMMA prefill path (64+ tokens) doesn't take the gate; those callers apply it.
     let gate = args.gate.filter(|_| n_tokens < 64);
+    // On ROCm decode the kernel also leaves the output's q8_1 form for the output projection
+    // (rows of n_q_heads * 256, a multiple of the MMVQ row padding).
+    #[cfg(feature = "rocm")]
+    let q8_out = match (gate.is_some(), q.dtype(), device) {
+        (true, DType::BF16, Device::Rocm(dev)) if (n_q_heads * ATTN_HEAD_DIM) % 512 == 0 => {
+            Some(unsafe { dev.alloc::<u8>(n_tokens * n_q_heads * (ATTN_HEAD_DIM / 32) * 36)? })
+        }
+        _ => None,
+    };
+    #[cfg(not(feature = "rocm"))]
+    let q8_out: Option<()> = None;
     let (gate_ptr, gate_tok_stride, gate_head_stride) = match gate {
         Some((gate, offset, tok_stride, head_stride)) => {
             if gate.dtype() != q.dtype() {
@@ -1223,9 +1235,22 @@ pub(crate) fn qsa_attention(args: QsaAttentionArgs<'_>) -> Result<(Tensor, bool)
             gate_ptr as *const _,
             gate_tok_stride,
             gate_head_stride,
+            {
+                #[cfg(feature = "rocm")]
+                let p = q8_out.as_ref().map_or(0u64, |q8| q8.device_ptr());
+                #[cfg(not(feature = "rocm"))]
+                let p = 0u64;
+                p as *mut _
+            },
             half_dtype_code(q.dtype())?,
             stream(device)?,
         );
+    }
+    #[cfg(feature = "rocm")]
+    if let (Some(q8), Device::Rocm(dev)) = (q8_out, device) {
+        // The key candle's shared activation lookup computes for bf16 rows of this shape.
+        dev.hip_stream()
+            .set_derived((dev_ptr(&out)?, n_q_heads * ATTN_HEAD_DIM, n_tokens * 4), q8);
     }
     Ok((out, gate.is_some()))
 }

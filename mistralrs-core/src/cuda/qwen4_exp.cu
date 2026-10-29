@@ -299,6 +299,13 @@ __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
 }
 #endif
 
+// 36-byte q8_1 block (the MMVQ activation format): d and sum in f16, then 32 int8 values.
+struct Q4Q8Block {
+  __half d;
+  __half s;
+  int8_t qs[32];
+};
+
 // Indexer query preparation: from the indexer projection `index_qk[t] = [q heads | raw key]`
 // (row stride `in_stride`), RMSNorm each query head (weight `norm_w`, Gemma-style `1 + w`
 // already applied), rotate its first `2 * half_rot` dims (NeoX halves, cos/sin `[t, half_rot]`)
@@ -932,7 +939,8 @@ __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
     int topk, int ratio, int n_q_heads, int n_kv_heads, int items_per_split,
     float scale, int flashinfer_layout, T *__restrict__ out,
     float *__restrict__ part_acc, float *__restrict__ part_ml,
-    const T *__restrict__ gate, int64_t gate_tok_stride, int gate_head_stride) {
+    const T *__restrict__ gate, int64_t gate_tok_stride, int gate_head_stride,
+    Q4Q8Block *__restrict__ q8_out) {
   const int t = blockIdx.x;
   const int g = blockIdx.y;
   const int split = blockIdx.z;
@@ -1090,10 +1098,36 @@ __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
       const T *gt = gate != nullptr
                         ? gate + (size_t)t * gate_tok_stride + (size_t)qh * gate_head_stride + lane * 8
                         : nullptr;
+      float ov[8];
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
         const float v = acc[hh][i] * inv;
-        o[i] = q4_t<T>(gt != nullptr ? v * q4_sigmoid(q4_f(gt[i])) : v);
+        const T r = q4_t<T>(gt != nullptr ? v * q4_sigmoid(q4_f(gt[i])) : v);
+        o[i] = r;
+        ov[i] = q4_f(r);
+      }
+      if (q8_out != nullptr) {
+        // The row's q8_1 form for the output projection: lanes 4b..4b+3 hold block b.
+        float amax = 0.0f, sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          amax = fmaxf(amax, fabsf(ov[i]));
+          sum += ov[i];
+        }
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, 32));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, 32));
+        sum += __shfl_xor_sync(0xffffffff, sum, 1, 32);
+        sum += __shfl_xor_sync(0xffffffff, sum, 2, 32);
+        const float d = amax / 127.0f;
+        Q4Q8Block *blk = q8_out + ((size_t)t * n_q_heads + qh) * (Q4_ATTN_HEAD_DIM / 32) + lane / 4;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          blk->qs[(lane % 4) * 8 + i] = amax == 0.0f ? 0 : (int8_t)roundf(ov[i] / d);
+        }
+        if (lane % 4 == 0) {
+          blk->d = (__half)d;
+          blk->s = (__half)sum;
+        }
       }
     } else {
       const size_t row = ((size_t)t * n_q_heads + qh) * splits + split;
@@ -1116,7 +1150,7 @@ q4_qsa_attention_reduce_kernel(const float *__restrict__ part_acc,
                                const float *__restrict__ part_ml, int splits,
                                T *__restrict__ out, int n_q_heads,
                                const T *__restrict__ gate, int64_t gate_tok_stride,
-                               int gate_head_stride) {
+                               int gate_head_stride, Q4Q8Block *__restrict__ q8_out) {
   const size_t row = blockIdx.x;
   const int d = threadIdx.x;
   float m = -FLT_MAX;
@@ -1142,7 +1176,24 @@ q4_qsa_attention_reduce_kernel(const float *__restrict__ part_acc,
     const size_t t = row / n_q_heads, qh = row - t * n_q_heads;
     v *= q4_sigmoid(q4_f(gate[t * gate_tok_stride + qh * gate_head_stride + d]));
   }
-  out[row * Q4_ATTN_HEAD_DIM + d] = q4_t<T>(v);
+  const T r = q4_t<T>(v);
+  out[row * Q4_ATTN_HEAD_DIM + d] = r;
+  if (q8_out != nullptr) {
+    // Each wave of 32 threads holds one q8_1 block of the row.
+    const float ov = q4_f(r);
+    float amax = fabsf(ov), sum = ov;
+    for (int off = 16; off > 0; off >>= 1) {
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, 32));
+      sum += __shfl_xor_sync(0xffffffff, sum, off, 32);
+    }
+    const float dq = amax / 127.0f;
+    Q4Q8Block *blk = q8_out + row * (Q4_ATTN_HEAD_DIM / 32) + d / 32;
+    blk->qs[d % 32] = amax == 0.0f ? 0 : (int8_t)roundf(ov / dq);
+    if (d % 32 == 0) {
+      blk->d = (__half)dq;
+      blk->s = (__half)sum;
+    }
+  }
 }
 
 // Launcher dtype codes: 0 = f16, 1 = bf16, 2 = f32.
@@ -1665,14 +1716,14 @@ extern "C" void qwen4_qsa_attention(
     int ratio, int n_q_heads, int n_kv_heads, int splits, int items_per_split,
     float scale, int flashinfer_layout, void *out, float *part_acc,
     float *part_ml, const void *gate, int64_t gate_tok_stride,
-    int gate_head_stride, int dtype, int64_t stream) {
+    int gate_head_stride, void *q8_out, int dtype, int64_t stream) {
   if (layout.n_tokens == 0) {
     return;
   }
   const cudaStream_t s = (cudaStream_t)stream;
 #ifdef USE_ROCM
   // Prefill batches take the WMMA kernel; decode keeps the split kernel below.
-  if (gate == nullptr && layout.n_tokens >= 64 && n_q_heads % n_kv_heads == 0 &&
+  if (gate == nullptr && q8_out == nullptr && layout.n_tokens >= 64 && n_q_heads % n_kv_heads == 0 &&
       n_q_heads / n_kv_heads <= Q4W_ROWS) {
     const dim3 wgrid(layout.n_tokens, n_kv_heads);
     Q4_DISPATCH_HALF(dtype, {
@@ -1692,12 +1743,13 @@ extern "C" void qwen4_qsa_attention(
         (const scalar_t *)v_cache, layout, paged, selected, n_selected, topk,
         ratio, n_q_heads, n_kv_heads, items_per_split, scale, flashinfer_layout,
         (scalar_t *)out, part_acc, part_ml, (const scalar_t *)gate, gate_tok_stride,
-        gate_head_stride);
+        gate_head_stride, (Q4Q8Block *)q8_out);
     if (splits > 1) {
       q4_qsa_attention_reduce_kernel<scalar_t>
           <<<layout.n_tokens * n_q_heads, Q4_ATTN_HEAD_DIM, 0, s>>>(
               part_acc, part_ml, splits, (scalar_t *)out, n_q_heads,
-              (const scalar_t *)gate, gate_tok_stride, gate_head_stride);
+              (const scalar_t *)gate, gate_tok_stride, gate_head_stride,
+              (Q4Q8Block *)q8_out);
     }
   });
 }
