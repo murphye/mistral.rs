@@ -11,6 +11,8 @@ pub struct RmsNormGated {
     pub weight: Tensor,
     eps: f64,
     activation: GdnGateActivation,
+    /// The weight in the activation dtype the fused kernels take, cast once.
+    act_weight: std::sync::OnceLock<Tensor>,
 }
 
 impl RmsNormGated {
@@ -20,6 +22,7 @@ impl RmsNormGated {
             weight,
             eps,
             activation: GdnGateActivation::Silu,
+            act_weight: std::sync::OnceLock::new(),
         }
     }
 
@@ -38,6 +41,7 @@ impl RmsNormGated {
             weight,
             eps,
             activation,
+            act_weight: std::sync::OnceLock::new(),
         })
     }
 
@@ -51,9 +55,28 @@ impl RmsNormGated {
     }
 
     pub fn forward(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
+        self.forward_seeded(x, gate, None)
+    }
+
+    /// [`Self::forward`] where, on ROCm, `seed_k` names the input width of the projection
+    /// that consumes the result so the kernel can leave its q8_1 quantization for it.
+    pub fn forward_seeded(&self, x: &Tensor, gate: &Tensor, seed_k: Option<usize>) -> Result<Tensor> {
+        #[cfg(not(feature = "rocm"))]
+        let _ = seed_k;
         #[cfg(any(feature = "cuda", feature = "metal", feature = "rocm"))]
         if self.fused_kernel_applies(x, gate)? {
-            let weight = self.weight.to_dtype(x.dtype())?;
+            let weight = if self.weight.dtype() == x.dtype() {
+                self.weight.clone()
+            } else {
+                match self.act_weight.get() {
+                    Some(w) if w.dtype() == x.dtype() => w.clone(),
+                    _ => {
+                        let w = self.weight.to_dtype(x.dtype())?;
+                        let _ = self.act_weight.set(w.clone());
+                        w
+                    }
+                }
+            };
             #[cfg(feature = "cuda")]
             if x.device().is_cuda() {
                 return crate::cuda::gdn::rmsnorm_gated_cuda(
@@ -76,6 +99,7 @@ impl RmsNormGated {
                     &weight,
                     self.eps,
                     self.activation,
+                    seed_k,
                 );
             }
         }

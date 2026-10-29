@@ -5592,6 +5592,7 @@ pub fn rmsnorm_gated_cuda(
                 gate_stride[3] as i64,
                 eps as f32,
                 activation.sigmoid_flag(),
+                std::ptr::null_mut(),
                 dtype_code,
                 stream,
             );

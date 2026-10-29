@@ -1093,7 +1093,11 @@ impl GatedDeltaNet {
         };
         #[cfg(not(feature = "cuda"))]
         let y = match output {
-            GdnCoreOutput::Recurrent(y) => self.norm.forward(&y, &z)?,
+            GdnCoreOutput::Recurrent(y) => {
+                // Decode: the norm leaves the q8 form of out_proj's input.
+                self.norm
+                    .forward_seeded(&y, &z, Some(self.dims.value_dim))?
+            }
         };
         let y = y.reshape((batch_size, seq_len, self.dims.value_dim))?;
         let y = shard_out_proj_input(y, self.out_proj_input_shard)?;

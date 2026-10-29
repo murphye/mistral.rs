@@ -110,6 +110,7 @@ extern "C" {
         gate_stride_3: i64,
         eps: f32,
         sigmoid_gate: i32,
+        q8_out: *mut c_void,
         dtype: i32,
         stream: i64,
     );

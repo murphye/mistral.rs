@@ -339,6 +339,7 @@ pub fn rmsnorm_gated_rocm(
     weight: &Tensor,
     eps: f64,
     activation: GdnGateActivation,
+    seed_k: Option<usize>,
 ) -> Result<Tensor> {
     use candle_core as candle;
     use core::ffi::c_void;
@@ -350,6 +351,7 @@ pub fn rmsnorm_gated_rocm(
         eps: f64,
         activation: GdnGateActivation,
         dtype_code: i32,
+        seed_k: Option<usize>,
     ) -> Result<Tensor> {
         let weight = weight.contiguous()?;
         let hidden_dim = weight.dims1()?;
@@ -384,6 +386,19 @@ pub fn rmsnorm_gated_rocm(
 
         let rows = dims[0] * dims[1] * dims[2];
         let output_buf = unsafe { dev.alloc::<T>(rows * hidden_dim) }?;
+        // With `seed_k` (the consuming projection's input width) the kernel also writes the
+        // output's q8_1 form, recorded as the stream's shared activation quantization.
+        let seed_tokens = seed_k
+            .filter(|k| {
+                dtype_code == 1
+                    && hidden_dim == 128
+                    && *k % 512 == 0
+                    && (rows * hidden_dim) % *k == 0
+            })
+            .map(|k| (k, rows * hidden_dim / k));
+        let q8 = seed_tokens
+            .map(|_| unsafe { dev.alloc::<u8>(rows * (hidden_dim / 32) * 36) })
+            .transpose()?;
         let stream = dev.hip_stream().raw() as i64;
 
         unsafe {
@@ -406,9 +421,15 @@ pub fn rmsnorm_gated_rocm(
                 gate_stride[3] as i64,
                 eps as f32,
                 activation.sigmoid_flag(),
+                q8.as_ref().map_or(std::ptr::null_mut(), |q8| q8.device_ptr() as *mut c_void),
                 dtype_code,
                 stream,
             );
+        }
+        if let (Some(q8), Some((k, tokens))) = (q8, seed_tokens) {
+            // The key candle's SharedQ8Activation computes for bf16 rows of this shape.
+            dev.hip_stream()
+                .set_derived((output_buf.device_ptr(), k, tokens * 4), q8);
         }
 
         let output_storage = candle::RocmStorage::wrap_rocm_slice(output_buf, dev.clone());
@@ -419,8 +440,8 @@ pub fn rmsnorm_gated_rocm(
     }
 
     match x.dtype() {
-        DType::F16 => rocm_fwd::<half::f16>(x, gate, weight, eps, activation, 0),
-        DType::BF16 => rocm_fwd::<half::bf16>(x, gate, weight, eps, activation, 1),
+        DType::F16 => rocm_fwd::<half::f16>(x, gate, weight, eps, activation, 0, seed_k),
+        DType::BF16 => rocm_fwd::<half::bf16>(x, gate, weight, eps, activation, 1, seed_k),
         other => candle_core::bail!("rmsnorm_gated_rocm only supports f16/bf16, got {:?}", other),
     }
 }

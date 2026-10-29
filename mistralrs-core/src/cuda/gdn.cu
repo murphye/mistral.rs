@@ -2984,13 +2984,23 @@ gdn_rmsnorm_gated_kernel(const T *__restrict__ x, const T *__restrict__ gate,
   }
 }
 
+// 36-byte q8_1 block (the MMVQ activation format): d, sum in f16, then 32 int8 values.
+struct GdnQ8Block {
+  __half d;
+  __half s;
+  int8_t qs[32];
+};
+
+// `q8_out` (nullable): the output rows' q8_1 quantization, HIDDEN_DIM / 32 blocks per row in
+// row order, so the projection that consumes them skips its quantize launch.
 template <typename T, int HIDDEN_DIM, int ROWS_PER_BLOCK>
 __global__ void gdn_rmsnorm_gated_warp_kernel(
     const T *__restrict__ x, const T *__restrict__ gate,
     const T *__restrict__ weight, T *__restrict__ output, int rows,
     int outer_dim_1, int outer_dim_2, int64_t x_stride_0,
     int64_t x_stride_1, int64_t x_stride_2, int64_t gate_stride_0,
-    int64_t gate_stride_1, int64_t gate_stride_2, float eps, int sigmoid_gate) {
+    int64_t gate_stride_1, int64_t gate_stride_2, float eps, int sigmoid_gate,
+    GdnQ8Block *__restrict__ q8_out) {
   const int lane = threadIdx.x;
   const int warp = threadIdx.y;
   const int row = blockIdx.x * ROWS_PER_BLOCK + warp;
@@ -3027,8 +3037,31 @@ __global__ void gdn_rmsnorm_gated_warp_kernel(
 
 #pragma unroll
   for (int i = lane; i < HIDDEN_DIM; i += 32) {
-    out_row[i] = (T)(values[i / 32] * inv_rms * (float)weight[i] *
-                     gdn_gate_act((float)gate_row[i], sigmoid_gate));
+    const T o = (T)(values[i / 32] * inv_rms * (float)weight[i] *
+                    gdn_gate_act((float)gate_row[i], sigmoid_gate));
+    out_row[i] = o;
+    values[i / 32] = (float)o;
+  }
+  if (q8_out != nullptr) {
+    // Block j holds columns j * 32 .. j * 32 + 31: one value per lane.
+#pragma unroll
+    for (int j = 0; j < HIDDEN_DIM / 32; ++j) {
+      const float v = values[j];
+      float amax = fabsf(v);
+      float sum = v;
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset));
+        sum += __shfl_xor_sync(0xffffffff, sum, offset);
+      }
+      const float d = amax / 127.0f;
+      GdnQ8Block *blk = q8_out + (size_t)row * (HIDDEN_DIM / 32) + j;
+      blk->qs[lane] = amax == 0.0f ? 0 : (int8_t)roundf(v / d);
+      if (lane == 0) {
+        blk->d = (__half)d;
+        blk->s = (__half)sum;
+      }
+    }
   }
 }
 
@@ -3313,14 +3346,15 @@ extern "C" void gdn_rmsnorm_gated(const void *x, const void *gate,
                                   int64_t x_stride_3, int64_t gate_stride_0,
                                   int64_t gate_stride_1, int64_t gate_stride_2,
                                   int64_t gate_stride_3, float eps,
-                                  int sigmoid_gate, int dtype,
+                                  int sigmoid_gate, void *q8_out, int dtype,
                                   int64_t stream) {
   const cudaStream_t custream = (cudaStream_t)stream;
   const bool use_warp_kernel =
       hidden_dim == GDN_RMSNORM_FAST_HIDDEN && x_stride_3 == 1 &&
       gate_stride_3 == 1;
   if (use_warp_kernel) {
-    const bool use_rows4_kernel =
+    // Only the warp kernel writes the q8 copy.
+    const bool use_rows4_kernel = q8_out == nullptr &&
         rows >= GDN_RMSNORM_TILED_MIN_ROWS &&
         gdn_rmsnorm_dense_rows(rows, outer_dim_1, outer_dim_2, x_stride_0,
                                x_stride_1, x_stride_2) &&
@@ -3364,7 +3398,8 @@ extern "C" void gdn_rmsnorm_gated(const void *x, const void *gate,
               (const __half *)x, (const __half *)gate,
               (const __half *)weight, (__half *)output, rows, outer_dim_1,
               outer_dim_2, x_stride_0, x_stride_1, x_stride_2, gate_stride_0,
-              gate_stride_1, gate_stride_2, eps, sigmoid_gate);
+              gate_stride_1, gate_stride_2, eps, sigmoid_gate,
+              (GdnQ8Block *)q8_out);
     } else {
       gdn_rmsnorm_gated_warp_kernel<
           __nv_bfloat16, GDN_RMSNORM_FAST_HIDDEN,
@@ -3373,7 +3408,8 @@ extern "C" void gdn_rmsnorm_gated(const void *x, const void *gate,
               (const __nv_bfloat16 *)x, (const __nv_bfloat16 *)gate,
               (const __nv_bfloat16 *)weight, (__nv_bfloat16 *)output, rows,
               outer_dim_1, outer_dim_2, x_stride_0, x_stride_1, x_stride_2,
-              gate_stride_0, gate_stride_1, gate_stride_2, eps, sigmoid_gate);
+              gate_stride_0, gate_stride_1, gate_stride_2, eps, sigmoid_gate,
+              (GdnQ8Block *)q8_out);
     }
     return;
   }
