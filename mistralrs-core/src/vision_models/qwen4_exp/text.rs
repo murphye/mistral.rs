@@ -172,46 +172,67 @@ impl SparseMoeBlock {
     pub(super) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let xs_flat = xs.reshape(((), hidden_dim))?;
-        #[cfg(feature = "rocm")]
-        let (router_logits, shared_logit) = match &self.stacked_gates {
-            Some(stacked) if xs.device().is_rocm() && xs.dtype() == stacked.dtype() => {
-                let (router, shared) = crate::rocm::moe_glue::moe_dual_gate_gemv(&xs_flat, stacked)?;
-                (router, Some(shared))
-            }
-            _ => (self.gate.forward(&xs_flat)?, None),
+        let router_config = crate::ops::MoeRouterTopKConfig {
+            top_k: self.num_experts_per_tok,
+            score_function: crate::ops::MoeRouterScoreFunction::Softmax,
+            selected_weight: crate::ops::MoeRouterSelectedWeight::Score,
+            renormalize: self.norm_topk_prob,
+            norm_min: 0.0,
+            output_scale: 1.0,
+            logit_clip: None,
         };
-        #[cfg(not(feature = "rocm"))]
-        let router_logits = self.gate.forward(&xs_flat)?;
-        let topk = crate::ops::moe_router_topk(
-            &router_logits,
-            crate::ops::MoeRouterTopKConfig {
-                top_k: self.num_experts_per_tok,
-                score_function: crate::ops::MoeRouterScoreFunction::Softmax,
-                selected_weight: crate::ops::MoeRouterSelectedWeight::Score,
-                renormalize: self.norm_topk_prob,
-                norm_min: 0.0,
-                output_scale: 1.0,
-                logit_clip: None,
-            },
-            None,
-            None,
-        )?;
+        // ROCm decode: the stacked gate launch fills the routing table's shared-expert slot and
+        // the router writes the top-k into the same `[tokens, top_k + 1]` table.
         #[cfg(feature = "rocm")]
-        if xs.device().is_rocm() {
-            if let Some(out) = self.forward_rocm_fused(
-                xs,
+        if let Some(stacked) = self
+            .stacked_gates
+            .as_ref()
+            .filter(|stacked| xs.device().is_rocm() && xs.dtype() == stacked.dtype())
+        {
+            let tokens = b_size * seq_len;
+            let slots = self.num_experts_per_tok + 1;
+            let slot_weights =
+                unsafe { Tensor::empty((tokens, slots), DType::F32, xs.device()) }?;
+            let slot_ids = unsafe { Tensor::empty((tokens, slots), DType::U32, xs.device()) }?;
+            let (router_logits, _shared_logit) = crate::rocm::moe_glue::moe_dual_gate_gemv_slots(
                 &xs_flat,
-                &topk.values,
-                &topk.indices,
-                shared_logit.as_ref(),
-            )? {
+                stacked,
+                Some((&slot_weights, &slot_ids, self.experts.num_experts() as u32)),
+            )?;
+            crate::rocm::moe_router::moe_router_topk_rocm_into(
+                &router_logits,
+                router_config,
+                None,
+                None,
+                &slot_weights,
+                &slot_ids,
+            )?;
+            if let Some(out) = self.forward_rocm_fused(xs, &xs_flat, &slot_ids, &slot_weights)? {
                 return Ok(out);
             }
+            // The unfused path takes the routed slots only.
+            let topk_values = slot_weights.narrow(1, 0, self.num_experts_per_tok)?.contiguous()?;
+            let topk_indices = slot_ids.narrow(1, 0, self.num_experts_per_tok)?.contiguous()?;
+            return self.forward_unfused(xs, &xs_flat, topk_values, &topk_indices);
         }
+        let router_logits = self.gate.forward(&xs_flat)?;
+        let topk = crate::ops::moe_router_topk(&router_logits, router_config, None, None)?;
+        self.forward_unfused(xs, &xs_flat, topk.values, &topk.indices)
+    }
+
+    /// The expert forward from a `[tokens, top_k]` routing: the generic path.
+    fn forward_unfused(
+        &self,
+        xs: &Tensor,
+        xs_flat: &Tensor,
+        topk_values: Tensor,
+        topk_indices: &Tensor,
+    ) -> Result<Tensor> {
+        let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         // Under tensor parallelism both expert outputs are partial sums. The shared expert's
         // gate is one scalar per token, so it applies to each partial sum and the two reduce
         // together.
-        let (y, routed_partial) = self.experts.forward_partial(xs, topk.values, &topk.indices)?;
+        let (y, routed_partial) = self.experts.forward_partial(xs, topk_values, topk_indices)?;
         let mut y = y.reshape((b_size, seq_len, hidden_dim))?;
         let shared_partial = !self.all_reduce.is_noop();
         if shared_partial && !routed_partial {
@@ -258,9 +279,8 @@ impl SparseMoeBlock {
         &self,
         xs: &Tensor,
         xs_flat: &Tensor,
-        topk_values: &Tensor,
-        topk_indices: &Tensor,
-        shared_logit: Option<&Tensor>,
+        ids: &Tensor,
+        weights: &Tensor,
     ) -> Result<Option<Tensor>> {
         use candle_core::quantized::rocm::{
             indexed_moe_forward_with_extra_reduce, indexed_moe_glu_forward_with_extra,
@@ -286,21 +306,10 @@ impl SparseMoeBlock {
         }
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let tokens = b_size * seq_len;
-        let num_experts = self.experts.num_experts();
-        let shared_logit = match shared_logit {
-            Some(shared_logit) => shared_logit.clone(),
-            None => self.shared_expert_gate.forward(xs_flat)?,
-        };
-        let (ids, weights) = crate::rocm::moe_glue::moe_append_shared_slot(
-            &topk_indices.to_dtype(DType::U32)?,
-            &topk_values.to_dtype(DType::F32)?,
-            &shared_logit,
-            num_experts as u32,
-        )?;
         let x3 = xs_flat.reshape((tokens, 1, hidden_dim))?.contiguous()?;
-        let down_in = indexed_moe_glu_forward_with_extra(&gate, &up, 0, &s_gate, &s_up, &x3, &ids)?;
+        let down_in = indexed_moe_glu_forward_with_extra(&gate, &up, 0, &s_gate, &s_up, &x3, ids)?;
         // The down projection sums each token's slots in the kernel.
-        let out = indexed_moe_forward_with_extra_reduce(&down, &s_down, &down_in, &ids, &weights)?
+        let out = indexed_moe_forward_with_extra_reduce(&down, &s_down, &down_in, ids, weights)?
             .reshape((b_size, seq_len, hidden_dim))?;
         if routed_partial {
             return self.all_reduce.sum_all_reduce(&out.contiguous()?).map(Some);

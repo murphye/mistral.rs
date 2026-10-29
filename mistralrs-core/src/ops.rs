@@ -508,6 +508,7 @@ pub fn cuda_moe_router_topk(
                     nrows as i32,
                     n_experts as i32,
                     config.top_k as i32,
+                    config.top_k as i32,
                     config.score_function.as_i32(),
                     config.selected_weight.as_i32(),
                     config.renormalize,

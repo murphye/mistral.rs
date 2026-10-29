@@ -163,6 +163,17 @@ pub fn moe_append_shared_slot(
 /// Router logits `[tokens, n_router]` and the shared-expert gate logit `[tokens]` from one
 /// launch over `w: [n_router + 1, k]` (the router rows, then the shared gate row).
 pub fn moe_dual_gate_gemv(x: &Tensor, w: &Tensor) -> Result<(Tensor, Tensor)> {
+    moe_dual_gate_gemv_slots(x, w, None)
+}
+
+/// [`moe_dual_gate_gemv`] that also fills the shared-expert slot of a routing table: with
+/// `slots = (weights [tokens, stride] f32, ids [tokens, stride] u32, shared_id)` the last column
+/// of each row receives `sigmoid(shared logit)` and `shared_id`.
+pub fn moe_dual_gate_gemv_slots(
+    x: &Tensor,
+    w: &Tensor,
+    slots: Option<(&Tensor, &Tensor, u32)>,
+) -> Result<(Tensor, Tensor)> {
     let (tokens, k) = x.dims2()?;
     let (rows, w_k) = w.dims2()?;
     if w_k != k || rows < 2 || k % 256 != 0 || x.dtype() != w.dtype() {
@@ -179,12 +190,41 @@ pub fn moe_dual_gate_gemv(x: &Tensor, w: &Tensor) -> Result<(Tensor, Tensor)> {
         DType::BF16 => crate::rocm::ffi::moe_dual_gate_gemv_bf16,
         dt => candle_core::bail!("moe_dual_gate_gemv: unsupported dtype {dt:?}"),
     };
+    let (slot_weights, slot_ids, slot_stride, shared_id) = match slots {
+        Some((weights, ids, shared_id)) => {
+            let (rows, stride) = weights.dims2()?;
+            if rows != tokens
+                || ids.dims() != weights.dims()
+                || weights.dtype() != DType::F32
+                || ids.dtype() != DType::U32
+                || !weights.is_contiguous()
+                || !ids.is_contiguous()
+            {
+                candle_core::bail!(
+                    "moe_dual_gate_gemv_slots: slot tables {:?}/{:?} don't fit {tokens} tokens",
+                    weights.shape(),
+                    ids.shape()
+                );
+            }
+            (
+                rocm_ptr::<f32>(weights, "slot_weights")? as *mut f32,
+                rocm_ptr::<u32>(ids, "slot_ids")? as *mut u32,
+                stride as i32,
+                shared_id,
+            )
+        }
+        None => (std::ptr::null_mut(), std::ptr::null_mut(), 0, 0),
+    };
     unsafe {
         launch(
             half_or_f32_ptr(&x, "x")? as *const c_void,
             half_or_f32_ptr(&w, "w")? as *const c_void,
             half_or_f32_ptr(&router, "router")? as *mut c_void,
             half_or_f32_ptr(&shared, "shared")? as *mut c_void,
+            slot_weights,
+            slot_ids,
+            slot_stride,
+            shared_id,
             tokens as i32,
             n_router as i32,
             k as i32,

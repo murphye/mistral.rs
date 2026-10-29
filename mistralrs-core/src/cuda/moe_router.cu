@@ -100,7 +100,7 @@ __launch_bounds__(MOE_ROUTER_ROWS_PER_BLOCK * 32, 1) __global__
         const T *__restrict__ logits, float *__restrict__ weights,
         uint32_t *__restrict__ ids, const float *__restrict__ selection_bias,
         const float *__restrict__ expert_scale, const int n_rows,
-        const int top_k, const int score_mode, const int weight_mode,
+        const int top_k, const int out_stride, const int score_mode, const int weight_mode,
         const bool renormalize, const bool clamp_logits, const float clamp_min,
         const float clamp_max, const float norm_min, const float output_scale) {
   const int lane = threadIdx.x;
@@ -110,8 +110,8 @@ __launch_bounds__(MOE_ROUTER_ROWS_PER_BLOCK * 32, 1) __global__
   }
 
   logits += row * n_experts;
-  weights += row * top_k;
-  ids += row * top_k;
+  weights += row * out_stride;
+  ids += row * out_stride;
 
   constexpr int values_per_thread = n_experts > 32 ? n_experts / 32 : 1;
 
@@ -254,7 +254,7 @@ void launch_moe_router_topk(const T *logits, float *weights, uint32_t *ids,
                             const float *selection_bias,
                             const float *expert_scale, const int n_rows,
                             const int n_experts, const int top_k,
-                            const int score_mode, const int weight_mode,
+                            const int out_stride, const int score_mode, const int weight_mode,
                             const bool renormalize, const bool clamp_logits,
                             const float clamp_min, const float clamp_max,
                             const float norm_min, const float output_scale,
@@ -269,7 +269,8 @@ void launch_moe_router_topk(const T *logits, float *weights, uint32_t *ids,
   moe_router_topk_kernel<T, EXPERTS, has_bias, has_expert_scale>               \
       <<<grid_dims, block_dims, 0, custream>>>(                                \
           logits, weights, ids, selection_bias, expert_scale, n_rows, top_k,   \
-          score_mode, weight_mode, renormalize, clamp_logits, clamp_min,       \
+          out_stride, score_mode, weight_mode, renormalize, clamp_logits,      \
+          clamp_min,                                                           \
           clamp_max, norm_min, output_scale);                                  \
   break
 
@@ -310,7 +311,7 @@ void moe_router_topk_dispatch(const T *logits, float *weights, uint32_t *ids,
                               const float *selection_bias,
                               const float *expert_scale, const int n_rows,
                               const int n_experts, const int top_k,
-                              const int score_mode, const int weight_mode,
+                              const int out_stride, const int score_mode, const int weight_mode,
                               const bool renormalize, const bool clamp_logits,
                               const float clamp_min, const float clamp_max,
                               const float norm_min, const float output_scale,
@@ -318,22 +319,22 @@ void moe_router_topk_dispatch(const T *logits, float *weights, uint32_t *ids,
   if (selection_bias != nullptr && expert_scale != nullptr) {
     launch_moe_router_topk<T, true, true>(
         logits, weights, ids, selection_bias, expert_scale, n_rows, n_experts,
-        top_k, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
+        top_k, out_stride, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
         clamp_max, norm_min, output_scale, stream);
   } else if (selection_bias != nullptr) {
     launch_moe_router_topk<T, true, false>(
         logits, weights, ids, selection_bias, expert_scale, n_rows, n_experts,
-        top_k, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
+        top_k, out_stride, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
         clamp_max, norm_min, output_scale, stream);
   } else if (expert_scale != nullptr) {
     launch_moe_router_topk<T, false, true>(
         logits, weights, ids, selection_bias, expert_scale, n_rows, n_experts,
-        top_k, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
+        top_k, out_stride, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
         clamp_max, norm_min, output_scale, stream);
   } else {
     launch_moe_router_topk<T, false, false>(
         logits, weights, ids, selection_bias, expert_scale, n_rows, n_experts,
-        top_k, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
+        top_k, out_stride, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
         clamp_max, norm_min, output_scale, stream);
   }
 }
@@ -341,40 +342,40 @@ void moe_router_topk_dispatch(const T *logits, float *weights, uint32_t *ids,
 extern "C" void moe_router_topk_f32(const float *logits, float *weights,
                                     uint32_t *ids, const float *selection_bias,
                                     const float *expert_scale, int n_rows,
-                                    int n_experts, int top_k, int score_mode,
+                                    int n_experts, int top_k, int out_stride, int score_mode,
                                     int weight_mode, bool renormalize,
                                     bool clamp_logits, float clamp_min,
                                     float clamp_max, float norm_min,
                                     float output_scale, int64_t stream) {
   moe_router_topk_dispatch<float>(
       logits, weights, ids, selection_bias, expert_scale, n_rows, n_experts,
-      top_k, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
+      top_k, out_stride, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
       clamp_max, norm_min, output_scale, stream);
 }
 
 extern "C" void
 moe_router_topk_bf16(const __nv_bfloat16 *logits, float *weights, uint32_t *ids,
                      const float *selection_bias, const float *expert_scale,
-                     int n_rows, int n_experts, int top_k, int score_mode,
+                     int n_rows, int n_experts, int top_k, int out_stride, int score_mode,
                      int weight_mode, bool renormalize, bool clamp_logits,
                      float clamp_min, float clamp_max, float norm_min,
                      float output_scale, int64_t stream) {
   moe_router_topk_dispatch<__nv_bfloat16>(
       logits, weights, ids, selection_bias, expert_scale, n_rows, n_experts,
-      top_k, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
+      top_k, out_stride, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
       clamp_max, norm_min, output_scale, stream);
 }
 
 extern "C" void moe_router_topk_f16(const __half *logits, float *weights,
                                     uint32_t *ids, const float *selection_bias,
                                     const float *expert_scale, int n_rows,
-                                    int n_experts, int top_k, int score_mode,
+                                    int n_experts, int top_k, int out_stride, int score_mode,
                                     int weight_mode, bool renormalize,
                                     bool clamp_logits, float clamp_min,
                                     float clamp_max, float norm_min,
                                     float output_scale, int64_t stream) {
   moe_router_topk_dispatch<__half>(
       logits, weights, ids, selection_bias, expert_scale, n_rows, n_experts,
-      top_k, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
+      top_k, out_stride, score_mode, weight_mode, renormalize, clamp_logits, clamp_min,
       clamp_max, norm_min, output_scale, stream);
 }

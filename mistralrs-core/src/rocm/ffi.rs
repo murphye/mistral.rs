@@ -208,6 +208,7 @@ extern "C" {
         nrows: i32,
         n_experts: i32,
         top_k: i32,
+        out_stride: i32,
         score_mode: i32,
         weight_mode: i32,
         renormalize: bool,
@@ -227,6 +228,7 @@ extern "C" {
         nrows: i32,
         n_experts: i32,
         top_k: i32,
+        out_stride: i32,
         score_mode: i32,
         weight_mode: i32,
         renormalize: bool,
@@ -246,6 +248,7 @@ extern "C" {
         nrows: i32,
         n_experts: i32,
         top_k: i32,
+        out_stride: i32,
         score_mode: i32,
         weight_mode: i32,
         renormalize: bool,
@@ -269,9 +272,9 @@ extern "C" {
     pub fn moe_append_shared_slot_f32(ids: *const u32, weights: *const f32, gate: *const c_void, ids_out: *mut u32, weights_out: *mut f32, tokens: i32, top_k: i32, shared_id: u32, stream: i64);
     pub fn moe_append_shared_slot_f16(ids: *const u32, weights: *const f32, gate: *const c_void, ids_out: *mut u32, weights_out: *mut f32, tokens: i32, top_k: i32, shared_id: u32, stream: i64);
     pub fn moe_append_shared_slot_bf16(ids: *const u32, weights: *const f32, gate: *const c_void, ids_out: *mut u32, weights_out: *mut f32, tokens: i32, top_k: i32, shared_id: u32, stream: i64);
-    pub fn moe_dual_gate_gemv_f32(x: *const c_void, w: *const c_void, router_out: *mut c_void, shared_out: *mut c_void, tokens: i32, n_router: i32, k: i32, stream: i64);
-    pub fn moe_dual_gate_gemv_f16(x: *const c_void, w: *const c_void, router_out: *mut c_void, shared_out: *mut c_void, tokens: i32, n_router: i32, k: i32, stream: i64);
-    pub fn moe_dual_gate_gemv_bf16(x: *const c_void, w: *const c_void, router_out: *mut c_void, shared_out: *mut c_void, tokens: i32, n_router: i32, k: i32, stream: i64);
+    pub fn moe_dual_gate_gemv_f32(x: *const c_void, w: *const c_void, router_out: *mut c_void, shared_out: *mut c_void, slot_weights: *mut f32, slot_ids: *mut u32, slot_stride: i32, shared_id: u32, tokens: i32, n_router: i32, k: i32, stream: i64);
+    pub fn moe_dual_gate_gemv_f16(x: *const c_void, w: *const c_void, router_out: *mut c_void, shared_out: *mut c_void, slot_weights: *mut f32, slot_ids: *mut u32, slot_stride: i32, shared_id: u32, tokens: i32, n_router: i32, k: i32, stream: i64);
+    pub fn moe_dual_gate_gemv_bf16(x: *const c_void, w: *const c_void, router_out: *mut c_void, shared_out: *mut c_void, slot_weights: *mut f32, slot_ids: *mut u32, slot_stride: i32, shared_id: u32, tokens: i32, n_router: i32, k: i32, stream: i64);
     pub fn add_sigmoid_gated_f32(y: *const c_void, shared: *const c_void, gate: *const c_void, out: *mut c_void, n: i64, hidden: i32, stream: i64);
     pub fn add_sigmoid_gated_f16(y: *const c_void, shared: *const c_void, gate: *const c_void, out: *mut c_void, n: i64, hidden: i32, stream: i64);
     pub fn add_sigmoid_gated_bf16(y: *const c_void, shared: *const c_void, gate: *const c_void, out: *mut c_void, n: i64, hidden: i32, stream: i64);

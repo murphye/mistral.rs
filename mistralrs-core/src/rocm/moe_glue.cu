@@ -192,10 +192,15 @@ APPEND_SHARED_OP(__nv_bfloat16, bf16)
 // Router and shared-expert gate logits in one launch: `w` stacks the `n_router` router rows
 // and the single shared-gate row ([n_router + 1, k]); one wave per (token, row), f32 dots.
 // router_out: [tokens, n_router]; shared_out: [tokens].
+// With `slot_weights`/`slot_ids` ([tokens, slot_stride]) the shared gate's sigmoid and
+// `shared_id` also land in the last column of each row: the routing table's appended slot.
 template <typename T>
 __global__ void moe_dual_gate_gemv_kernel(const T *__restrict__ x, const T *__restrict__ w,
                                           T *__restrict__ router_out, T *__restrict__ shared_out,
-                                          const int tokens, const int n_router, const int k) {
+                                          float *__restrict__ slot_weights,
+                                          unsigned int *__restrict__ slot_ids, const int slot_stride,
+                                          const unsigned int shared_id, const int tokens,
+                                          const int n_router, const int k) {
   const int lane = threadIdx.x % 32;
   const int item = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   const int rows = n_router + 1;
@@ -225,20 +230,28 @@ __global__ void moe_dual_gate_gemv_kernel(const T *__restrict__ x, const T *__re
       router_out[(int64_t)t * n_router + r] = from_float<T>(acc);
     } else {
       shared_out[t] = from_float<T>(acc);
+      if (slot_weights != nullptr) {
+        const int64_t slot = (int64_t)t * slot_stride + slot_stride - 1;
+        slot_weights[slot] = 1.0f / (1.0f + expf(-acc));
+        slot_ids[slot] = shared_id;
+      }
     }
   }
 }
 
 #define DUAL_GATE_OP(T, SUFFIX)                                                                    \
   extern "C" void moe_dual_gate_gemv_##SUFFIX(const void *x, const void *w, void *router_out,      \
-                                              void *shared_out, int tokens, int n_router, int k,   \
-                                              int64_t stream) {                                     \
+                                              void *shared_out, float *slot_weights,               \
+                                              unsigned int *slot_ids, int slot_stride,              \
+                                              unsigned int shared_id, int tokens, int n_router,     \
+                                              int k, int64_t stream) {                              \
     const int warps = 8;                                                                            \
     const int items = tokens * (n_router + 1);                                                      \
     moe_dual_gate_gemv_kernel<T><<<(items + warps - 1) / warps, warps * 32, 0,                     \
                                    (cudaStream_t)stream>>>((const T *)x, (const T *)w,             \
                                                            (T *)router_out, (T *)shared_out,        \
-                                                           tokens, n_router, k);                    \
+                                                           slot_weights, slot_ids, slot_stride,     \
+                                                           shared_id, tokens, n_router, k);         \
   }
 
 DUAL_GATE_OP(float, f32)
