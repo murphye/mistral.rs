@@ -649,6 +649,26 @@ impl PleTable {
         })
     }
 
+    /// Pull the whole mapped table into the page cache ahead of decode: its rows are gathered
+    /// on the host, and a row not in memory costs a disk read in the step's critical path.
+    /// `MISTRALRS_PLE_PREFETCH=0` skips it.
+    fn prefetch(&self) -> Result<()> {
+        if std::env::var("MISTRALRS_PLE_PREFETCH").is_ok_and(|v| v == "0") {
+            return Ok(());
+        }
+        match &self.source {
+            TableSource::Shards { raw, names, .. } => {
+                for name in names {
+                    advise_will_need(raw.get(name)?.data());
+                }
+            }
+            TableSource::Gguf { archive, .. } => {
+                advise_will_need(archive.tensor_data(GGUF_TABLE_NAME)?.bytes());
+            }
+        }
+        Ok(())
+    }
+
     /// Turn off read-ahead on the mapped table. Host gathers touch a few scattered rows per token, and
     /// read-ahead (often megabytes per fault) would stream unrelated rows from disk and evict hot pages.
     fn advise_random(&self) -> Result<()> {
@@ -742,6 +762,20 @@ fn evict_page_cache(data: &[u8]) {
         let len = data.as_ptr() as usize + data.len() - start;
         unsafe {
             libc::madvise(start as *mut libc::c_void, len, libc::MADV_PAGEOUT);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = data;
+}
+
+fn advise_will_need(data: &[u8]) {
+    #[cfg(target_os = "linux")]
+    {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+        let start = data.as_ptr() as usize / page * page;
+        let len = data.as_ptr() as usize + data.len() - start;
+        unsafe {
+            libc::madvise(start as *mut libc::c_void, len, libc::MADV_WILLNEED);
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -967,6 +1001,7 @@ impl PleLayer {
             }
         }
         let _ = device;
+        self.table.prefetch()?;
         self.table.advise_random()?;
         tracing::info!("Qwen4-Exp PLE rows are gathered from the memory-mapped table on the host");
         Ok(())
@@ -1107,6 +1142,8 @@ impl PleLayer {
         seqs: &[(usize, usize)],
         n_tokens: usize,
     ) -> Result<Tensor> {
+        let timing = std::env::var_os("MISTRALRS_GRAPH_TIMING").is_some();
+        let t0 = std::time::Instant::now();
         let tokens = tokens
             .flatten_all()?
             .to_dtype(DType::U32)?
@@ -1140,11 +1177,22 @@ impl PleLayer {
                 .collect::<Vec<_>>();
             new_history.push(tail);
         }
+        let t_hash = t0.elapsed();
         for (seq, tail) in new_history.into_iter().enumerate() {
             let row = Tensor::from_vec(tail, (1, context), state.history.device())?;
             state.history.slice_set(&row, 0, slots[seq] as usize)?;
         }
+        let t_hist = t0.elapsed();
         let emb = self.table.gather_host(&rows, state.conv.device())?;
+        if timing {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            eprintln!(
+                "PLE_HOST hash={:.3}ms hist={:.3}ms gather={:.3}ms",
+                ms(t_hash),
+                ms(t_hist - t_hash),
+                ms(t0.elapsed() - t_hist)
+            );
+        }
         emb.reshape((n_tokens, heads * self.table.head_dim))
     }
 
