@@ -291,6 +291,23 @@ pub fn all_gather(comm: &RcclComm, xs: &Tensor, dim: usize) -> Result<Tensor> {
 /// The largest `value` across ranks, read back to the host. Ranks call this at the same points
 /// of their host loops to agree on decisions that must not diverge.
 pub fn all_reduce_max_u32(comm: &RcclComm, value: u32) -> Result<u32> {
+    if let Some(peer) = comm.peer.as_ref() {
+        // The peer kernels move bf16 bit patterns, so the value rides in two of eight
+        // elements of an all-gather and the maximum is taken on the host: one small kernel
+        // instead of an RCCL collective.
+        let mut bits = [half::bf16::ZERO; 8];
+        bits[0] = half::bf16::from_bits(value as u16);
+        bits[1] = half::bf16::from_bits((value >> 16) as u16);
+        let xs = Tensor::new(&bits[..], &comm.device)?;
+        if peer.supports(&xs) {
+            let rows = peer.all_gather(&xs)?.to_vec2::<half::bf16>()?;
+            return Ok(rows
+                .iter()
+                .map(|row| row[0].to_bits() as u32 | (row[1].to_bits() as u32) << 16)
+                .max()
+                .unwrap_or(value));
+        }
+    }
     let xs = Tensor::new(&[value], &comm.device)?;
     let out = unsafe { Tensor::empty(1, DType::U32, &comm.device) }?;
     let ptr = |t: &Tensor| -> Result<u64> {
