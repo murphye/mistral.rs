@@ -56,7 +56,12 @@ pub(super) struct QsaStep<'a> {
 #[derive(Clone)]
 #[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 struct QsaAuxCache {
+    /// Raw indexer key per KV slot, `[slots, head_dim]`.
     raw: Tensor,
+    /// cos then sin of each compressed block's first position, `[slots / ratio, 2 * half_rot]`:
+    /// the finalize kernel rotates the pooled block key by the block's first position only.
+    block_cs: Tensor,
+    /// Pooled, normed and rotated key per completed block, `[slots / ratio, head_dim]`.
     block_keys: Tensor,
 }
 
@@ -411,7 +416,12 @@ impl QsaAttention {
         let half_rot = self.rotary_emb_half_dim();
         let cache = QsaAuxCache {
             raw: Tensor::zeros(
-                (num_blocks * block_size, aux_dim(&self.qsa, half_rot)),
+                (num_blocks * block_size, self.qsa.head_dim),
+                dtype,
+                key_cache.device(),
+            )?,
+            block_cs: Tensor::zeros(
+                (num_blocks * block_size / self.qsa.compress_ratio, 2 * half_rot),
                 dtype,
                 key_cache.device(),
             )?,
@@ -519,9 +529,12 @@ impl QsaAttention {
                 &cos_sin.1.reshape((n_tokens, shape.half_rot))?,
                 slot_mapping,
                 &aux.raw,
+                &aux.block_cs,
+                shape.ratio,
             )?;
             kernels::qsa_finalize(kernels::QsaFinalizeArgs {
                 aux: &aux.raw,
+                block_cs: &aux.block_cs,
                 block_keys: &aux.block_keys,
                 layout,
                 paged: &paged,

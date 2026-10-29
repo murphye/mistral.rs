@@ -216,15 +216,18 @@ mod ffi {
             sin: *const c_void,
             slot_mapping: *const i64,
             aux: *mut c_void,
+            block_cs: *mut c_void,
             n_tokens: i32,
             key_dim: i32,
             half_rot: i32,
             aux_dim: i32,
+            ratio: i32,
             dtype: i32,
             stream: i64,
         );
         pub(super) fn qwen4_qsa_finalize(
             aux: *const c_void,
+            block_cs: *const c_void,
             block_keys: *mut c_void,
             layout: Q4Tokens,
             paged: Q4Paged,
@@ -912,6 +915,8 @@ pub(crate) fn qsa_aux_write(
     sin: &Tensor,
     slot_mapping: &Tensor,
     aux: &Tensor,
+    block_cs: &Tensor,
+    ratio: usize,
 ) -> Result<()> {
     let raw_key = raw_key.contiguous()?;
     let cos = cos.contiguous()?;
@@ -933,10 +938,12 @@ pub(crate) fn qsa_aux_write(
             dev_ptr(&sin)? as *const _,
             dev_ptr(&slot_mapping)? as *const i64,
             dev_ptr(aux)? as *mut _,
+            dev_ptr(block_cs)? as *mut _,
             n_tokens as i32,
             key_dim as i32,
             half_rot as i32,
             aux.dim(candle_core::D::Minus1)? as i32,
+            ratio as i32,
             half_dtype_code(aux.dtype())?,
             stream(aux.device())?,
         );
@@ -953,6 +960,8 @@ pub(crate) struct QsaShape {
 
 pub(crate) struct QsaFinalizeArgs<'a> {
     pub aux: &'a Tensor,
+    /// cos/sin of each block's first position, `[slots / ratio, 2 * half_rot]`.
+    pub block_cs: &'a Tensor,
     pub block_keys: &'a Tensor,
     pub layout: &'a TokenLayout,
     pub paged: &'a PagedView<'a>,
@@ -965,6 +974,7 @@ pub(crate) struct QsaFinalizeArgs<'a> {
 pub(crate) fn qsa_finalize(args: QsaFinalizeArgs<'_>) -> Result<()> {
     let QsaFinalizeArgs {
         aux,
+        block_cs,
         block_keys,
         layout,
         paged,
@@ -975,6 +985,7 @@ pub(crate) fn qsa_finalize(args: QsaFinalizeArgs<'_>) -> Result<()> {
     unsafe {
         ffi::qwen4_qsa_finalize(
             dev_ptr(aux)? as *const _,
+            dev_ptr(block_cs)? as *const _,
             dev_ptr(block_keys)? as *mut _,
             layout.ffi()?,
             paged.ffi()?,

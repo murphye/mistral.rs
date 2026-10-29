@@ -730,11 +730,15 @@ __device__ __forceinline__ int q4_pos_of(const Q4Tokens &l, const Q4Paged &pg,
   return (int)pg.kv_lens[seq] - q4_len_of(l, seq) + q4_local_of(l, t);
 }
 
+// Writes the token's raw indexer key to its aux slot and, for the first token of each
+// compressed block (block sizes are multiples of `ratio`, so slot % ratio == 0), the block's
+// cos/sin to `block_cs`: the finalize kernel rotates the pooled key by that position alone.
 template <typename T>
 __global__ void q4_qsa_aux_write_kernel(
     const T *__restrict__ raw_key, const T *__restrict__ cos,
     const T *__restrict__ sin, const long long *__restrict__ slot_mapping,
-    T *__restrict__ aux, int n_tokens, int key_dim, int half_rot, int aux_dim) {
+    T *__restrict__ aux, T *__restrict__ block_cs, int n_tokens, int key_dim,
+    int half_rot, int aux_dim, int ratio) {
   const int t = blockIdx.x;
   if (t >= n_tokens) {
     return;
@@ -747,9 +751,12 @@ __global__ void q4_qsa_aux_write_kernel(
   for (int i = threadIdx.x; i < key_dim; i += blockDim.x) {
     dst[i] = raw_key[(size_t)t * key_dim + i];
   }
-  for (int i = threadIdx.x; i < half_rot; i += blockDim.x) {
-    dst[key_dim + i] = cos[(size_t)t * half_rot + i];
-    dst[key_dim + half_rot + i] = sin[(size_t)t * half_rot + i];
+  if (slot % ratio == 0) {
+    T *cs = block_cs + (slot / ratio) * (2 * half_rot);
+    for (int i = threadIdx.x; i < half_rot; i += blockDim.x) {
+      cs[i] = cos[(size_t)t * half_rot + i];
+      cs[half_rot + i] = sin[(size_t)t * half_rot + i];
+    }
   }
 }
 
@@ -757,8 +764,8 @@ __global__ void q4_qsa_aux_write_kernel(
 // key_dim must be 128.
 template <typename T>
 __global__ void
-q4_qsa_finalize_kernel(const T *__restrict__ aux, T *__restrict__ block_keys,
-                       Q4Tokens l, Q4Paged pg,
+q4_qsa_finalize_kernel(const T *__restrict__ aux, const T *__restrict__ block_cs,
+                       T *__restrict__ block_keys, Q4Tokens l, Q4Paged pg,
                        const float *__restrict__ norm_weight, int ratio,
                        int half_rot, int aux_dim, float eps) {
   const int t = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -793,7 +800,7 @@ q4_qsa_finalize_kernel(const T *__restrict__ aux, T *__restrict__ block_keys,
   for (int i = 0; i < 4; ++i) {
     v[i] = q4_f(q4_t<T>(v[i] * inv * norm_weight[lane * 4 + i]));
   }
-  const T *cs = aux + q4_slot(pg, seq, start) * aux_dim + Q4_QSA_HEAD_DIM;
+  const T *cs = block_cs + q4_slot(pg, seq, start) / ratio * (2 * half_rot);
   // Keep raw keys intact when speculative rollback reopens a completed block.
   T *dst = block_keys + q4_slot(pg, seq, start) / ratio * Q4_QSA_HEAD_DIM;
   const T *sn = cs + half_rot;
@@ -1703,8 +1710,9 @@ extern "C" void qwen4_ple_conv(const void *normed, const void *gated,
 extern "C" void qwen4_qsa_aux_write(const void *raw_key, const void *cos,
                                     const void *sin,
                                     const long long *slot_mapping, void *aux,
-                                    int n_tokens, int key_dim, int half_rot,
-                                    int aux_dim, int dtype, int64_t stream) {
+                                    void *block_cs, int n_tokens, int key_dim,
+                                    int half_rot, int aux_dim, int ratio,
+                                    int dtype, int64_t stream) {
   if (n_tokens == 0) {
     return;
   }
@@ -1713,14 +1721,15 @@ extern "C" void qwen4_qsa_aux_write(const void *raw_key, const void *cos,
                    q4_qsa_aux_write_kernel<scalar_t><<<n_tokens, 128, 0, s>>>(
                        (const scalar_t *)raw_key, (const scalar_t *)cos,
                        (const scalar_t *)sin, slot_mapping, (scalar_t *)aux,
-                       n_tokens, key_dim, half_rot, aux_dim));
+                       (scalar_t *)block_cs, n_tokens, key_dim, half_rot,
+                       aux_dim, ratio));
 }
 
-extern "C" void qwen4_qsa_finalize(const void *aux, void *block_keys,
-                                   Q4Tokens layout, Q4Paged paged,
-                                   const float *norm_weight, int ratio,
-                                   int half_rot, int aux_dim, float eps,
-                                   int dtype, int64_t stream) {
+extern "C" void qwen4_qsa_finalize(const void *aux, const void *block_cs,
+                                   void *block_keys, Q4Tokens layout,
+                                   Q4Paged paged, const float *norm_weight,
+                                   int ratio, int half_rot, int aux_dim,
+                                   float eps, int dtype, int64_t stream) {
   if (layout.n_tokens == 0) {
     return;
   }
@@ -1729,8 +1738,9 @@ extern "C" void qwen4_qsa_finalize(const void *aux, void *block_keys,
   Q4_DISPATCH_HALF(
       dtype, q4_qsa_finalize_kernel<scalar_t>
       <<<(layout.n_tokens + warps - 1) / warps, warps * 32, 0, s>>>(
-          (const scalar_t *)aux, (scalar_t *)block_keys, layout, paged,
-          norm_weight, ratio, half_rot, aux_dim, eps));
+          (const scalar_t *)aux, (const scalar_t *)block_cs,
+          (scalar_t *)block_keys, layout, paged, norm_weight, ratio, half_rot,
+          aux_dim, eps));
 }
 
 extern "C" void qwen4_qsa_select(const void *q, const void *block_keys,
