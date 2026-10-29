@@ -115,6 +115,13 @@ pub struct PagedAttentionScheduler {
     decode_steps_since_prefill: usize,
     prompt_admission_epoch: bool,
     waiting_prompt_preemption_enabled: bool,
+    /// KV blocks a new prompt must leave free per decoding sequence, so admitting it does not
+    /// push the running conversations into preemption as they grow
+    /// (`MISTRALRS_PA_GROWTH_RESERVE_TOKENS`, default 0).
+    growth_reserve_blocks: usize,
+    /// Whether a starved prompt may evict running sequences to get its blocks
+    /// (`MISTRALRS_PA_PROMPT_PREEMPTS=0` makes it wait instead).
+    prompt_preempts_running: bool,
     next_prompt_sequence_id: Option<usize>,
     completion_cursor: usize,
     /// Block hashes per sequence for prefix caching.
@@ -133,11 +140,20 @@ impl PagedAttentionScheduler {
         assert!(config.max_num_batched_tokens > 0);
         assert!(config.max_prefill_chunk_tokens > 0);
         assert!(config.max_decode_steps_before_prefill > 0);
+        let growth_reserve_tokens = std::env::var("MISTRALRS_PA_GROWTH_RESERVE_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let growth_reserve_blocks = growth_reserve_tokens.div_ceil(cache_config.block_size);
+        let prompt_preempts_running =
+            std::env::var("MISTRALRS_PA_PROMPT_PREEMPTS").map_or(true, |v| v != "0");
         info!(
             max_num_seqs = config.max_num_seqs,
             max_num_batched_tokens = config.max_num_batched_tokens,
             max_prefill_chunk_tokens = config.max_prefill_chunk_tokens,
             max_decode_steps_before_prefill = config.max_decode_steps_before_prefill,
+            growth_reserve_tokens,
+            prompt_preempts_running,
             "Configured PagedAttention scheduler"
         );
         Self {
@@ -163,6 +179,8 @@ impl PagedAttentionScheduler {
             decode_steps_since_prefill: 0,
             prompt_admission_epoch: false,
             waiting_prompt_preemption_enabled: true,
+            growth_reserve_blocks,
+            prompt_preempts_running,
             next_prompt_sequence_id: None,
             completion_cursor: 0,
             seq_block_hashes: HashMap::new(),
@@ -528,13 +546,20 @@ impl PagedAttentionScheduler {
             .get_toks()
             .len()
             .div_ceil(self.block_size);
-        let decode_reserve = self
+        let decoding = self
             .running
             .iter()
             .filter(|seq| get_mut_arcmutex!(seq).is_completion())
             .count();
+        let decode_reserve = decoding.saturating_add(self.growth_reserve(decoding));
         prompt_blocks.saturating_add(decode_reserve)
             <= get_mut_arcmutex!(self.kv_cache_manager).num_unreserved_blocks()
+    }
+
+    /// Blocks kept free for `decoding` running sequences to grow into before a new prompt is
+    /// admitted.
+    fn growth_reserve(&self, decoding: usize) -> usize {
+        decoding.saturating_mul(self.growth_reserve_blocks)
     }
 
     fn completion_token_cost(seq: &Sequence) -> usize {
@@ -1061,8 +1086,24 @@ impl PagedAttentionScheduler {
             let num_computed = computed.num_computed_tokens;
             let computed_block_count = num_computed / self.block_size;
             let computed_blocks = &computed.block_ids[..computed_block_count];
+            // Admitting the prompt must leave the running conversations their growth reserve;
+            // otherwise it waits like a prompt that found no free blocks.
+            let decoding = self
+                .running
+                .iter()
+                .chain(scheduled.iter())
+                .filter(|seq| get_mut_arcmutex!(seq).is_completion())
+                .count();
+            let growth_reserve = self.growth_reserve(decoding);
             let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
-            let alloc_result = if lazy_prompt_allocation {
+            let new_blocks = num_tokens
+                .saturating_sub(num_computed)
+                .div_ceil(self.block_size);
+            let leaves_reserve = growth_reserve == 0
+                || kv_mgr.num_unreserved_blocks() >= new_blocks.saturating_add(growth_reserve);
+            let alloc_result = if !leaves_reserve {
+                None
+            } else if lazy_prompt_allocation {
                 kv_mgr
                     .reserve_prompt(seq_id, num_tokens, computed_blocks)
                     .map(|()| Vec::new())
@@ -1082,7 +1123,9 @@ impl PagedAttentionScheduler {
                     *count += 1;
 
                     if *count > WAITING_TIMEOUT {
-                        if !self.waiting_prompt_preemption_enabled {
+                        // A prompt that fits the cache but not its current free blocks waits for
+                        // a running sequence to finish unless it may evict one.
+                        if !self.waiting_prompt_preemption_enabled || !self.prompt_preempts_running {
                             break;
                         }
                         // A feasible sequence waits or evicts instead of failing on ordinary pressure.
