@@ -191,6 +191,11 @@ q4_hc_combine_kernel(const T *__restrict__ res, const T *__restrict__ block_out,
 // for all peers' epochs before reading their slots. Every workgroup of the grid
 // must be resident at once, so `rows` stays small (decode steps).
 #define Q4_PEER_SPIN_TIMEOUT_TICKS 1000000000ull
+// Fence between a workgroup's pushes into peer memory and its ticket increment. Peer memory
+// needs system scope; an agent-scope fence measured only ~2 us faster per combine.
+#ifndef Q4_PEER_PUSH_FENCE
+#define Q4_PEER_PUSH_FENCE() __threadfence_system()
+#endif
 
 typedef unsigned int q4_v4u __attribute__((ext_vector_type(4)));
 
@@ -230,7 +235,7 @@ __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
       dst[i] = src[i];
     }
   }
-  __threadfence_system();
+  Q4_PEER_PUSH_FENCE();
   __syncthreads();
   if (threadIdx.x == 0) {
     // Every workgroup's pushes are fenced before its increment; an acquire-release increment

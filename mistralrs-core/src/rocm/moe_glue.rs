@@ -160,6 +160,40 @@ pub fn moe_append_shared_slot(
     Ok((ids_out, weights_out))
 }
 
+/// Router logits `[tokens, n_router]` and the shared-expert gate logit `[tokens]` from one
+/// launch over `w: [n_router + 1, k]` (the router rows, then the shared gate row).
+pub fn moe_dual_gate_gemv(x: &Tensor, w: &Tensor) -> Result<(Tensor, Tensor)> {
+    let (tokens, k) = x.dims2()?;
+    let (rows, w_k) = w.dims2()?;
+    if w_k != k || rows < 2 || k % 256 != 0 || x.dtype() != w.dtype() {
+        candle_core::bail!("moe_dual_gate_gemv: mismatched inputs {:?} {:?}", x.shape(), w.shape());
+    }
+    let n_router = rows - 1;
+    let x = x.contiguous()?;
+    let w = w.contiguous()?;
+    let router = unsafe { Tensor::empty((tokens, n_router), x.dtype(), x.device()) }?;
+    let shared = unsafe { Tensor::empty(tokens, x.dtype(), x.device()) }?;
+    let launch = match x.dtype() {
+        DType::F32 => crate::rocm::ffi::moe_dual_gate_gemv_f32,
+        DType::F16 => crate::rocm::ffi::moe_dual_gate_gemv_f16,
+        DType::BF16 => crate::rocm::ffi::moe_dual_gate_gemv_bf16,
+        dt => candle_core::bail!("moe_dual_gate_gemv: unsupported dtype {dt:?}"),
+    };
+    unsafe {
+        launch(
+            half_or_f32_ptr(&x, "x")? as *const c_void,
+            half_or_f32_ptr(&w, "w")? as *const c_void,
+            half_or_f32_ptr(&router, "router")? as *mut c_void,
+            half_or_f32_ptr(&shared, "shared")? as *mut c_void,
+            tokens as i32,
+            n_router as i32,
+            k as i32,
+            stream(&x)?,
+        );
+    }
+    Ok((router, shared))
+}
+
 pub fn add_sigmoid_gated(y: &Tensor, shared: &Tensor, gate: &Tensor) -> Result<Tensor> {
     let hidden = y.dim(candle_core::D::Minus1)?;
     if y.shape() != shared.shape()

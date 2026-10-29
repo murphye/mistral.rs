@@ -189,6 +189,62 @@ APPEND_SHARED_OP(float, f32)
 APPEND_SHARED_OP(__half, f16)
 APPEND_SHARED_OP(__nv_bfloat16, bf16)
 
+// Router and shared-expert gate logits in one launch: `w` stacks the `n_router` router rows
+// and the single shared-gate row ([n_router + 1, k]); one wave per (token, row), f32 dots.
+// router_out: [tokens, n_router]; shared_out: [tokens].
+template <typename T>
+__global__ void moe_dual_gate_gemv_kernel(const T *__restrict__ x, const T *__restrict__ w,
+                                          T *__restrict__ router_out, T *__restrict__ shared_out,
+                                          const int tokens, const int n_router, const int k) {
+  const int lane = threadIdx.x % 32;
+  const int item = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  const int rows = n_router + 1;
+  if (item >= tokens * rows) {
+    return;
+  }
+  const int t = item / rows, r = item - t * rows;
+  const T *xr = x + (int64_t)t * k;
+  const T *wr = w + (int64_t)r * k;
+  float acc = 0.0f;
+  // 8 elements (16 bytes) per lane per step; k is a multiple of 256.
+  for (int c = lane * 8; c < k; c += 32 * 8) {
+    const uint4 xv = *reinterpret_cast<const uint4 *>(xr + c);
+    const uint4 wv = *reinterpret_cast<const uint4 *>(wr + c);
+    const T *xe = reinterpret_cast<const T *>(&xv);
+    const T *we = reinterpret_cast<const T *>(&wv);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      acc = fmaf(to_float(xe[j]), to_float(we[j]), acc);
+    }
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_xor_sync(0xffffffff, acc, off, 32);
+  }
+  if (lane == 0) {
+    if (r < n_router) {
+      router_out[(int64_t)t * n_router + r] = from_float<T>(acc);
+    } else {
+      shared_out[t] = from_float<T>(acc);
+    }
+  }
+}
+
+#define DUAL_GATE_OP(T, SUFFIX)                                                                    \
+  extern "C" void moe_dual_gate_gemv_##SUFFIX(const void *x, const void *w, void *router_out,      \
+                                              void *shared_out, int tokens, int n_router, int k,   \
+                                              int64_t stream) {                                     \
+    const int warps = 8;                                                                            \
+    const int items = tokens * (n_router + 1);                                                      \
+    moe_dual_gate_gemv_kernel<T><<<(items + warps - 1) / warps, warps * 32, 0,                     \
+                                   (cudaStream_t)stream>>>((const T *)x, (const T *)w,             \
+                                                           (T *)router_out, (T *)shared_out,        \
+                                                           tokens, n_router, k);                    \
+  }
+
+DUAL_GATE_OP(float, f32)
+DUAL_GATE_OP(__half, f16)
+DUAL_GATE_OP(__nv_bfloat16, bf16)
+
 // out = act(x * scale), contiguous with n elements.
 template <typename T>
 __global__ void act_scaled_kernel(const T *__restrict__ x, T *__restrict__ out, const int64_t n,

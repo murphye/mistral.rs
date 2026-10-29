@@ -91,6 +91,10 @@ pub(super) struct SparseMoeBlock {
     experts: MoEExperts,
     shared_expert: layers::Mlp,
     shared_expert_gate: Linear,
+    /// The router and shared-gate weights stacked `[num_experts + 1, hidden]`, for the ROCm
+    /// decode path's single gate launch.
+    #[cfg(feature = "rocm")]
+    stacked_gates: Option<Tensor>,
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
     /// Sums the routed and shared experts' tensor-parallel partial outputs in one collective.
@@ -139,11 +143,19 @@ impl SparseMoeBlock {
                 .to_device(&layer_device)?,
             None,
         );
+        #[cfg(feature = "rocm")]
+        let stacked_gates = (layer_device.is_rocm()
+            && gate.weight().dtype() == shared_expert_gate.weight().dtype()
+            && gate.bias().is_none())
+        .then(|| Tensor::cat(&[gate.weight(), shared_expert_gate.weight()], 0))
+        .transpose()?;
         Ok(Self {
             gate,
             experts,
             shared_expert,
             shared_expert_gate,
+            #[cfg(feature = "rocm")]
+            stacked_gates,
             num_experts_per_tok: cfg.num_experts_per_tok,
             norm_topk_prob: cfg.norm_topk_prob,
             all_reduce: mistralrs_quant::SumAllReduce::new(comm),
@@ -160,6 +172,15 @@ impl SparseMoeBlock {
     pub(super) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let xs_flat = xs.reshape(((), hidden_dim))?;
+        #[cfg(feature = "rocm")]
+        let (router_logits, shared_logit) = match &self.stacked_gates {
+            Some(stacked) if xs.device().is_rocm() && xs.dtype() == stacked.dtype() => {
+                let (router, shared) = crate::rocm::moe_glue::moe_dual_gate_gemv(&xs_flat, stacked)?;
+                (router, Some(shared))
+            }
+            _ => (self.gate.forward(&xs_flat)?, None),
+        };
+        #[cfg(not(feature = "rocm"))]
         let router_logits = self.gate.forward(&xs_flat)?;
         let topk = crate::ops::moe_router_topk(
             &router_logits,
@@ -177,7 +198,13 @@ impl SparseMoeBlock {
         )?;
         #[cfg(feature = "rocm")]
         if xs.device().is_rocm() {
-            if let Some(out) = self.forward_rocm_fused(xs, &xs_flat, &topk.values, &topk.indices)? {
+            if let Some(out) = self.forward_rocm_fused(
+                xs,
+                &xs_flat,
+                &topk.values,
+                &topk.indices,
+                shared_logit.as_ref(),
+            )? {
                 return Ok(out);
             }
         }
@@ -233,6 +260,7 @@ impl SparseMoeBlock {
         xs_flat: &Tensor,
         topk_values: &Tensor,
         topk_indices: &Tensor,
+        shared_logit: Option<&Tensor>,
     ) -> Result<Option<Tensor>> {
         use candle_core::quantized::rocm::{
             indexed_moe_forward_with_extra, indexed_moe_glu_forward_with_extra,
@@ -259,7 +287,10 @@ impl SparseMoeBlock {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let tokens = b_size * seq_len;
         let num_experts = self.experts.num_experts();
-        let shared_logit = self.shared_expert_gate.forward(xs_flat)?;
+        let shared_logit = match shared_logit {
+            Some(shared_logit) => shared_logit.clone(),
+            None => self.shared_expert_gate.forward(xs_flat)?,
+        };
         let (ids, weights) = crate::rocm::moe_glue::moe_append_shared_slot(
             &topk_indices.to_dtype(DType::U32)?,
             &topk_values.to_dtype(DType::F32)?,
