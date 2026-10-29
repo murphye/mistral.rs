@@ -317,6 +317,13 @@ impl SparseMoeBlock {
         }
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let tokens = b_size * seq_len;
+        // The indexed kernels stream every expert row once per (token, slot) pair; from about
+        // 1.5K pairs the grouped WMMA GEMM the unfused path reaches (candle's
+        // `ROCM_GROUPED_MOE_MIN_PAIRS`) is far faster, so prefill chunks take that path.
+        const INDEXED_MAX_PAIRS: usize = 1536;
+        if tokens * (self.num_experts_per_tok + 1) >= INDEXED_MAX_PAIRS {
+            return Ok(None);
+        }
         let x3 = xs_flat.reshape((tokens, 1, hidden_dim))?.contiguous()?;
         // The gate and router launches since the mixer seeded `xs`'s q8 form did not touch it.
         if let Some(seed) = seed {
