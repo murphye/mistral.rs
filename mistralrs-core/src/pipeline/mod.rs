@@ -453,6 +453,7 @@ fn paged_kv_bytes_per_token(
         .to_dtype(dtype)
         .size_in_bytes()
         .checked_mul(model_config.total_kv_cache_elements_per_token())
+        .and_then(|bytes| bytes.checked_add(model_config.total_side_cache_bytes_per_token()))
         .ok_or_else(|| anyhow::anyhow!("PagedAttention token memory size overflow"))
 }
 

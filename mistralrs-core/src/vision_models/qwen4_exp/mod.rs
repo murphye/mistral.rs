@@ -60,11 +60,17 @@ fn kernel_device(device: &Device) -> bool {
 }
 
 /// Hybrid paged config that also budgets for the per-token QSA aux cache beside the KV cache.
+/// The aux cache (indexer keys and compressed block keys) lives in the activation dtype, so it
+/// is charged in bytes rather than as KV elements: with an fp8 KV cache the two differ by 2x.
 pub(crate) struct Qwen4ExpPagedConfig {
     inner: HybridPagedKvCacheConfig,
+    /// Aux cache elements per token of a QSA layer (16-bit activations).
     aux_dim: usize,
     dense_kv_cap: usize,
 }
+
+/// Bytes of one aux cache element: the model's bf16/f16 activations.
+const QSA_AUX_ELEMENT_BYTES: usize = 2;
 
 impl Qwen4ExpPagedConfig {
     pub(crate) fn new(
@@ -141,9 +147,14 @@ impl ModelConfigLike for Qwen4ExpPagedConfig {
         self.inner.layer_has_paged_kv_cache(layer_idx)
     }
     fn layer_kv_cache_elements_per_token(&self, layer_idx: usize) -> Option<usize> {
-        self.inner
-            .layer_kv_cache_elements_per_token(layer_idx)
-            .map(|elements| elements + self.aux_dim)
+        self.inner.layer_kv_cache_elements_per_token(layer_idx)
+    }
+    fn layer_side_cache_bytes_per_token(&self, layer_idx: usize) -> usize {
+        if self.inner.layer_has_paged_kv_cache(layer_idx) {
+            self.aux_dim * QSA_AUX_ELEMENT_BYTES
+        } else {
+            0
+        }
     }
     fn prefix_prefill_attention_features(
         &self,

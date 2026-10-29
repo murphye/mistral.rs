@@ -174,6 +174,18 @@ pub trait ModelConfigLike {
         self.layer_has_paged_kv_cache(layer_idx)
             .then(|| self.kv_cache_elements_per_token())
     }
+    /// Bytes per token of side caches a layer allocates alongside its paged KV blocks (one row
+    /// per KV slot) that are not stored in the KV cache's dtype, such as Qwen4-Exp's QSA indexer
+    /// keys. The memory plan charges them per block in addition to the KV elements.
+    fn layer_side_cache_bytes_per_token(&self, _layer_idx: usize) -> usize {
+        0
+    }
+    /// `layer_side_cache_bytes_per_token` summed over the layers.
+    fn total_side_cache_bytes_per_token(&self) -> usize {
+        (0..self.num_layers())
+            .map(|idx| self.layer_side_cache_bytes_per_token(idx))
+            .sum()
+    }
     /// Summed over every layer holding a paged cache. Size against this rather than multiplying a
     /// per-layer average by a layer count: the two diverge as soon as layers differ from each other.
     fn total_kv_cache_elements_per_token(&self) -> usize {
@@ -344,6 +356,14 @@ where
 
     fn layer_kv_cache_elements_per_token(&self, layer_idx: usize) -> Option<usize> {
         self.base.layer_kv_cache_elements_per_token(layer_idx)
+    }
+
+    fn layer_side_cache_bytes_per_token(&self, layer_idx: usize) -> usize {
+        self.base.layer_side_cache_bytes_per_token(layer_idx)
+    }
+
+    fn total_side_cache_bytes_per_token(&self) -> usize {
+        self.base.total_side_cache_bytes_per_token()
     }
 
     fn attention_layer_spec(&self, layer_idx: usize) -> AttentionLayerSpec {

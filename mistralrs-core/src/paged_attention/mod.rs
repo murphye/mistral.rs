@@ -669,9 +669,11 @@ fn cache_device_allocations<'a>(
     let mut devices: Vec<CacheDeviceAllocation<'_>> = Vec::new();
     for layer in 0..config.num_layers() {
         let elements = config.layer_kv_cache_elements_per_token(layer);
+        // KV elements in the cache dtype, plus side caches kept in their own dtype.
         let bytes = elements
             .unwrap_or(0)
             .checked_mul(cache_dtype.size_in_bytes())
+            .and_then(|bytes| bytes.checked_add(config.layer_side_cache_bytes_per_token(layer)))
             .and_then(|bytes| bytes.checked_mul(block_size))
             .ok_or_else(|| anyhow::anyhow!("KV block size overflow"))?;
         let layer_device = layer_devices
