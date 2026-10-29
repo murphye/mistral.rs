@@ -116,7 +116,7 @@ impl GatedResidual {
 
     #[cfg(feature = "rocm")]
     fn mix_inject_fused(&self, xn: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
-        use candle_core::quantized::rocm::{qgemv_gate_mean, qgemv_pair};
+        use candle_core::quantized::rocm::{qgemv_gate_mean_seeded, qgemv_pair};
         let Some(inject) = &self.inject else {
             return Ok(None);
         };
@@ -131,7 +131,9 @@ impl GatedResidual {
         let Some((lo, logits)) = qgemv_pair(xn, &down, Some(1.0 / self.hc as f32), &inject)? else {
             return Ok(None);
         };
-        let Some(h) = qgemv_gate_mean(&lo, &up, xn, self.hc)? else {
+        // The mixed activations feed quantized matmuls next (the GDN or QSA projections, the
+        // MoE experts); the kernel leaves their q8_1 form for those to pick up.
+        let Some(h) = qgemv_gate_mean_seeded(&lo, &up, xn, self.hc)? else {
             return Ok(None);
         };
         Ok(Some((h, logits)))
