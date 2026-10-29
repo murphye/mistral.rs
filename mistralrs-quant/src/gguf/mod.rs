@@ -542,6 +542,13 @@ impl QuantMethod for GgufMatMul {
         }
     }
 
+    fn plain_gguf_weight(&self) -> Option<Arc<candle_core::quantized::QTensor>> {
+        if self.b.is_some() || self.stats_snapshot().is_some() {
+            return None;
+        }
+        self.get_qtensor()
+    }
+
     #[cfg(all(feature = "cuda", has_marlin_kernels))]
     fn prepare_gguf_affine_raw(
         &self,

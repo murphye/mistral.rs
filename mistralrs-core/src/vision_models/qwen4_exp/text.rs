@@ -263,7 +263,7 @@ impl SparseMoeBlock {
         shared_logit: Option<&Tensor>,
     ) -> Result<Option<Tensor>> {
         use candle_core::quantized::rocm::{
-            indexed_moe_forward_with_extra, indexed_moe_glu_forward_with_extra,
+            indexed_moe_forward_with_extra_reduce, indexed_moe_glu_forward_with_extra,
         };
         let Some((gate, up, down, routed_partial)) = self.experts.rocm_quantized_tables() else {
             return Ok(None);
@@ -299,8 +299,8 @@ impl SparseMoeBlock {
         )?;
         let x3 = xs_flat.reshape((tokens, 1, hidden_dim))?.contiguous()?;
         let down_in = indexed_moe_glu_forward_with_extra(&gate, &up, 0, &s_gate, &s_up, &x3, &ids)?;
-        let ys = indexed_moe_forward_with_extra(&down, &s_down, &down_in, &ids)?;
-        let out = crate::rocm::moe_glue::moe_weighted_reduce(&ys, &weights)?
+        // The down projection sums each token's slots in the kernel.
+        let out = indexed_moe_forward_with_extra_reduce(&down, &s_down, &down_in, &ids, &weights)?
             .reshape((b_size, seq_len, hidden_dim))?;
         if routed_partial {
             return self.all_reduce.sum_all_reduce(&out.contiguous()?).map(Some);

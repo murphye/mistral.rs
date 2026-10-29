@@ -127,6 +127,29 @@ impl GdnInputProjection {
                 merged_qkv_z,
                 merged_b_a,
             } => {
+                // ROCm decode: the four GGUF projections in one launch.
+                #[cfg(feature = "rocm")]
+                if merged_qkv_z.is_none() && merged_b_a.is_none() {
+                    if let Some(outputs) = mistralrs_quant::try_forward_multi_gguf_rocm(
+                        x,
+                        &[
+                            in_proj_qkv.as_ref(),
+                            in_proj_z.as_ref(),
+                            in_proj_b.as_ref(),
+                            in_proj_a.as_ref(),
+                        ],
+                    )? {
+                        let [mixed_qkv, mixed_z, mixed_b, mixed_a]: [Tensor; 4] =
+                            outputs.try_into().map_err(|_| {
+                                candle_core::Error::msg(
+                                    "fused GDN projection returned the wrong output count",
+                                )
+                            })?;
+                        return GdnProjection::from_split(
+                            mixed_qkv, mixed_z, mixed_b, mixed_a, dims, batch_size, seq_len,
+                        );
+                    }
+                }
                 let (mixed_qkv, mixed_z) = if let Some(merged_qkv_z) = merged_qkv_z {
                     let [mixed_qkv, mixed_z]: [Tensor; 2] =
                         merged_qkv_z.forward(x)?.try_into().map_err(|_| {

@@ -1748,6 +1748,13 @@ pub struct PackedLinear {
 pub type PackedColumnParallel = PackedLinear;
 
 impl QuantMethod for ColumnParallelLayer {
+    fn plain_gguf_weight(&self) -> Option<Arc<candle_core::quantized::QTensor>> {
+        if self.bias.is_some() {
+            return None;
+        }
+        self.weight.plain_gguf_weight()
+    }
+
     #[cfg(feature = "metal")]
     fn prepare_metal_kernels(&self, activation_dtype: DType) -> Result<()> {
         self.weight.prepare_metal_kernels(activation_dtype)
@@ -2323,6 +2330,10 @@ impl ReplicatedLayer {
 }
 
 impl QuantMethod for ReplicatedLayer {
+    fn plain_gguf_weight(&self) -> Option<Arc<candle_core::quantized::QTensor>> {
+        self.0.plain_gguf_weight()
+    }
+
     #[cfg(feature = "metal")]
     fn prepare_metal_kernels(&self, activation_dtype: DType) -> Result<()> {
         self.0.prepare_metal_kernels(activation_dtype)

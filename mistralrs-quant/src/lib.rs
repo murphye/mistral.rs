@@ -1925,6 +1925,12 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
         None
     }
 
+    /// The GGUF weight when `forward` is exactly `x @ w^T` (no bias, LoRA or quantized
+    /// activations), for callers that batch several such matmuls into one launch.
+    fn plain_gguf_weight(&self) -> Option<Arc<candle_core::quantized::QTensor>> {
+        None
+    }
+
     #[cfg(all(feature = "cuda", has_marlin_kernels))]
     #[doc(hidden)]
     fn prepare_gguf_affine_raw(
@@ -2068,6 +2074,41 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
     fn dummy_info(&self) -> Option<DummyLayerInfo> {
         None
     }
+}
+
+/// ROCm GGUF decode: every method's weight in one multi-segment mmvq launch over `a`, or
+/// `None` when any method is not a plain GGUF matmul or the shapes don't fit.
+#[cfg(feature = "rocm")]
+pub fn try_forward_multi_gguf_rocm(
+    a: &Tensor,
+    methods: &[&dyn QuantMethod],
+) -> Result<Option<Vec<Tensor>>> {
+    if !a.device().is_rocm() || methods.is_empty() || methods.len() > 4 {
+        return Ok(None);
+    }
+    let mut weights = Vec::with_capacity(methods.len());
+    for method in methods {
+        match method.plain_gguf_weight() {
+            Some(weight) => weights.push(weight),
+            None => {
+                log::once_log_info(&format!(
+                    "multi-segment GGUF matmul skipped: {} is not a plain GGUF matmul",
+                    method.name()
+                ));
+                return Ok(None);
+            }
+        }
+    }
+    let refs = weights.iter().map(|w| w.as_ref()).collect::<Vec<_>>();
+    let out = candle_core::quantized::rocm::fast_mmvq_multi(&refs, a)?;
+    if out.is_none() {
+        log::once_log_info(&format!(
+            "multi-segment GGUF matmul skipped for shapes {:?} / {:?}",
+            a.shape(),
+            refs.iter().map(|w| w.shape().dims().to_vec()).collect::<Vec<_>>()
+        ));
+    }
+    Ok(out)
 }
 
 pub fn try_forward_with_shared_quantized_activation(

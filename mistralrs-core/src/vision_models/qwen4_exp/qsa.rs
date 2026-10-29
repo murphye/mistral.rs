@@ -220,8 +220,33 @@ impl QsaAttention {
         step: &QsaStep<'_>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
-        let (q_gate, k, v) =
-            crate::ops::qkv_projections(x, &*self.q_proj, &*self.k_proj, &*self.v_proj)?;
+        // ROCm decode: the four GGUF projections of `x` in one launch.
+        #[cfg(feature = "rocm")]
+        let fused = mistralrs_quant::try_forward_multi_gguf_rocm(
+            x,
+            &[
+                &*self.q_proj,
+                &*self.k_proj,
+                &*self.v_proj,
+                &*self.index_qk_proj,
+            ],
+        )?
+        .map(|outputs| {
+            let [q_gate, k, v, index_qk]: [Tensor; 4] = outputs
+                .try_into()
+                .expect("four projections requested");
+            (q_gate, k, v, index_qk)
+        });
+        #[cfg(not(feature = "rocm"))]
+        let fused: Option<(Tensor, Tensor, Tensor, Tensor)> = None;
+        let (q_gate, k, v, fused_index_qk) = match fused {
+            Some((q_gate, k, v, index_qk)) => (q_gate, k, v, Some(index_qk)),
+            None => {
+                let (q_gate, k, v) =
+                    crate::ops::qkv_projections(x, &*self.q_proj, &*self.k_proj, &*self.v_proj)?;
+                (q_gate, k, v, None)
+            }
+        };
         let q_gate = q_gate.reshape((b_sz, seq_len, self.num_heads, self.head_dim * 2))?;
         let q = q_gate.narrow(D::Minus1, 0, self.head_dim)?;
         let gate = q_gate
@@ -243,7 +268,10 @@ impl QsaAttention {
             self.k_norm.eps(),
         )?;
 
-        let index_qk = self.index_qk_proj.forward(x)?;
+        let index_qk = match fused_index_qk {
+            Some(index_qk) => index_qk,
+            None => self.index_qk_proj.forward(x)?,
+        };
         let index_q_dim = self.qsa.n_heads * self.qsa.head_dim;
         let index_q = index_qk.narrow(D::Minus1, 0, index_q_dim)?.reshape((
             b_sz,
