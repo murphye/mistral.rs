@@ -56,7 +56,7 @@ pub(super) struct QsaStep<'a> {
 #[derive(Clone)]
 #[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 struct QsaAuxCache {
-    /// Raw indexer key per KV slot, `[slots, head_dim]`.
+    /// Raw indexer key per KV slot as int8 with an f32 row scale, `[slots, head_dim + 4]` u8.
     raw: Tensor,
     /// cos then sin of each compressed block's first position, `[slots / ratio, 2 * half_rot]`:
     /// the finalize kernel rotates the pooled block key by the block's first position only.
@@ -415,9 +415,10 @@ impl QsaAttention {
         }
         let half_rot = self.rotary_emb_half_dim();
         let cache = QsaAuxCache {
+            // int8 per element plus one f32 scale per row (the kernels' Q4_QSA_RAW_ROW_BYTES).
             raw: Tensor::zeros(
-                (num_blocks * block_size, self.qsa.head_dim),
-                dtype,
+                (num_blocks * block_size, self.qsa.head_dim + 4),
+                DType::U8,
                 key_cache.device(),
             )?,
             block_cs: Tensor::zeros(

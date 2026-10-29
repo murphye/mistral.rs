@@ -733,12 +733,17 @@ __device__ __forceinline__ int q4_pos_of(const Q4Tokens &l, const Q4Paged &pg,
 // Writes the token's raw indexer key to its aux slot and, for the first token of each
 // compressed block (block sizes are multiples of `ratio`, so slot % ratio == 0), the block's
 // cos/sin to `block_cs`: the finalize kernel rotates the pooled key by that position alone.
+// Raw keys are stored as int8 with one f32 scale per row (`Q4_QSA_RAW_ROW_BYTES` bytes):
+// the pooled, RMS-normed block key tolerates the ~0.4% per-element error, and the row is
+// half the size of a bf16 one. 128 threads per token, one element each.
+#define Q4_QSA_RAW_ROW_BYTES (Q4_QSA_HEAD_DIM + 4)
 template <typename T>
 __global__ void q4_qsa_aux_write_kernel(
     const T *__restrict__ raw_key, const T *__restrict__ cos,
     const T *__restrict__ sin, const long long *__restrict__ slot_mapping,
-    T *__restrict__ aux, T *__restrict__ block_cs, int n_tokens, int key_dim,
+    uint8_t *__restrict__ aux, T *__restrict__ block_cs, int n_tokens, int key_dim,
     int half_rot, int aux_dim, int ratio) {
+  __shared__ float warp_max[4];
   const int t = blockIdx.x;
   if (t >= n_tokens) {
     return;
@@ -747,9 +752,26 @@ __global__ void q4_qsa_aux_write_kernel(
   if (slot < 0) {
     return;
   }
-  T *dst = aux + slot * aux_dim;
-  for (int i = threadIdx.x; i < key_dim; i += blockDim.x) {
-    dst[i] = raw_key[(size_t)t * key_dim + i];
+  uint8_t *row = aux + slot * aux_dim;
+  const int i = threadIdx.x;
+  const float x = i < key_dim ? q4_f(raw_key[(size_t)t * key_dim + i]) : 0.0f;
+  float amax = fabsf(x);
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+  }
+  if ((i & 31) == 0) {
+    warp_max[i >> 5] = amax;
+  }
+  __syncthreads();
+  amax = fmaxf(fmaxf(warp_max[0], warp_max[1]), fmaxf(warp_max[2], warp_max[3]));
+  const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+  if (i < key_dim) {
+    const float q = rintf(x / scale);
+    ((int8_t *)row)[i] = (int8_t)fminf(fmaxf(q, -127.0f), 127.0f);
+  }
+  if (i == 0) {
+    *(float *)(row + key_dim) = scale;
   }
   if (slot % ratio == 0) {
     T *cs = block_cs + (slot / ratio) * (2 * half_rot);
@@ -764,7 +786,7 @@ __global__ void q4_qsa_aux_write_kernel(
 // key_dim must be 128.
 template <typename T>
 __global__ void
-q4_qsa_finalize_kernel(const T *__restrict__ aux, const T *__restrict__ block_cs,
+q4_qsa_finalize_kernel(const uint8_t *__restrict__ aux, const T *__restrict__ block_cs,
                        T *__restrict__ block_keys, Q4Tokens l, Q4Paged pg,
                        const float *__restrict__ norm_weight, int ratio,
                        int half_rot, int aux_dim, float eps) {
@@ -781,10 +803,12 @@ q4_qsa_finalize_kernel(const T *__restrict__ aux, const T *__restrict__ block_cs
   const int start = pos + 1 - ratio;
   float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   for (int m = 0; m < ratio; ++m) {
-    const T *src = aux + q4_slot(pg, seq, start + m) * aux_dim;
+    const uint8_t *row = aux + q4_slot(pg, seq, start + m) * aux_dim;
+    const float row_scale = *(const float *)(row + Q4_QSA_HEAD_DIM);
+    const int8_t *src = (const int8_t *)row;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      v[i] += q4_f(src[lane * 4 + i]);
+      v[i] += (float)src[lane * 4 + i] * row_scale;
     }
   }
   float ss = 0.0f;
@@ -1720,7 +1744,7 @@ extern "C" void qwen4_qsa_aux_write(const void *raw_key, const void *cos,
   Q4_DISPATCH_HALF(dtype,
                    q4_qsa_aux_write_kernel<scalar_t><<<n_tokens, 128, 0, s>>>(
                        (const scalar_t *)raw_key, (const scalar_t *)cos,
-                       (const scalar_t *)sin, slot_mapping, (scalar_t *)aux,
+                       (const scalar_t *)sin, slot_mapping, (uint8_t *)aux,
                        (scalar_t *)block_cs, n_tokens, key_dim, half_rot,
                        aux_dim, ratio));
 }
@@ -1738,7 +1762,7 @@ extern "C" void qwen4_qsa_finalize(const void *aux, const void *block_cs,
   Q4_DISPATCH_HALF(
       dtype, q4_qsa_finalize_kernel<scalar_t>
       <<<(layout.n_tokens + warps - 1) / warps, warps * 32, 0, s>>>(
-          (const scalar_t *)aux, (const scalar_t *)block_cs,
+          (const uint8_t *)aux, (const scalar_t *)block_cs,
           (scalar_t *)block_keys, layout, paged, norm_weight, ratio, half_rot,
           aux_dim, eps));
 }

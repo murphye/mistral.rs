@@ -944,7 +944,7 @@ pub(crate) fn qsa_aux_write(
             half_rot as i32,
             aux.dim(candle_core::D::Minus1)? as i32,
             ratio as i32,
-            half_dtype_code(aux.dtype())?,
+            half_dtype_code(raw_key.dtype())?,
             stream(aux.device())?,
         );
     }
@@ -994,7 +994,7 @@ pub(crate) fn qsa_finalize(args: QsaFinalizeArgs<'_>) -> Result<()> {
             shape.half_rot as i32,
             aux.dim(candle_core::D::Minus1)? as i32,
             eps as f32,
-            half_dtype_code(aux.dtype())?,
+            half_dtype_code(block_keys.dtype())?,
             stream(aux.device())?,
         );
     }
