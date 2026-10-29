@@ -519,6 +519,25 @@ const GDN_DECODE_MAX_K: usize = 256;
 /// NVIDIA-specific cooperative and pipelined variants.
 const GDN_DECODE_KERNEL_BASELINE: i32 = 0;
 
+/// The decode recurrence kernel variant (gdn.cu's kernel kinds): the baseline unless
+/// `MISTRALRS_GDN_DECODE_KERNEL` names `cooperative` or `pipelined`, which the ROCm build
+/// also compiles.
+fn decode_kernel_kind() -> i32 {
+    static KIND: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *KIND.get_or_init(|| {
+        match std::env::var("MISTRALRS_GDN_DECODE_KERNEL")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "cooperative" => 1,
+            "pipelined" => 2,
+            _ => GDN_DECODE_KERNEL_BASELINE,
+        }
+    })
+}
+
 
 /// Single-token GDN step from the convolved projections: gating, L2 norm and the
 /// key-major recurrence in one kernel. Returns `[BH, 1, V]` in the input dtype.
@@ -682,7 +701,7 @@ pub fn fused_decode_recurrence_rocm(launch: FusedDecodeRecurrence<'_>) -> Result
                 a_stride[0] as i64,
                 a_stride[a_stride.len() - 1] as i64,
                 slot_ptr,
-                GDN_DECODE_KERNEL_BASELINE,
+                decode_kernel_kind(),
                 dtype_code,
                 state_dtype,
                 stream,
