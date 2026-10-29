@@ -257,7 +257,9 @@ impl QsaAttention {
             cos_sin.0.to_device(x.device())?,
             cos_sin.1.to_device(x.device())?,
         );
-        let (q, k) = self.rotary_emb.forward_qk_norm(
+        // Token-major output buffers: the cache write and the attention kernel consume q and k
+        // as `[tokens, heads, d]`, so their later `transpose(1, 2).contiguous()` copies nothing.
+        let (q, k) = self.rotary_emb.forward_qk_norm_layout(
             &cos_sin,
             &q.transpose(1, 2)?,
             &k.transpose(1, 2)?,
@@ -265,6 +267,7 @@ impl QsaAttention {
             self.k_norm.weight(),
             self.q_norm.eps(),
             self.k_norm.eps(),
+            true,
         )?;
 
         let index_qk = self.index_qk_proj.forward(x)?;
