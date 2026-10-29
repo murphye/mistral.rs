@@ -904,6 +904,29 @@ impl Engine {
         disconnected
     }
 
+    /// Waits until `pending` holds at least `count` requests, the ones rank 0 dispatched this
+    /// iteration and replicated to this worker. Returns false once the channel closes.
+    async fn await_replicated_requests(
+        &self,
+        pending: &mut admission::AdmissionQueue<Request>,
+        count: usize,
+    ) -> bool {
+        while pending.len() < count {
+            let Some(request) = self.rx.lock().await.recv().await else {
+                return false;
+            };
+            let Some(request) = self.prepare_request_for_dispatch(request).await else {
+                continue;
+            };
+            let class = Self::admission_class(&request);
+            if pending.push(request, class).is_err() {
+                tracing::error!("Tensor-parallel worker admission queue is full");
+                return false;
+            }
+        }
+        true
+    }
+
     async fn dispatch_prepared_request(self: &Arc<Self>, mut request: Request) -> bool {
         if let Request::Normal(request) = &mut request {
             if let Some(duration) = request.take_queue_duration() {
@@ -1226,7 +1249,30 @@ impl Engine {
                 dispatches += 1;
             }
 
-            while dispatches < pending.max_dispatches_per_step() {
+            // Tensor-parallel workers receive each request from rank 0 as it is dispatched there,
+            // so they admit exactly as many as rank 0 did this iteration; the ranks' schedulers then
+            // form the same batches and their collectives match.
+            let mirror_admission = mistralrs_quant::distributed::mirrors_first_rank_admission();
+            let worker_budget = if mirror_admission && distributed::is_daemon() {
+                match mistralrs_quant::distributed::broadcast_from_first_rank(0) {
+                    Ok(budget) => {
+                        if !self.await_replicated_requests(&mut pending, budget).await {
+                            break 'lp;
+                        }
+                        Some(budget)
+                    }
+                    Err(err) => {
+                        tracing::error!("Tensor-parallel admission sync failed: {err}");
+                        break 'lp;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut workload_dispatches = 0;
+            while dispatches < pending.max_dispatches_per_step()
+                && worker_budget.is_none_or(|budget| workload_dispatches < budget)
+            {
                 let active_sequences = {
                     let scheduler = get_mut_arcmutex!(self.scheduler);
                     scheduler.waiting_len() + scheduler.running_len()
@@ -1243,6 +1289,15 @@ impl Engine {
                     break 'lp;
                 }
                 dispatches += 1;
+                workload_dispatches += 1;
+            }
+            if mirror_admission && !distributed::is_daemon() {
+                if let Err(err) =
+                    mistralrs_quant::distributed::broadcast_from_first_rank(workload_dispatches)
+                {
+                    tracing::error!("Tensor-parallel admission sync failed: {err}");
+                    break 'lp;
+                }
             }
             let pending_metric = u32::try_from(pending.len()).unwrap_or(u32::MAX);
             metrics::gauge!("mistralrs_requests_pending_admission").set(f64::from(pending_metric));

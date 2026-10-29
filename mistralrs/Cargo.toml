@@ -295,6 +295,7 @@ accelerate = ["mistralrs-core/accelerate"]
 mkl = ["mistralrs-core/mkl"]
 # Multi-GPU support via NCCL (requires cuda)
 nccl = ["mistralrs-core/nccl"]
+rccl = ["mistralrs-core/rccl"]
 # Use ring instead of aws-lc-rs for TLS
 ring = ["mistralrs-core/ring"]
 # Python code execution tool

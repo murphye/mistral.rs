@@ -2,16 +2,18 @@ use std::{fmt::Debug, fs::File, sync::Barrier};
 
 use candle_core::Result;
 pub mod layers;
+#[cfg(feature = "rccl")]
+pub mod rccl;
 pub mod socket;
 
 use serde::{Deserialize, Serialize};
 
 const MISTRALRS_NO_NCCL: &str = "MISTRALRS_NO_NCCL";
-#[cfg(all(feature = "cuda", feature = "nccl"))]
+#[cfg(any(all(feature = "cuda", feature = "nccl"), feature = "rccl"))]
 const MIN_NCCL_WORLD_SIZE: usize = 2;
-#[cfg(all(feature = "cuda", feature = "nccl"))]
+#[cfg(any(all(feature = "cuda", feature = "nccl"), feature = "rccl"))]
 const MISTRALRS_MN_GLOBAL_WORLD_SIZE: &str = "MISTRALRS_MN_GLOBAL_WORLD_SIZE";
-#[cfg(all(feature = "cuda", feature = "nccl"))]
+#[cfg(any(all(feature = "cuda", feature = "nccl"), feature = "rccl"))]
 const MISTRALRS_MN_LOCAL_WORLD_SIZE: &str = "MISTRALRS_MN_LOCAL_WORLD_SIZE";
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -90,7 +92,12 @@ pub fn get_global_tp_size_from_devices() -> Result<usize> {
         }
     }
 
-    #[cfg(all(not(feature = "ring"), not(feature = "nccl")))]
+    #[cfg(feature = "rccl")]
+    {
+        Ok(rccl_world_size().unwrap_or(1))
+    }
+
+    #[cfg(all(not(feature = "ring"), not(feature = "nccl"), not(feature = "rccl")))]
     Ok(1)
 }
 
@@ -104,8 +111,36 @@ pub fn use_nccl() -> bool {
         nccl_world_size().is_some_and(|world_size| world_size >= MIN_NCCL_WORLD_SIZE)
     }
 
-    #[cfg(not(all(feature = "cuda", feature = "nccl")))]
+    #[cfg(feature = "rccl")]
+    {
+        rccl_world_size().is_some_and(|world_size| world_size >= MIN_NCCL_WORLD_SIZE)
+    }
+
+    #[cfg(not(any(all(feature = "cuda", feature = "nccl"), feature = "rccl")))]
     false
+}
+
+/// RCCL ranks: an explicit world size, or every discrete HIP device (integrated GPUs are skipped,
+/// so they never become a rank).
+#[cfg(feature = "rccl")]
+fn rccl_world_size() -> Option<usize> {
+    for name in [MISTRALRS_MN_GLOBAL_WORLD_SIZE, MISTRALRS_MN_LOCAL_WORLD_SIZE] {
+        if let Ok(value) = std::env::var(name) {
+            return Some(
+                value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("Not a number for {name}!")),
+            );
+        }
+    }
+    let count = candle_core::rocm_backend::hip::device_count().ok()?;
+    Some(
+        (0..count)
+            .filter(|&ordinal| {
+                !candle_core::rocm_backend::hip::device_is_integrated(ordinal).unwrap_or(true)
+            })
+            .count(),
+    )
 }
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -134,6 +169,46 @@ pub fn use_ring() -> bool {
     cfg!(feature = "ring") && std::env::var("RING_CONFIG").is_ok()
 }
 
+/// The communicator of the first tensor-parallel model, used by the engine to keep the ranks'
+/// host-side decisions (which queued requests to admit) identical.
+static CONTROL_COMM: std::sync::OnceLock<std::sync::Arc<Comm>> = std::sync::OnceLock::new();
+
+pub fn set_control_comm(comm: &std::sync::Arc<Comm>) {
+    if comm.world_size() > 1 {
+        let _ = CONTROL_COMM.set(comm.clone());
+    }
+}
+
+/// Rank 0's `value` on every tensor-parallel rank (the others pass anything; it is ignored), or
+/// `value` itself without tensor parallelism or on backends that keep ranks in step another way.
+pub fn broadcast_from_first_rank(value: usize) -> Result<usize> {
+    let Some(comm) = CONTROL_COMM.get() else {
+        return Ok(value);
+    };
+    match &**comm {
+        #[cfg(feature = "rccl")]
+        Comm::Rccl(rccl_comm) => {
+            let value = if comm.rank() == 0 {
+                u32::try_from(value).unwrap_or(u32::MAX)
+            } else {
+                0
+            };
+            Ok(rccl::all_reduce_max_u32(rccl_comm, value)? as usize)
+        }
+        _ => Ok(value),
+    }
+}
+
+/// Whether the engine must mirror rank 0's admission decisions with
+/// [`broadcast_from_first_rank`].
+pub fn mirrors_first_rank_admission() -> bool {
+    CONTROL_COMM.get().is_some_and(|comm| match &**comm {
+        #[cfg(feature = "rccl")]
+        Comm::Rccl(_) => true,
+        _ => false,
+    })
+}
+
 // Unified Comm enum
 #[derive(Debug)]
 pub enum Comm {
@@ -141,6 +216,8 @@ pub enum Comm {
     Nccl(nccl::NcclComm),
     #[cfg(feature = "ring")]
     Ring(ring::RingComm),
+    #[cfg(feature = "rccl")]
+    Rccl(rccl::RcclComm),
     Dummy(dummy::DummyComm),
 }
 
@@ -155,6 +232,13 @@ impl Comm {
         if use_nccl() {
             return Ok(Self::Nccl(nccl::NcclComm::from_device(
                 id, dev, rank, world_size,
+            )?));
+        }
+
+        #[cfg(feature = "rccl")]
+        if let Id::Rccl(internal) = &id {
+            return Ok(Self::Rccl(rccl::RcclComm::from_device(
+                internal, dev, rank, world_size,
             )?));
         }
 
@@ -177,6 +261,8 @@ impl Comm {
             Self::Nccl(comm) => comm.rank(),
             #[cfg(feature = "ring")]
             Self::Ring(comm) => comm.rank(),
+            #[cfg(feature = "rccl")]
+            Self::Rccl(comm) => comm.rank(),
             Self::Dummy(comm) => comm.rank(),
         }
     }
@@ -187,6 +273,8 @@ impl Comm {
             Self::Nccl(comm) => comm.world_size(),
             #[cfg(feature = "ring")]
             Self::Ring(comm) => comm.world_size(),
+            #[cfg(feature = "rccl")]
+            Self::Rccl(comm) => comm.world_size(),
             Self::Dummy(comm) => comm.world_size(),
         }
     }
@@ -197,6 +285,8 @@ impl Comm {
 pub enum Id {
     #[cfg(all(feature = "cuda", feature = "nccl"))]
     Nccl(cudarc::nccl::Id),
+    #[cfg(feature = "rccl")]
+    Rccl([::core::ffi::c_char; 128usize]),
     Dummy,
 }
 
@@ -207,6 +297,10 @@ impl Id {
             let id = cudarc::nccl::Id::new().expect("Failed to create `Id`.");
             return Self::Nccl(id);
         }
+        #[cfg(feature = "rccl")]
+        if use_nccl() {
+            return Self::Rccl(rccl::new_id());
+        }
         Self::Dummy
     }
 
@@ -215,6 +309,10 @@ impl Id {
         if use_nccl() {
             return Self::Nccl(cudarc::nccl::Id::uninit(_internal));
         }
+        #[cfg(feature = "rccl")]
+        if use_nccl() {
+            return Self::Rccl(_internal);
+        }
         Self::Dummy
     }
 
@@ -222,6 +320,8 @@ impl Id {
         match self {
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             Self::Nccl(id) => id.internal(),
+            #[cfg(feature = "rccl")]
+            Self::Rccl(internal) => internal,
             Self::Dummy => {
                 static ZEROED_ID: [::core::ffi::c_char; 128] = [0; 128];
                 &ZEROED_ID
@@ -392,6 +492,8 @@ pub struct SumAllReduce {
     nccl: Option<nccl_ops::SumAllReduce>,
     #[cfg(feature = "ring")]
     ring: Option<ring_ops::SumAllReduce>,
+    #[cfg(feature = "rccl")]
+    rccl: Option<std::sync::Arc<Comm>>,
     dummy: Option<dummy_ops::SumAllReduce>,
     world_size: usize,
 }
@@ -399,6 +501,16 @@ pub struct SumAllReduce {
 impl SumAllReduce {
     pub fn new(comm: &std::sync::Arc<Comm>) -> Self {
         let world_size = comm.world_size();
+        #[cfg(feature = "rccl")]
+        if let Comm::Rccl(_) = &**comm {
+            return Self {
+                #[cfg(feature = "ring")]
+                ring: None,
+                rccl: Some(comm.clone()),
+                dummy: None,
+                world_size,
+            };
+        }
         match &**comm {
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             Comm::Nccl(_) => Self {
@@ -418,11 +530,15 @@ impl SumAllReduce {
                 dummy: None,
                 world_size,
             },
+            #[cfg(feature = "rccl")]
+            Comm::Rccl(_) => unreachable!("handled above"),
             Comm::Dummy(_) => Self {
                 #[cfg(all(feature = "cuda", feature = "nccl"))]
                 nccl: None,
                 #[cfg(feature = "ring")]
                 ring: None,
+                #[cfg(feature = "rccl")]
+                rccl: None,
                 dummy: Some(dummy_ops::SumAllReduce::new(comm)),
                 world_size,
             },
@@ -445,6 +561,10 @@ impl SumAllReduce {
         if let Some(ref ring) = self.ring {
             return ring.sum_all_reduce(xs);
         }
+        #[cfg(feature = "rccl")]
+        if let Some(Comm::Rccl(comm)) = self.rccl.as_deref() {
+            return rccl::sum_all_reduce(comm, xs);
+        }
         if let Some(ref dummy) = self.dummy {
             return dummy.sum_all_reduce(xs);
         }
@@ -458,11 +578,22 @@ pub struct AllGather {
     nccl: Option<nccl_ops::AllGather>,
     #[cfg(feature = "ring")]
     ring: Option<ring_ops::AllGather>,
+    #[cfg(feature = "rccl")]
+    rccl: Option<(std::sync::Arc<Comm>, usize)>,
     dummy: Option<dummy_ops::AllGather>,
 }
 
 impl AllGather {
     pub fn new(comm: &std::sync::Arc<Comm>, dim: usize) -> Self {
+        #[cfg(feature = "rccl")]
+        if let Comm::Rccl(_) = &**comm {
+            return Self {
+                #[cfg(feature = "ring")]
+                ring: None,
+                rccl: Some((comm.clone(), dim)),
+                dummy: None,
+            };
+        }
         match &**comm {
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             Comm::Nccl(_) => Self {
@@ -480,11 +611,15 @@ impl AllGather {
                 ring: Some(ring_ops::AllGather::new(comm, dim)),
                 dummy: None,
             },
+            #[cfg(feature = "rccl")]
+            Comm::Rccl(_) => unreachable!("handled above"),
             Comm::Dummy(_) => Self {
                 #[cfg(all(feature = "cuda", feature = "nccl"))]
                 nccl: None,
                 #[cfg(feature = "ring")]
                 ring: None,
+                #[cfg(feature = "rccl")]
+                rccl: None,
                 dummy: Some(dummy_ops::AllGather::new(comm, dim)),
             },
         }
@@ -498,6 +633,12 @@ impl AllGather {
         #[cfg(feature = "ring")]
         if let Some(ref ring) = self.ring {
             return ring.all_gather(xs);
+        }
+        #[cfg(feature = "rccl")]
+        if let Some((comm, dim)) = &self.rccl {
+            if let Comm::Rccl(comm) = &**comm {
+                return rccl::all_gather(comm, xs, *dim);
+            }
         }
         if let Some(ref dummy) = self.dummy {
             return dummy.all_gather(xs);

@@ -408,6 +408,7 @@ impl Qwen4ExpTextModel {
             embed_tokens.clone()
         };
 
+        let tp_world = mapper.get_comm_for(0)?.world_size();
         let mut hybrid_layer_types = layer_types
             .iter()
             .map(|lt| match lt {
@@ -477,8 +478,14 @@ impl Qwen4ExpTextModel {
                 max_seq_len: cfg.max_position_embeddings,
                 num_layers: cfg.num_hidden_layers + cfg.mtp_layers(mtp.is_some()),
                 hidden_size: cfg.hidden_size,
-                num_attn_heads: cfg.num_attention_heads,
-                num_kv_heads: cfg.num_key_value_heads,
+                num_attn_heads: cfg.num_attention_heads / tp_world,
+                num_kv_heads: cfg.num_attention_heads
+                    / tp_world
+                    / mistralrs_quant::compute_n_kv_groups(
+                        cfg.num_key_value_heads,
+                        cfg.num_attention_heads,
+                        &*mapper.get_comm_for(0)?,
+                    )?,
                 sliding_window: None,
                 k_head_dim: cfg.head_dim,
                 v_head_dim: cfg.head_dim,

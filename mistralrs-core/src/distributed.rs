@@ -161,8 +161,20 @@ fn select_compatible_tensor_parallel_size(
     Ok(None)
 }
 
+/// The GPU a tensor-parallel rank runs on.
+pub(crate) fn tp_rank_device(ordinal: usize) -> candle_core::Result<candle_core::Device> {
+    #[cfg(all(feature = "rccl", not(feature = "cuda")))]
+    {
+        candle_core::Device::new_rocm(ordinal)
+    }
+    #[cfg(not(all(feature = "rccl", not(feature = "cuda"))))]
+    {
+        candle_core::Device::new_cuda(ordinal)
+    }
+}
+
 pub fn is_daemon() -> bool {
-    if cfg!(feature = "cuda") && !cfg!(feature = "ring") {
+    if (cfg!(feature = "cuda") || cfg!(feature = "rccl")) && !cfg!(feature = "ring") {
         std::env::var(IS_DAEMON_FLAG).is_ok()
     } else if use_ring() {
         !RingConfig::load().is_master_rank()
@@ -389,23 +401,27 @@ where
                 tracing::error!("Daemon dispatch failed for Normal request: {e}");
                 return;
             }
-            loop {
-                match receiver.recv().await {
-                    Some(crate::Response::AgenticToolCallProgress { .. })
-                    | Some(crate::Response::BlockDenoisingProgress(_))
-                    | Some(crate::Response::File(_)) => continue,
-                    Some(resp) => {
-                        if let Err(e) = resp.as_result() {
-                            tracing::error!("Normal response error: {e}");
+            // Drain the response off the accept loop: rank 0 forwards the next request while this
+            // one is still generating, and blocks until this worker accepts it.
+            tokio::spawn(async move {
+                loop {
+                    match receiver.recv().await {
+                        Some(crate::Response::AgenticToolCallProgress { .. })
+                        | Some(crate::Response::BlockDenoisingProgress(_))
+                        | Some(crate::Response::File(_)) => continue,
+                        Some(resp) => {
+                            if let Err(e) = resp.as_result() {
+                                tracing::error!("Normal response error: {e}");
+                            }
+                            break;
                         }
-                        break;
-                    }
-                    None => {
-                        tracing::error!("Normal response channel closed");
-                        break;
+                        None => {
+                            tracing::error!("Normal response channel closed");
+                            break;
+                        }
                     }
                 }
-            }
+            });
         }
         req => {
             if let Err(e) = dispatch(req).await {
@@ -467,7 +483,9 @@ fn spawn_tensor_parallel_workers(ids: &[mistralrs_quant::Id]) -> anyhow::Result<
 
         cmd.env(IS_DAEMON_FLAG, serde_json::to_string(&data)?);
         cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
+        if env::var_os("MISTRALRS_TP_WORKER_LOGS").is_none() {
+            cmd.stderr(std::process::Stdio::null());
+        }
         cmd.stdin(std::process::Stdio::null());
         spawn_worker_and_reap(&mut cmd)?;
     }
@@ -583,7 +601,7 @@ pub(crate) fn prepare_distributed_mapper<T: DeviceMappedModelLoader + IsqModelLo
         model,
         weights,
     } = args;
-    if !(cfg!(feature = "cuda") || cfg!(feature = "ring")) {
+    if !(cfg!(feature = "cuda") || cfg!(feature = "ring") || cfg!(feature = "rccl")) {
         tracing::warn!(
             "Distributed support was not included in the build, be sure to build with `--features nccl`."
         );
@@ -683,7 +701,9 @@ pub(crate) fn prepare_distributed_mapper<T: DeviceMappedModelLoader + IsqModelLo
             cmd.env(IS_DAEMON_FLAG, serde_json::to_string(&data)?);
 
             cmd.stdout(std::process::Stdio::null());
-            cmd.stderr(std::process::Stdio::null());
+            if env::var_os("MISTRALRS_TP_WORKER_LOGS").is_none() {
+                cmd.stderr(std::process::Stdio::null());
+            }
             cmd.stdin(std::process::Stdio::null());
 
             children.push(cmd.spawn().expect("Failed to spawn process"));
@@ -779,9 +799,11 @@ pub(crate) fn prepare_distributed_mapper<T: DeviceMappedModelLoader + IsqModelLo
 
     info!("Loading all ranks.");
     // The mapper is specific to this pipeline
+    let comm = Arc::new(comm);
+    mistralrs_quant::distributed::set_control_comm(&comm);
     let mapper = DeviceMapSetting::Nccl {
         nm_device: available_devices[0].clone(),
-        comm: Arc::new(comm),
+        comm,
     }
     .into_mapper(model.num_layers(config)?, device, None, available_devices)?;
 

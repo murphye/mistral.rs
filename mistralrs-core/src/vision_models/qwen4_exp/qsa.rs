@@ -98,12 +98,13 @@ impl QsaAttention {
         use_paged_attention: bool,
         comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
-        if comm.world_size() != 1 {
-            candle_core::bail!("Qwen4-Exp QSA attention does not support tensor parallelism yet");
-        }
+        // Tensor parallelism splits the attention heads; the indexer stays replicated so every
+        // rank selects the same blocks without another collective.
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
+        let kv_shard = mistralrs_quant::compute_kv_shard(num_kv_heads, head_dim, comm)?;
+        let n_kv_groups = mistralrs_quant::compute_n_kv_groups(num_kv_heads, num_heads, comm)?;
         let q_proj = ColumnParallelLayer::new(
             cfg.hidden_size,
             num_heads * head_dim * 2,
@@ -112,22 +113,26 @@ impl QsaAttention {
             comm,
             vb_sa.pp("q_proj"),
         )?;
-        let k_proj = ColumnParallelLayer::new(
+        let k_proj = ColumnParallelLayer::new_with_shard(
             cfg.hidden_size,
             num_kv_heads * head_dim,
             &cfg.quantization_config,
             false,
             comm,
+            kv_shard,
             vb_sa.pp("k_proj"),
         )?;
-        let v_proj = ColumnParallelLayer::new(
+        let v_proj = ColumnParallelLayer::new_with_shard(
             cfg.hidden_size,
             num_kv_heads * head_dim,
             &cfg.quantization_config,
             false,
             comm,
+            kv_shard,
             vb_sa.pp("v_proj"),
         )?;
+        let num_heads = num_heads / comm.world_size();
+        let num_kv_heads = num_heads / n_kv_groups;
         let o_proj = RowParallelLayer::new(
             num_heads * head_dim,
             cfg.hidden_size,
@@ -192,7 +197,7 @@ impl QsaAttention {
             rotary_emb,
             paged_attn,
             sdpa_params: SdpaParams {
-                n_kv_groups: num_heads / num_kv_heads,
+                n_kv_groups,
                 softcap: None,
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,

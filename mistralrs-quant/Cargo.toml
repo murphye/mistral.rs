@@ -57,6 +57,7 @@ cutile = [
 ]
 nccl = ["cuda", "candle-core/nccl"]
 rocm = ["candle-core/rocm", "candle-nn/rocm"]
+rccl = ["rocm"]
 metal = [
     "candle-core/metal",
     "candle-nn/metal",

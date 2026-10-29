@@ -208,6 +208,16 @@ struct NativeMultimodalLoadArgs<'a> {
     paged_attn_config: Option<PagedAttentionConfig>,
 }
 
+/// The dtype of a GGUF weight source's float tensors. Tensor-parallel loads stage weights on the
+/// CPU, so the dtype is chosen for the GPU the ranks run on rather than for the staging device.
+fn gguf_source_dtype(dtype: &dyn TryIntoDType, device: &Device) -> Result<candle_core::DType> {
+    if device.is_cpu() && mistralrs_quant::distributed::use_nccl() {
+        let rank_device = distributed::tp_rank_device(0)?;
+        return dtype.try_into_dtype(&[&rank_device]);
+    }
+    dtype.try_into_dtype(&[device])
+}
+
 fn prepare_native_multimodal_config(
     loader_type: &MultimodalLoaderType,
     config: &str,
@@ -713,7 +723,7 @@ impl GGUFLoader {
         };
         let config = stamp_qk_rope_layout(&config, rope_pairing)?;
         let bindings = build_normal_bindings(&archive, &loader_type, descriptor.architecture)?;
-        let internal_dtype = dtype.try_into_dtype(&[device])?;
+        let internal_dtype = gguf_source_dtype(dtype, device)?;
         let source = Arc::new(mistralrs_quant::GgufWeightSource::new(
             archive.clone(),
             &bindings,
@@ -859,7 +869,7 @@ impl GGUFLoader {
             preprocessor_config,
             projector_files,
         } = prepared;
-        let internal_dtype = dtype.try_into_dtype(&[device])?;
+        let internal_dtype = gguf_source_dtype(dtype, device)?;
         let source = Arc::new(mistralrs_quant::GgufWeightSource::new(
             archive.clone(),
             &bindings,
@@ -1005,7 +1015,7 @@ impl GGUFLoader {
         if architecture == "gemma3" {
             ensure_gemma3_vision_config(&config)?;
         }
-        let internal_dtype = dtype.try_into_dtype(&[device])?;
+        let internal_dtype = gguf_source_dtype(dtype, device)?;
         let source = Arc::new(mistralrs_quant::GgufWeightSource::new(
             archive.clone(),
             &bindings,
@@ -1416,9 +1426,9 @@ impl Loader for GGUFLoader {
         let available_devices = if let Ok(payload) = env::var(distributed::IS_DAEMON_FLAG) {
             let payload: WorkerTransferData = serde_json::from_str(&payload)?;
             let WorkerTransferData::Init { worker_rank, .. } = payload;
-            vec![candle_core::Device::new_cuda(worker_rank + 1)?]
+            vec![crate::distributed::tp_rank_device(worker_rank + 1)?]
         } else if use_nccl {
-            vec![candle_core::Device::new_cuda(0)?]
+            vec![crate::distributed::tp_rank_device(0)?]
         } else {
             device_map::get_all_similar_devices(device)?
         };
