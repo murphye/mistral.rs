@@ -243,6 +243,14 @@ impl QsaAttention {
         let gate = q_gate
             .narrow(D::Minus1, self.head_dim, self.head_dim)?
             .reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
+        // The gate half of the contiguous `[tokens, heads, 2 * head_dim]` projection, for the
+        // attention kernel to fold in.
+        let gate_view = q_gate.is_contiguous().then_some((
+            &q_gate,
+            self.head_dim,
+            self.num_heads * self.head_dim * 2,
+            self.head_dim * 2,
+        ));
         let k = k.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?;
         let cos_sin = (
@@ -261,27 +269,62 @@ impl QsaAttention {
 
         let index_qk = self.index_qk_proj.forward(x)?;
         let index_q_dim = self.qsa.n_heads * self.qsa.head_dim;
-        let index_q = index_qk.narrow(D::Minus1, 0, index_q_dim)?.reshape((
-            b_sz,
-            seq_len,
-            self.qsa.n_heads,
-            self.qsa.head_dim,
-        ))?;
-        // Unpaged dense steps attend to every key and never read the indexer query.
-        let index_q = if self.paged_attn.is_some() || matches!(step.mode, QsaMode::Sparse { .. }) {
-            self.index_query(&index_q, &cos_sin)?
+        // ROCm decode: the indexer query's norm and rope and the raw key copy in one launch.
+        #[cfg(feature = "rocm")]
+        let fused_index = if x.device().is_rocm()
+            && self.paged_attn.is_some()
+            && b_sz * seq_len < 64
+            && cos_sin.0.dtype() == index_qk.dtype()
+            && self.index_q_norm.weight().dtype() == index_qk.dtype()
+        {
+            let n_tokens = b_sz * seq_len;
+            let (index_q, raw_key) = super::kernels::index_q_prep(
+                &index_qk.reshape((n_tokens, ()))?,
+                self.index_q_norm.weight(),
+                self.index_q_norm.eps(),
+                &cos_sin.0.reshape((n_tokens, ()))?,
+                &cos_sin.1.reshape((n_tokens, ()))?,
+                self.qsa.n_heads,
+                self.qsa.head_dim,
+            )?;
+            Some((
+                index_q.reshape((b_sz, seq_len, self.qsa.n_heads, self.qsa.head_dim))?,
+                raw_key.reshape((b_sz, seq_len, self.qsa.head_dim))?,
+            ))
         } else {
-            index_q
+            None
         };
-        let raw_key = index_qk.narrow(D::Minus1, index_q_dim, self.qsa.head_dim)?;
+        #[cfg(not(feature = "rocm"))]
+        let fused_index: Option<(Tensor, Tensor)> = None;
+        let (index_q, raw_key) = match fused_index {
+            Some(fused) => fused,
+            None => {
+                let index_q = index_qk.narrow(D::Minus1, 0, index_q_dim)?.reshape((
+                    b_sz,
+                    seq_len,
+                    self.qsa.n_heads,
+                    self.qsa.head_dim,
+                ))?;
+                // Unpaged dense steps attend to every key and never read the indexer query.
+                let index_q =
+                    if self.paged_attn.is_some() || matches!(step.mode, QsaMode::Sparse { .. }) {
+                        self.index_query(&index_q, &cos_sin)?
+                    } else {
+                        index_q
+                    };
+                let raw_key = index_qk.narrow(D::Minus1, index_q_dim, self.qsa.head_dim)?;
+                (index_q, raw_key)
+            }
+        };
 
-        let y = match (&self.paged_attn, metadata) {
+        let (y, gated) = match (&self.paged_attn, metadata) {
             (Some(paged_attn), Some(((key_cache, value_cache), input_metadata))) => self
                 .forward_paged(PagedQsaInputs {
                     paged_attn,
                     q: &q,
                     k: &k,
                     v: &v,
+                    gate: gate_view,
                     index_q: &index_q,
                     raw_key: &raw_key,
                     cos_sin: &cos_sin,
@@ -305,9 +348,9 @@ impl QsaAttention {
                     &self.sdpa_params,
                     Some(flash_params),
                 )?;
-                y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
+                (y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?, false)
             }
-            (None, _) => self.forward_unpaged(UnpagedQsaInputs {
+            (None, _) => (self.forward_unpaged(UnpagedQsaInputs {
                 q: &q,
                 k: &k,
                 v: &v,
@@ -320,9 +363,12 @@ impl QsaAttention {
                 })?,
                 flash_params,
                 step,
-            })?,
+            })?, false),
         };
 
+        if gated {
+            return self.o_proj.forward(&y);
+        }
         let gate = candle_nn::ops::sigmoid(&gate.to_dtype(y.dtype())?)?;
         self.o_proj.forward(&y.broadcast_mul(&gate)?)
     }
@@ -384,12 +430,14 @@ impl QsaAttention {
     }
 
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-    fn forward_paged(&self, inputs: PagedQsaInputs<'_>) -> Result<Tensor> {
+    /// The attention output and whether the output gate was already applied.
+    fn forward_paged(&self, inputs: PagedQsaInputs<'_>) -> Result<(Tensor, bool)> {
         let PagedQsaInputs {
             paged_attn,
             q,
             k,
             v,
+            gate,
             index_q,
             raw_key,
             cos_sin,
@@ -490,7 +538,7 @@ impl QsaAttention {
                     &self.sdpa_params,
                     Some(flash_params),
                 )?;
-                return y.transpose(1, 2)?.reshape((b_sz, seq_len, ()));
+                return Ok((y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?, false));
             };
             let mut key_cache = key_cache.clone();
             let mut value_cache = value_cache.clone();
@@ -536,12 +584,13 @@ impl QsaAttention {
                 shape: &shape,
                 n_kv_heads: self.num_kv_heads,
                 scale: self.sdpa_params.softmax_scale,
+                gate,
             };
-            let y = match kernels::qsa_attention_cutile(&attn_args)? {
-                Some(y) => y,
+            let (y, gated) = match kernels::qsa_attention_cutile(&attn_args)? {
+                Some(y) => (y, false),
                 None => kernels::qsa_attention(attn_args)?,
             };
-            return y.reshape((b_sz, seq_len, ()));
+            return Ok((y.reshape((b_sz, seq_len, ()))?, gated));
         }
         candle_core::bail!(
             "Qwen4-Exp paged attention requires CUDA; run with paged attention disabled on this device"
@@ -699,6 +748,9 @@ struct PagedQsaInputs<'a> {
     q: &'a Tensor,
     k: &'a Tensor,
     v: &'a Tensor,
+    /// The output gate logits as `(tensor, element offset, token stride, head stride)`, for
+    /// the attention kernel to apply (sigmoid included) when it can.
+    gate: Option<(&'a Tensor, usize, usize, usize)>,
     index_q: &'a Tensor,
     raw_key: &'a Tensor,
     cos_sin: &'a (Tensor, Tensor),

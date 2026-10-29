@@ -112,6 +112,22 @@ mod ffi {
             finished: *mut u32,
             stream: i64,
         );
+        pub(super) fn qwen4_index_q_prep(
+            index_qk: *const c_void,
+            in_stride: i32,
+            norm_w: *const c_void,
+            eps: f32,
+            cos: *const c_void,
+            sin: *const c_void,
+            half_rot: i32,
+            index_q: *mut c_void,
+            raw_key: *mut c_void,
+            tokens: i32,
+            heads: i32,
+            d: i32,
+            dtype: i32,
+            stream: i64,
+        );
         pub(super) fn qwen4_ple_hash(
             tokens: *const u32,
             layout: Q4Tokens,
@@ -255,6 +271,9 @@ mod ffi {
             out: *mut c_void,
             part_acc: *mut f32,
             part_ml: *mut f32,
+            gate: *const c_void,
+            gate_tok_stride: i64,
+            gate_head_stride: i32,
             dtype: i32,
             stream: i64,
         );
@@ -642,6 +661,63 @@ pub(crate) fn hc_combine_ar(
         );
     }
     Ok((out, xn))
+}
+
+/// Normalized, rotated indexer queries `[tokens, heads, d]` and the raw indexer key
+/// `[tokens, d]` from the indexer projection `index_qk: [tokens, heads * d + d]`, in one
+/// launch. `norm_weight` is the Gemma-style `1 + w` weight in the activation dtype; `cos`/`sin`
+/// are `[tokens, half_rot]`.
+pub(crate) fn index_q_prep(
+    index_qk: &Tensor,
+    norm_weight: &Tensor,
+    eps: f64,
+    cos: &Tensor,
+    sin: &Tensor,
+    heads: usize,
+    d: usize,
+) -> Result<(Tensor, Tensor)> {
+    let index_qk = index_qk.contiguous()?;
+    let (tokens, width) = index_qk.dims2()?;
+    let half_rot = cos.dim(candle_core::D::Minus1)?;
+    if width != heads * d + d
+        || d > 256
+        || 2 * half_rot > d
+        || cos.elem_count() != tokens * half_rot
+        || sin.elem_count() != tokens * half_rot
+        || norm_weight.elem_count() != d
+        || [norm_weight, cos, sin].iter().any(|t| t.dtype() != index_qk.dtype())
+    {
+        candle_core::bail!(
+            "index_q_prep: shapes {:?} / {:?} / {:?} don't fit {heads} heads of {d}",
+            index_qk.shape(),
+            norm_weight.shape(),
+            cos.shape()
+        );
+    }
+    let cos = cos.contiguous()?;
+    let sin = sin.contiguous()?;
+    let norm_weight = norm_weight.contiguous()?;
+    let index_q = empty(&[tokens, heads, d], index_qk.dtype(), index_qk.device())?;
+    let raw_key = empty(&[tokens, d], index_qk.dtype(), index_qk.device())?;
+    unsafe {
+        ffi::qwen4_index_q_prep(
+            dev_ptr(&index_qk)? as *const _,
+            width as i32,
+            dev_ptr(&norm_weight)? as *const _,
+            eps as f32,
+            dev_ptr(&cos)? as *const _,
+            dev_ptr(&sin)? as *const _,
+            half_rot as i32,
+            dev_ptr(&index_q)? as *mut _,
+            dev_ptr(&raw_key)? as *mut _,
+            tokens as i32,
+            heads as i32,
+            d as i32,
+            dtype_code(index_qk.dtype())?,
+            stream(index_qk.device())?,
+        );
+    }
+    Ok((index_q, raw_key))
 }
 
 /// `[tokens, heads]` table rows from each token's n-gram context; also advances `hist_pool`.
@@ -1077,10 +1153,14 @@ pub(crate) struct QsaAttentionArgs<'a> {
     pub shape: &'a QsaShape,
     pub n_kv_heads: usize,
     pub scale: f32,
+    /// The output gate to fold in: `(tensor, element offset, token stride, head stride)` of a
+    /// `[tokens] x [heads] x 256` view holding the gate logits (sigmoid applied in the kernel).
+    pub gate: Option<(&'a Tensor, usize, usize, usize)>,
 }
 
 /// Attention of `q: [tokens, q_heads, 256]` over each query's selected blocks plus its tail.
-pub(crate) fn qsa_attention(args: QsaAttentionArgs<'_>) -> Result<Tensor> {
+/// Returns the output and whether `args.gate` was applied (decode-sized batches only).
+pub(crate) fn qsa_attention(args: QsaAttentionArgs<'_>) -> Result<(Tensor, bool)> {
     let q = args.q.contiguous()?;
     let (n_tokens, n_q_heads, head_dim) = q.dims3()?;
     if head_dim != ATTN_HEAD_DIM {
@@ -1105,6 +1185,21 @@ pub(crate) fn qsa_attention(args: QsaAttentionArgs<'_>) -> Result<Tensor> {
     } else {
         (None, None)
     };
+    // The WMMA prefill path (64+ tokens) doesn't take the gate; those callers apply it.
+    let gate = args.gate.filter(|_| n_tokens < 64);
+    let (gate_ptr, gate_tok_stride, gate_head_stride) = match gate {
+        Some((gate, offset, tok_stride, head_stride)) => {
+            if gate.dtype() != q.dtype() {
+                candle_core::bail!("QSA gate dtype {:?} differs from q {:?}", gate.dtype(), q.dtype());
+            }
+            (
+                dev_ptr(gate)? + (offset * gate.dtype().size_in_bytes()) as u64,
+                tok_stride as i64,
+                head_stride as i32,
+            )
+        }
+        None => (0, 0, 0),
+    };
     unsafe {
         ffi::qwen4_qsa_attention(
             dev_ptr(&q)? as *const _,
@@ -1125,11 +1220,14 @@ pub(crate) fn qsa_attention(args: QsaAttentionArgs<'_>) -> Result<Tensor> {
             dev_ptr(&out)? as *mut _,
             opt_ptr(part_acc.as_ref())? as *mut f32,
             opt_ptr(part_ml.as_ref())? as *mut f32,
+            gate_ptr as *const _,
+            gate_tok_stride,
+            gate_head_stride,
             half_dtype_code(q.dtype())?,
             stream(device)?,
         );
     }
-    Ok(out)
+    Ok((out, gate.is_some()))
 }
 
 #[cfg(test)]

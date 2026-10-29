@@ -299,6 +299,39 @@ __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
 }
 #endif
 
+// Indexer query preparation: from the indexer projection `index_qk[t] = [q heads | raw key]`
+// (row stride `in_stride`), RMSNorm each query head (weight `norm_w`, Gemma-style `1 + w`
+// already applied), rotate its first `2 * half_rot` dims (NeoX halves, cos/sin `[t, half_rot]`)
+// and write `index_q[t, h]`; blocks of head 0 also copy the raw key to `raw_key[t]`.
+// Grid: (tokens, heads); block: d threads (d <= 256).
+template <typename T>
+__global__ void q4_index_q_prep_kernel(const T *__restrict__ index_qk, int in_stride,
+                                       const T *__restrict__ norm_w, float eps,
+                                       const T *__restrict__ cos, const T *__restrict__ sin,
+                                       int half_rot, T *__restrict__ index_q,
+                                       T *__restrict__ raw_key, int heads, int d) {
+  __shared__ float smem[32];
+  __shared__ float xs[256];
+  const int t = blockIdx.x, h = blockIdx.y, c = threadIdx.x;
+  const T *row = index_qk + (size_t)t * in_stride;
+  const float v = q4_f(row[h * d + c]);
+  const float ss = q4_block_sum(v * v, smem);
+  const float inv = rsqrtf(ss / (float)d + eps);
+  xs[c] = v * inv * q4_f(norm_w[c]);
+  __syncthreads();
+  float r = xs[c];
+  if (c < half_rot) {
+    r = xs[c] * q4_f(cos[(size_t)t * half_rot + c]) - xs[c + half_rot] * q4_f(sin[(size_t)t * half_rot + c]);
+  } else if (c < 2 * half_rot) {
+    const int j = c - half_rot;
+    r = xs[c] * q4_f(cos[(size_t)t * half_rot + j]) + xs[c - half_rot] * q4_f(sin[(size_t)t * half_rot + j]);
+  }
+  index_q[((size_t)t * heads + h) * d + c] = q4_t<T>(r);
+  if (h == 0) {
+    raw_key[(size_t)t * d + c] = row[heads * d + c];
+  }
+}
+
 struct Q4PleHashParams {
   unsigned long long multipliers[Q4_MAX_PLE_NGRAM];
   unsigned long long vocab_sizes[Q4_MAX_PLE_HEADS];
@@ -898,7 +931,8 @@ __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
     const int *__restrict__ selected, const int *__restrict__ n_selected,
     int topk, int ratio, int n_q_heads, int n_kv_heads, int items_per_split,
     float scale, int flashinfer_layout, T *__restrict__ out,
-    float *__restrict__ part_acc, float *__restrict__ part_ml) {
+    float *__restrict__ part_acc, float *__restrict__ part_ml,
+    const T *__restrict__ gate, int64_t gate_tok_stride, int gate_head_stride) {
   const int t = blockIdx.x;
   const int g = blockIdx.y;
   const int split = blockIdx.z;
@@ -1052,9 +1086,14 @@ __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
     if (splits == 1) {
       const float inv = s[hh] > 0.0f ? 1.0f / s[hh] : 0.0f;
       T *o = out + ((size_t)t * n_q_heads + qh) * Q4_ATTN_HEAD_DIM + lane * 8;
+      // The attention output gate (sigmoid of the q projection's gate half), when fused.
+      const T *gt = gate != nullptr
+                        ? gate + (size_t)t * gate_tok_stride + (size_t)qh * gate_head_stride + lane * 8
+                        : nullptr;
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
-        o[i] = q4_t<T>(acc[hh][i] * inv);
+        const float v = acc[hh][i] * inv;
+        o[i] = q4_t<T>(gt != nullptr ? v * q4_sigmoid(q4_f(gt[i])) : v);
       }
     } else {
       const size_t row = ((size_t)t * n_q_heads + qh) * splits + split;
@@ -1075,7 +1114,9 @@ template <typename T>
 __global__ void
 q4_qsa_attention_reduce_kernel(const float *__restrict__ part_acc,
                                const float *__restrict__ part_ml, int splits,
-                               T *__restrict__ out) {
+                               T *__restrict__ out, int n_q_heads,
+                               const T *__restrict__ gate, int64_t gate_tok_stride,
+                               int gate_head_stride) {
   const size_t row = blockIdx.x;
   const int d = threadIdx.x;
   float m = -FLT_MAX;
@@ -1096,7 +1137,12 @@ q4_qsa_attention_reduce_kernel(const float *__restrict__ part_acc,
     total = fmaf(ss, w, total);
     acc = fmaf(part_acc[(row * splits + sp) * Q4_ATTN_HEAD_DIM + d], w, acc);
   }
-  out[row * Q4_ATTN_HEAD_DIM + d] = q4_t<T>(total > 0.0f ? acc / total : 0.0f);
+  float v = total > 0.0f ? acc / total : 0.0f;
+  if (gate != nullptr) {
+    const size_t t = row / n_q_heads, qh = row - t * n_q_heads;
+    v *= q4_sigmoid(q4_f(gate[t * gate_tok_stride + qh * gate_head_stride + d]));
+  }
+  out[row * Q4_ATTN_HEAD_DIM + d] = q4_t<T>(v);
 }
 
 // Launcher dtype codes: 0 = f16, 1 = bf16, 2 = f32.
@@ -1429,6 +1475,21 @@ extern "C" void qwen4_hc_combine_ar(const void *res, const void *block_out,
 }
 #endif
 
+extern "C" void qwen4_index_q_prep(const void *index_qk, int in_stride, const void *norm_w,
+                                   float eps, const void *cos, const void *sin, int half_rot,
+                                   void *index_q, void *raw_key, int tokens, int heads, int d,
+                                   int dtype, int64_t stream) {
+  if (tokens == 0) {
+    return;
+  }
+  const cudaStream_t s = (cudaStream_t)stream;
+  const dim3 grid(tokens, heads);
+  Q4_DISPATCH(dtype, q4_index_q_prep_kernel<scalar_t><<<grid, d, 0, s>>>(
+                         (const scalar_t *)index_qk, in_stride, (const scalar_t *)norm_w, eps,
+                         (const scalar_t *)cos, (const scalar_t *)sin, half_rot,
+                         (scalar_t *)index_q, (scalar_t *)raw_key, heads, d));
+}
+
 extern "C" void qwen4_ple_hash(const unsigned int *tokens, Q4Tokens layout,
                                const float *hist_pool,
                                const unsigned int *slots, int hist_len,
@@ -1595,19 +1656,23 @@ extern "C" void qwen4_qsa_topk(const float *scores, int score_stride,
       scores, score_stride, layout, paged, ratio, topk, selected, n_selected);
 }
 
+// `gate` (nullable): the q projection's gate half, [tokens] x [heads] strided as given; the
+// kernels multiply the output by its sigmoid. The WMMA prefill path ignores it, so callers
+// pass it only for decode-sized batches (fewer than 64 tokens).
 extern "C" void qwen4_qsa_attention(
     const void *q, const void *k_cache, const void *v_cache, Q4Tokens layout,
     Q4Paged paged, const int *selected, const int *n_selected, int topk,
     int ratio, int n_q_heads, int n_kv_heads, int splits, int items_per_split,
     float scale, int flashinfer_layout, void *out, float *part_acc,
-    float *part_ml, int dtype, int64_t stream) {
+    float *part_ml, const void *gate, int64_t gate_tok_stride,
+    int gate_head_stride, int dtype, int64_t stream) {
   if (layout.n_tokens == 0) {
     return;
   }
   const cudaStream_t s = (cudaStream_t)stream;
 #ifdef USE_ROCM
   // Prefill batches take the WMMA kernel; decode keeps the split kernel below.
-  if (layout.n_tokens >= 64 && n_q_heads % n_kv_heads == 0 &&
+  if (gate == nullptr && layout.n_tokens >= 64 && n_q_heads % n_kv_heads == 0 &&
       n_q_heads / n_kv_heads <= Q4W_ROWS) {
     const dim3 wgrid(layout.n_tokens, n_kv_heads);
     Q4_DISPATCH_HALF(dtype, {
@@ -1626,11 +1691,13 @@ extern "C" void qwen4_qsa_attention(
         (const scalar_t *)q, (const scalar_t *)k_cache,
         (const scalar_t *)v_cache, layout, paged, selected, n_selected, topk,
         ratio, n_q_heads, n_kv_heads, items_per_split, scale, flashinfer_layout,
-        (scalar_t *)out, part_acc, part_ml);
+        (scalar_t *)out, part_acc, part_ml, (const scalar_t *)gate, gate_tok_stride,
+        gate_head_stride);
     if (splits > 1) {
       q4_qsa_attention_reduce_kernel<scalar_t>
           <<<layout.n_tokens * n_q_heads, Q4_ATTN_HEAD_DIM, 0, s>>>(
-              part_acc, part_ml, splits, (scalar_t *)out);
+              part_acc, part_ml, splits, (scalar_t *)out, n_q_heads,
+              (const scalar_t *)gate, gate_tok_stride, gate_head_stride);
     }
   });
 }
