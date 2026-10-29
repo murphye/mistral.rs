@@ -498,6 +498,37 @@ pub struct SumAllReduce {
     world_size: usize,
 }
 
+thread_local! {
+    /// While set, [`SumAllReduce::sum_all_reduce`] returns its input unchanged and counts the
+    /// reductions it skipped: the caller reduces those partial sums itself.
+    static DEFER_REDUCTIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// A scope in which every all-reduce on this thread is deferred: each skipped reduction
+/// leaves a partial sum the caller must reduce (or fuse into the work that consumes it).
+pub struct DeferredReductions {
+    outer: Option<usize>,
+}
+
+impl DeferredReductions {
+    pub fn begin() -> Self {
+        Self {
+            outer: DEFER_REDUCTIONS.with(|d| d.replace(Some(0))),
+        }
+    }
+
+    /// Ends the scope; the number of reductions it skipped.
+    pub fn finish(self) -> usize {
+        DEFER_REDUCTIONS.with(|d| d.get()).unwrap_or(0)
+    }
+}
+
+impl Drop for DeferredReductions {
+    fn drop(&mut self) {
+        DEFER_REDUCTIONS.with(|d| d.set(self.outer));
+    }
+}
+
 impl SumAllReduce {
     pub fn new(comm: &std::sync::Arc<Comm>) -> Self {
         let world_size = comm.world_size();
@@ -564,8 +595,22 @@ impl SumAllReduce {
         }
     }
 
+    /// The device handles of the peer all-reduce buffers, for kernels that fuse the exchange
+    /// with their own work.
+    #[cfg(feature = "rccl")]
+    pub fn peer_raw_handles(&self) -> Option<candle_core::rocm_backend::peer::PeerRawHandles> {
+        match self.rccl.as_deref() {
+            Some(Comm::Rccl(comm)) if !self.is_noop() => comm.peer_raw_handles(),
+            _ => None,
+        }
+    }
+
     pub fn sum_all_reduce(&self, xs: &candle_core::Tensor) -> Result<candle_core::Tensor> {
         if self.is_noop() {
+            return Ok(xs.clone());
+        }
+        if let Some(skipped) = DEFER_REDUCTIONS.with(|d| d.get()) {
+            DEFER_REDUCTIONS.with(|d| d.set(Some(skipped + 1)));
             return Ok(xs.clone());
         }
         #[cfg(all(feature = "cuda", feature = "nccl"))]

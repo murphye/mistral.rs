@@ -91,6 +91,27 @@ mod ffi {
             dtype: i32,
             stream: i64,
         );
+        #[cfg(feature = "rocm")]
+        pub(super) fn qwen4_hc_combine_ar(
+            res: *const c_void,
+            block_out: *const c_void,
+            inject: *const c_void,
+            res_out: *mut c_void,
+            next_weight: *const f32,
+            xn_out: *mut c_void,
+            rows: i32,
+            hc: i32,
+            hidden: i32,
+            eps: f32,
+            dtype: i32,
+            peers: *const u64,
+            rank: i32,
+            world: i32,
+            max_elems: i32,
+            epoch: *mut i32,
+            pushed: *mut u32,
+            stream: i64,
+        );
         pub(super) fn qwen4_ple_hash(
             tokens: *const u32,
             layout: Q4Tokens,
@@ -551,6 +572,72 @@ pub(crate) fn hc_combine(
             hidden as i32,
             eps as f32,
             dtype_code(res.dtype())?,
+            stream(res.device())?,
+        );
+    }
+    Ok((out, xn))
+}
+
+/// Whether [`hc_combine_ar`] takes this partial: it must fit the peer buffers, push in whole
+/// 16-byte vectors and keep the grid small enough to be resident at once.
+#[cfg(feature = "rocm")]
+pub(crate) fn hc_combine_ar_supports(
+    block_out: &Tensor,
+    hc: usize,
+    peer: &candle_core::rocm_backend::peer::PeerRawHandles,
+) -> bool {
+    let hidden = block_out.dims().last().copied().unwrap_or(0);
+    let tokens = block_out.elem_count() / hidden.max(1);
+    block_out.dtype() == DType::BF16
+        && hidden % (hc * 8) == 0
+        && block_out.elem_count() <= peer.max_elems as usize
+        && tokens * hc <= 128
+}
+
+/// [`hc_combine`] where `block_out` is this rank's partial sum: the kernel exchanges the
+/// partials with the other ranks over peer memory and combines their sum.
+#[cfg(feature = "rocm")]
+pub(crate) fn hc_combine_ar(
+    res: &Tensor,
+    block_out: &Tensor,
+    inject: &Tensor,
+    next_norm: Option<&Tensor>,
+    hc: usize,
+    eps: f64,
+    peer: &candle_core::rocm_backend::peer::PeerRawHandles,
+) -> Result<(Tensor, Option<Tensor>)> {
+    let res = res.contiguous()?;
+    let block_out = block_out.contiguous()?;
+    let inject = inject.contiguous()?;
+    let width = res.dim(candle_core::D::Minus1)?;
+    let hidden = width / hc;
+    let rows = res.elem_count() / hidden;
+    if !hc_combine_ar_supports(&block_out, hc, peer) {
+        candle_core::bail!("hc_combine_ar: unsupported shape {:?}", block_out.shape());
+    }
+    let out = empty(res.dims(), res.dtype(), res.device())?;
+    let xn = next_norm
+        .map(|_| empty(res.dims(), res.dtype(), res.device()))
+        .transpose()?;
+    unsafe {
+        ffi::qwen4_hc_combine_ar(
+            dev_ptr(&res)? as *const _,
+            dev_ptr(&block_out)? as *const _,
+            dev_ptr(&inject)? as *const _,
+            dev_ptr(&out)? as *mut _,
+            opt_ptr(next_norm)? as *const f32,
+            opt_ptr(xn.as_ref())? as *mut _,
+            rows as i32,
+            hc as i32,
+            hidden as i32,
+            eps as f32,
+            dtype_code(res.dtype())?,
+            peer.peers as *const u64,
+            peer.rank as i32,
+            peer.world as i32,
+            peer.max_elems as i32,
+            peer.epoch as *mut i32,
+            peer.counters as *mut u32,
             stream(res.device())?,
         );
     }

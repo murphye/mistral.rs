@@ -181,6 +181,119 @@ q4_hc_combine_kernel(const T *__restrict__ res, const T *__restrict__ block_out,
   }
 }
 
+#ifdef USE_ROCM
+// hc_combine over a tensor-parallel partial `block_out`: the ranks exchange their
+// partials through peer memory (the receive-buffer layout of candle's
+// peer_allreduce.cu) and each combines the full sum, so the all-reduce costs no
+// launch of its own. Workgroup `row` pushes its stream's `hidden / hc` slice of
+// token `t`'s partial to every peer's slot for this rank; the last workgroup to
+// finish pushing publishes the epoch to the peers, and every workgroup waits
+// for all peers' epochs before reading their slots. Every workgroup of the grid
+// must be resident at once, so `rows` stays small (decode steps).
+#define Q4_PEER_SPIN_TIMEOUT_TICKS 1000000000ull
+
+typedef unsigned int q4_v4u __attribute__((ext_vector_type(4)));
+
+template <typename T>
+__global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
+    const T *__restrict__ res, const T *__restrict__ block_out,
+    const T *__restrict__ inject, T *__restrict__ res_out,
+    const float *__restrict__ next_weight, T *__restrict__ xn_out, int hc,
+    int hidden, float eps, const uint64_t *__restrict__ peers, int rank,
+    int world, int max_elems, int *__restrict__ epoch,
+    unsigned int *__restrict__ pushed) {
+  __shared__ float smem[32];
+  __shared__ int ep_s;
+  const int rows = gridDim.x;
+  const size_t row = blockIdx.x;
+  const size_t t = row / hc;
+  const int stream = row - t * hc;
+  if (threadIdx.x == 0) {
+    ep_s = *epoch + 1;
+  }
+  __syncthreads();
+  const int ep = ep_s;
+  const int half = ep & 1;
+  // Push this stream's slice of the token's partial, 16 bytes per lane.
+  const int slice = hidden / hc;
+  const size_t at = t * hidden + (size_t)stream * slice;
+  const q4_v4u *src = reinterpret_cast<const q4_v4u *>(block_out + at);
+  const int nv = slice * (int)sizeof(T) / 16;
+  for (int peer = 0; peer < world; ++peer) {
+    if (peer == rank) {
+      continue;
+    }
+    T *slot = reinterpret_cast<T *>(peers[peer]) +
+              (size_t)(half * world + rank) * max_elems + at;
+    q4_v4u *dst = reinterpret_cast<q4_v4u *>(slot);
+    for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+      dst[i] = src[i];
+    }
+  }
+  __threadfence_system();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const unsigned int done = atomicAdd(pushed, 1u);
+    if (done == (unsigned int)rows - 1) {
+      // Every workgroup's pushes are fenced before its increment; publish them.
+      __threadfence_system();
+      for (int peer = 0; peer < world; ++peer) {
+        if (peer != rank) {
+          int *flags = reinterpret_cast<int *>(peers[world + peer]);
+          __hip_atomic_store(flags + rank, ep, __ATOMIC_RELEASE,
+                             __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+      }
+      // All workgroups have read the epoch and taken their ticket.
+      *pushed = 0;
+      *epoch = ep;
+    }
+    int *own = reinterpret_cast<int *>(peers[world + rank]);
+    const uint64_t start = wall_clock64();
+    for (int peer = 0; peer < world; ++peer) {
+      if (peer != rank) {
+        while (__hip_atomic_load(own + peer, __ATOMIC_ACQUIRE,
+                                 __HIP_MEMORY_SCOPE_SYSTEM) < ep) {
+          if (wall_clock64() - start > Q4_PEER_SPIN_TIMEOUT_TICKS) {
+            __builtin_trap();
+          }
+        }
+      }
+    }
+  }
+  __syncthreads();
+  // Sum in rank order so every rank's residual is bit-identical.
+  const T *recv = reinterpret_cast<const T *>(peers[rank]) +
+                  (size_t)half * world * max_elems + t * hidden;
+  const T *br = block_out + t * hidden;
+  const float w = 2.0f * q4_sigmoid(q4_f(inject[row]) / (float)hc);
+  const T *rr = res + row * hidden;
+  T *orow = res_out + row * hidden;
+  float ss = 0.0f;
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    float b = 0.0f;
+    for (int r = 0; r < world; ++r) {
+      b += r == rank ? q4_f(br[i]) : q4_f(recv[(size_t)r * max_elems + i]);
+    }
+    // The reduced block output is a T tensor on the unfused path; round it the same way.
+    const T v = q4_t<T>(fmaf(q4_f(q4_t<T>(b)), w, q4_f(rr[i])));
+    orow[i] = v;
+    const float vf = q4_f(v);
+    ss = fmaf(vf, vf, ss);
+  }
+  if (next_weight == nullptr) {
+    return;
+  }
+  ss = q4_block_sum(ss, smem);
+  const float inv = rsqrtf(ss / (float)hidden + eps);
+  const float *wr = next_weight + (size_t)stream * hidden;
+  T *xr = xn_out + row * hidden;
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    xr[i] = q4_t<T>(q4_f(orow[i]) * inv * wr[i]);
+  }
+}
+#endif
+
 struct Q4PleHashParams {
   unsigned long long multipliers[Q4_MAX_PLE_NGRAM];
   unsigned long long vocab_sizes[Q4_MAX_PLE_HEADS];
@@ -1286,6 +1399,30 @@ extern "C" void qwen4_hc_combine(const void *res, const void *block_out,
                   (const scalar_t *)inject, (scalar_t *)res_out, next_weight,
                   (scalar_t *)xn_out, hc, hidden, eps));
 }
+
+#ifdef USE_ROCM
+// `peers`, `rank`, `world`, `max_elems`, `epoch`: a candle PeerAllReduce's raw handles;
+// `pushed`: its zeroed workgroup counter. `hidden / hc` must be a multiple of
+// 16 bytes of T.
+extern "C" void qwen4_hc_combine_ar(const void *res, const void *block_out,
+                                    const void *inject, void *res_out,
+                                    const float *next_weight, void *xn_out,
+                                    int rows, int hc, int hidden, float eps,
+                                    int dtype, const uint64_t *peers, int rank,
+                                    int world, int max_elems, int *epoch,
+                                    unsigned int *pushed, int64_t stream) {
+  if (rows == 0) {
+    return;
+  }
+  const cudaStream_t s = (cudaStream_t)stream;
+  Q4_DISPATCH(dtype, q4_hc_combine_ar_kernel<scalar_t>
+              <<<rows, q4_row_threads(hidden), 0, s>>>(
+                  (const scalar_t *)res, (const scalar_t *)block_out,
+                  (const scalar_t *)inject, (scalar_t *)res_out, next_weight,
+                  (scalar_t *)xn_out, hc, hidden, eps, peers, rank, world,
+                  max_elems, epoch, pushed));
+}
+#endif
 
 extern "C" void qwen4_ple_hash(const unsigned int *tokens, Q4Tokens layout,
                                const float *hist_pool,

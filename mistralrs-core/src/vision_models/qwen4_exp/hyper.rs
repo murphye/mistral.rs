@@ -193,6 +193,46 @@ impl GatedResidual {
         let xn = next.map(|next| next.norm(&res)).transpose()?;
         Ok((res, xn))
     }
+
+    /// [`Self::combine`] where `out` came from a
+    /// [`mistralrs_quant::distributed::DeferredReductions`] scope that skipped
+    /// `skipped` all-reduces: one skipped reduction makes `out` this rank's partial sum, which
+    /// the ROCm kernel reduces over peer memory as it combines, and which is otherwise reduced
+    /// through `reducer` first.
+    pub(super) fn combine_reduced(
+        &self,
+        res: &Tensor,
+        out: &Tensor,
+        inject: &Tensor,
+        next: Option<&GatedResidual>,
+        reducer: &mistralrs_quant::SumAllReduce,
+        skipped: usize,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        match skipped {
+            0 => return self.combine(res, out, inject, next),
+            1 => {}
+            n => candle_core::bail!("{n} reductions deferred where one partial sum was expected"),
+        }
+        #[cfg(feature = "rccl")]
+        if res.device().is_rocm() {
+            let next = next.filter(|next| next.norm_weight.device().same_device(res.device()));
+            if let Some(peer) = reducer.peer_raw_handles() {
+                if crate::rocm::qwen4_exp::hc_combine_ar_supports(out, self.hc, &peer) {
+                    return crate::rocm::qwen4_exp::hc_combine_ar(
+                        res,
+                        out,
+                        inject,
+                        next.map(|next| &next.norm_weight),
+                        self.hc,
+                        self.eps,
+                        &peer,
+                    );
+                }
+            }
+        }
+        let out = reducer.sum_all_reduce(&out.contiguous()?)?;
+        self.combine(res, &out, inject, next)
+    }
 }
 
 /// RMSNorm of each `hidden`-wide group of the last dim, times a per-group weight.

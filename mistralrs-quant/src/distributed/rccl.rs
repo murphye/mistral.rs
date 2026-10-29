@@ -178,6 +178,10 @@ impl RcclComm {
     pub fn world_size(&self) -> usize {
         self.world_size
     }
+
+    pub fn peer_raw_handles(&self) -> Option<candle_core::rocm_backend::peer::PeerRawHandles> {
+        self.peer.as_ref().map(|peer| peer.raw_handles())
+    }
 }
 
 impl Drop for RcclComm {

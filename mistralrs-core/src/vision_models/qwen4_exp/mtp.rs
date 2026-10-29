@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Module, Result, Tensor};
+use mistralrs_quant::distributed::DeferredReductions;
 use mistralrs_quant::{QuantMethod, ReplicatedLayer, ShardedVarBuilder};
 
 use super::{
@@ -36,6 +37,7 @@ pub(super) struct Qwen4ExpMtpHead {
     mlp_hc: GatedResidual,
     moe: SparseMoeBlock,
     mixer: GatedResidual,
+    reduce: mistralrs_quant::SumAllReduce,
     rotary_emb: Arc<Qwen3VLRotaryEmbedding>,
     qsa: QsaConfig,
     max_seq_len: usize,
@@ -130,6 +132,7 @@ impl Qwen4ExpMtpHead {
                 &comm,
             )?,
             mixer: GatedResidual::load(cfg, vb_plain.pp("hyper_connection_mixer"), false)?,
+            reduce: mistralrs_quant::SumAllReduce::new(&comm),
             rotary_emb,
             qsa,
             max_seq_len: cfg.max_position_embeddings,
@@ -229,6 +232,7 @@ impl Qwen4ExpMtpHead {
 
         let xn = self.attn_hc.norm(&res)?;
         let (h, inject) = self.attn_hc.mix_inject(&xn)?;
+        let defer = DeferredReductions::begin();
         let out = self.attn.forward(
             &h,
             attention.attention_mask,
@@ -238,18 +242,31 @@ impl Qwen4ExpMtpHead {
             attention.flash_params,
             &step,
         )?;
-        let (res, xn) = self
-            .attn_hc
-            .combine(&res, &out, &inject, Some(&self.mlp_hc))?;
+        let skipped = defer.finish();
+        let (res, xn) = self.attn_hc.combine_reduced(
+            &res,
+            &out,
+            &inject,
+            Some(&self.mlp_hc),
+            &self.reduce,
+            skipped,
+        )?;
         let xn = match xn {
             Some(xn) => xn,
             None => self.mlp_hc.norm(&res)?,
         };
         let (h, inject) = self.mlp_hc.mix_inject(&xn)?;
+        let defer = DeferredReductions::begin();
         let out = self.moe.forward(&h)?;
-        let (res, xn) = self
-            .mlp_hc
-            .combine(&res, &out, &inject, Some(&self.mixer))?;
+        let skipped = defer.finish();
+        let (res, xn) = self.mlp_hc.combine_reduced(
+            &res,
+            &out,
+            &inject,
+            Some(&self.mixer),
+            &self.reduce,
+            skipped,
+        )?;
         let xn = match xn {
             Some(xn) => xn,
             None => self.mixer.norm(&res)?,

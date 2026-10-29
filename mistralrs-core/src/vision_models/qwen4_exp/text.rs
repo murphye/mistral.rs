@@ -10,6 +10,7 @@ use std::{
 
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::Linear;
+use mistralrs_quant::distributed::DeferredReductions;
 use mistralrs_quant::{QuantMethod, QuantizedConfig, ReplicatedLayer, ShardedVarBuilder};
 
 use super::{
@@ -288,6 +289,8 @@ struct DecoderLayer {
     attn_hc: GatedResidual,
     mlp_hc: GatedResidual,
     moe: SparseMoeBlock,
+    /// Reduces the mixer and MoE partial sums the hyper-connection combines take.
+    reduce: mistralrs_quant::SumAllReduce,
 }
 
 /// Recurrent-pool layer index that holds the PLE state (one past the decoder layers).
@@ -454,6 +457,7 @@ impl Qwen4ExpTextModel {
                 attn_hc: GatedResidual::load(cfg, vb_plain.pp("attn_hyper_connection"), true)?,
                 mlp_hc: GatedResidual::load(cfg, vb_plain.pp("mlp_hyper_connection"), true)?,
                 moe,
+                reduce: mistralrs_quant::SumAllReduce::new(&comm),
             })
         })?;
 
@@ -1129,6 +1133,8 @@ impl Qwen4ExpTextModel {
                 _ => layer.attn_hc.norm(&res)?,
             };
             let (h, inject) = layer.attn_hc.mix_inject(&xn)?;
+            // The mixer's output projection leaves its partial sum for the combine to reduce.
+            let defer = DeferredReductions::begin();
             let out = match &layer.mixer {
                 Mixer::Attention(attn) => {
                     let Some(HybridLayerCache::Attention(kv_cache)) = hybrid_cache.get_mut(i)
@@ -1216,22 +1222,33 @@ impl Qwen4ExpTextModel {
                     out
                 }
             };
-            let (next_res, xn) = layer
-                .attn_hc
-                .combine(&res, &out, &inject, Some(&layer.mlp_hc))?;
+            let skipped = defer.finish();
+            let (next_res, xn) = layer.attn_hc.combine_reduced(
+                &res,
+                &out,
+                &inject,
+                Some(&layer.mlp_hc),
+                &layer.reduce,
+                skipped,
+            )?;
             res = next_res;
             let xn = match xn {
                 Some(xn) => xn,
                 None => layer.mlp_hc.norm(&res)?,
             };
             let (h, inject) = layer.mlp_hc.mix_inject(&xn)?;
+            let defer = DeferredReductions::begin();
             let out = layer.moe.forward(&h)?;
+            let skipped = defer.finish();
             let next = match self.layers.get(i + 1) {
                 Some(next) if next.ple.is_none() => Some(&next.attn_hc),
                 Some(_) => None,
                 None => Some(&self.final_mixer),
             };
-            let (next_res, xn) = layer.mlp_hc.combine(&res, &out, &inject, next)?;
+            let (next_res, xn) =
+                layer
+                    .mlp_hc
+                    .combine_reduced(&res, &out, &inject, next, &layer.reduce, skipped)?;
             res = next_res;
             pending_norm = xn;
         }
