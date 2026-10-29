@@ -37,6 +37,8 @@ mod hyper;
 mod mtp;
 mod ple;
 mod qsa;
+#[cfg(feature = "rocm")]
+mod rocm_graph;
 mod speculative;
 mod text;
 
@@ -167,6 +169,8 @@ pub struct Qwen4ExpModel {
     vision_start_token_id: u32,
     vision_end_token_id: u32,
     encoder_cache: Arc<Mutex<EncoderCacheManager>>,
+    #[cfg(feature = "rocm")]
+    decode_graphs: rocm_graph::DecodeGraphs,
 }
 
 impl Qwen4ExpModel {
@@ -222,6 +226,8 @@ impl Qwen4ExpModel {
             vision_start_token_id: cfg.vision_start_token_id,
             vision_end_token_id: cfg.vision_end_token_id,
             encoder_cache: Arc::new(Mutex::new(EncoderCacheManager::new(32))),
+            #[cfg(feature = "rocm")]
+            decode_graphs: rocm_graph::DecodeGraphs::default(),
         })
     }
 
@@ -232,6 +238,89 @@ impl Qwen4ExpModel {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Runs a plain decode step (one token per sequence, paged, no speculation) as a replayed
+    /// HIP graph; `None` when the step doesn't qualify and must run eagerly.
+    #[cfg(feature = "rocm")]
+    fn try_decode_graph<F>(
+        &self,
+        input_ids: &Tensor,
+        ctx: &crate::pipeline::ModelForwardContext<'_>,
+        mut forward: F,
+    ) -> Result<Option<Tensor>>
+    where
+        F: FnMut(&Tensor, &crate::pipeline::ModelForwardContext<'_>) -> Result<Tensor>,
+    {
+        use rocm_graph::{CaptureHooks, StepInputs};
+        let device = &self.text.device;
+        let Ok((batch, 1)) = input_ids.dims2() else {
+            return Ok(None);
+        };
+        if !rocm_graph::enabled()
+            || !device.is_rocm()
+            || batch > rocm_graph::MAX_GRAPH_BATCH
+            || self.decode_graphs.has_failed(batch)
+            || self.text.store_spec_hidden_enabled()
+            || !matches!(
+                ctx.recurrent_batch_kind(),
+                Some(crate::pipeline::RecurrentBatchKind::Decode)
+            )
+            || !self.text.runs_on_one_device()
+        {
+            return Ok(None);
+        }
+        let Some(metadata) = ctx.paged_input_metadata() else {
+            return Ok(None);
+        };
+        if !metadata.is_decode_step() || metadata.has_host_staged_decode_tensors() {
+            return Ok(None);
+        }
+        let location = device.location();
+        let (Some(block_tables), Some(context_lens), Some(slot_mappings), Some(recurrent)) = (
+            metadata.block_tables.as_ref().and_then(|t| t.get(&location)),
+            metadata.context_lens.as_ref().and_then(|t| t.get(&location)),
+            metadata.slot_mappings.get(&location),
+            ctx.recurrent_metadata(),
+        ) else {
+            return Ok(None);
+        };
+        let positions = match metadata.rope_positions.as_ref().and_then(|t| t.get(&location)) {
+            Some(positions) => positions.clone(),
+            None => crate::pipeline::decode_positions_tensor(ctx.position_ids(), 1, device)?,
+        };
+        let state_indices = recurrent.state_indices().to_device(device)?;
+        let ple = self.text.decode_ple_embeddings(input_ids)?;
+        let step = StepInputs {
+            input_ids,
+            block_tables,
+            context_lens,
+            slot_mappings,
+            positions: &positions,
+            state_indices: &state_indices,
+            ple: ple.as_ref(),
+        };
+        if !rocm_graph::step_shapes_ok(&step)? {
+            // The PLE history already advanced for this step: hand the forward its embeddings.
+            self.text.set_ple_pending_embeddings(ple);
+            let out = forward(input_ids, ctx);
+            self.text.set_ple_pending_embeddings(None);
+            return out.map(Some);
+        }
+        let block_size = metadata.block_size.unwrap_or(1).max(1);
+        self.decode_graphs
+            .run(
+                step,
+                ctx,
+                CaptureHooks {
+                    device,
+                    max_blocks: self.text.max_seq_len.div_ceil(block_size),
+                    set_ple: &|emb| self.text.set_ple_pending_embeddings(emb),
+                    set_state_indices: &|indices| self.text.replace_state_indices(indices),
+                    forward,
+                },
+            )
+            .map(Some)
+    }
+
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -460,6 +549,32 @@ impl MultimodalModel for Qwen4ExpModel {
         let pixel_values = (image_grid_thw.is_some()).then_some(pixel_values).flatten();
         let rope_img = rope_img_grid_thw.or(image_grid_thw.clone());
         let rope_vid = rope_vid_grid_thw.or(video_grid_thw.clone());
+        #[cfg(feature = "rocm")]
+        if pixel_values.is_none() && pixel_values_video.is_none() && packed_layout.is_none() {
+            let forward = |ids: &Tensor, ctx: &crate::pipeline::ModelForwardContext<'_>| {
+                self.forward(
+                    ids,
+                    &input_ids_full,
+                    None,
+                    None,
+                    image_grid_thw.clone(),
+                    video_grid_thw.clone(),
+                    rope_img.clone(),
+                    rope_vid.clone(),
+                    seqlens.clone(),
+                    continuous_img_pad.clone(),
+                    continuous_vid_pad.clone(),
+                    &image_hashes,
+                    &video_hashes,
+                    None,
+                    prompt_position_ids.as_ref(),
+                    ctx,
+                )
+            };
+            if let Some(out) = self.try_decode_graph(input_ids, ctx, forward)? {
+                return Ok(out);
+            }
+        }
         self.forward(
             input_ids,
             &input_ids_full,

@@ -1398,6 +1398,13 @@ impl HybridCache {
     }
 
     /// Install caller-owned per-device index tensors (e.g. CUDA graph buffers) as the batch's state indices.
+    /// Swaps the current batch's state-index tensor for `indices` (same values, another
+    /// buffer), so layers read their slots from it.
+    pub fn replace_state_indices_tensor(&mut self, indices: Tensor) {
+        self.state_indices = Some(indices);
+        self.device_state_indices.clear();
+    }
+
     pub fn set_state_indices_tensors(
         &mut self,
         host: Vec<u32>,

@@ -749,6 +749,60 @@ impl Qwen4ExpTextModel {
             .all(PleLayer::gathers_on_device)
     }
 
+    /// Whether every layer runs on the model's own device (a single GPU, or one
+    /// tensor-parallel rank), which a captured decode graph requires.
+    #[cfg(feature = "rocm")]
+    pub(super) fn runs_on_one_device(&self) -> bool {
+        (0..self.layers.len()).all(|i| {
+            self.mapper
+                .device_for(i, false)
+                .is_none_or(|device| device.same_device(&self.device))
+        })
+    }
+
+    /// Gathers the PLE embeddings of a decode step (one token per sequence) on the host and
+    /// advances each sequence's n-gram history, as the forward pass would.
+    #[cfg(feature = "rocm")]
+    pub(super) fn decode_ple_embeddings(&self, input_ids: &Tensor) -> Result<Option<Tensor>> {
+        let Some(ple) = self.layers.iter().find_map(|layer| layer.ple.as_ref()) else {
+            return Ok(None);
+        };
+        let n_layers = self.layers.len();
+        let batch = input_ids.dim(0)?;
+        let mut hybrid_cache = self.cache.hybrid();
+        let indices = hybrid_cache
+            .state_indices_for_layer(n_layers)?
+            .ok_or_else(|| candle_core::Error::msg("PLE state indices are missing"))?;
+        let Some(HybridLayerCache::Recurrent(pool)) = hybrid_cache.get_mut(n_layers) else {
+            candle_core::bail!("Qwen4-Exp PLE state pool is missing");
+        };
+        let state = PleState {
+            conv: &pool.conv_state,
+            history: &pool.recurrent_state,
+            slots: &indices,
+        };
+        let spans = (0..batch).map(|b| (b, 1)).collect::<Vec<_>>();
+        ple.host_embeddings(input_ids, &state, &spans, batch).map(Some)
+    }
+
+    /// Embeddings the PLE layer uses in place of its own gather; `None` restores the gather.
+    #[cfg(feature = "rocm")]
+    pub(super) fn set_ple_pending_embeddings(&self, embeddings: Option<Tensor>) {
+        for ple in self.layers.iter().filter_map(|layer| layer.ple.as_ref()) {
+            ple.set_pending_embeddings(embeddings.clone());
+        }
+    }
+
+    /// Points the current batch's recurrent-state slots at `indices`.
+    #[cfg(feature = "rocm")]
+    pub(super) fn replace_state_indices(&self, indices: Tensor) {
+        self.cache.hybrid().replace_state_indices_tensor(indices);
+    }
+
+    pub(super) fn store_spec_hidden_enabled(&self) -> bool {
+        self.store_spec_hidden.load(Ordering::Relaxed)
+    }
+
     pub fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
         self.embed_tokens.embedding_forward(input_ids, self.dtype)
     }

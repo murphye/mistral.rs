@@ -885,6 +885,9 @@ pub(super) struct PleLayer {
     hc: usize,
     hidden: usize,
     eps: f64,
+    /// Embeddings gathered ahead of the forward pass, used instead of the host gather; a
+    /// replayed graph reads them from a fixed buffer.
+    pending_embeddings: std::sync::Mutex<Option<Tensor>>,
 }
 
 impl PleLayer {
@@ -935,7 +938,16 @@ impl PleLayer {
             hc: cfg.hc_count,
             hidden: cfg.hidden_size,
             eps: cfg.rms_norm_eps,
+            pending_embeddings: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Embeddings the next forward passes use instead of gathering their own.
+    pub(super) fn set_pending_embeddings(&self, embeddings: Option<Tensor>) {
+        *self
+            .pending_embeddings
+            .lock()
+            .expect("PLE pending embeddings poisoned") = embeddings;
     }
 
     #[cfg(feature = "cuda")]
@@ -1015,7 +1027,15 @@ impl PleLayer {
             })?;
             return out.reshape(dims);
         }
-        let emb = self.host_embeddings(tokens, state, batch.seqs, n_tokens)?;
+        let pending = self
+            .pending_embeddings
+            .lock()
+            .expect("PLE pending embeddings poisoned")
+            .clone();
+        let emb = match pending {
+            Some(emb) => emb,
+            None => self.host_embeddings(tokens, state, batch.seqs, n_tokens)?,
+        };
         let (gated, normed) = self.gate(&emb.to_dtype(flat.dtype())?, &flat)?;
         if let Some(out) = conv_inputs_out {
             *out = Some(normed.clone());
@@ -1076,7 +1096,9 @@ impl PleLayer {
         Ok((gated, normed))
     }
 
-    fn host_embeddings(
+    /// Hashes `tokens` against each sequence's n-gram history, advances the history, and
+    /// gathers the embedding rows: `[n_tokens, heads * head_dim]` f32 on the state's device.
+    pub(super) fn host_embeddings(
         &self,
         tokens: &Tensor,
         state: &PleState<'_>,
