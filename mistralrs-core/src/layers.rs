@@ -3636,6 +3636,35 @@ impl Mlp {
         )
     }
 
+    /// An MLP whose output is this rank's partial sum under tensor parallelism; the caller
+    /// all-reduces it, possibly together with other partial sums.
+    pub fn new_partial(
+        vb: ShardedVarBuilder,
+        hidden_size: usize,
+        intermediate_size: usize,
+        quantization_config: &Option<QuantizedConfig>,
+        hidden_act: Activation,
+        comm: &Arc<mistralrs_quant::Comm>,
+    ) -> Result<Self> {
+        let mut mlp = Self::new(
+            vb.clone(),
+            hidden_size,
+            intermediate_size,
+            quantization_config,
+            hidden_act,
+            comm,
+        )?;
+        mlp.down = RowParallelLayer::new_partial(
+            intermediate_size,
+            hidden_size,
+            quantization_config,
+            false,
+            comm,
+            vb.pp("down_proj"),
+        )?;
+        Ok(mlp)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_bias(
         vb: ShardedVarBuilder,

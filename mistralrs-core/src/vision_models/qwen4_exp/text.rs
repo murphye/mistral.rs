@@ -89,6 +89,8 @@ pub(super) struct SparseMoeBlock {
     shared_expert_gate: Linear,
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
+    /// Sums the routed and shared experts' tensor-parallel partial outputs in one collective.
+    all_reduce: mistralrs_quant::SumAllReduce,
 }
 
 impl SparseMoeBlock {
@@ -119,7 +121,7 @@ impl SparseMoeBlock {
             &cfg.quantization_config,
             cfg.hidden_act,
         )?;
-        let shared_expert = layers::Mlp::new(
+        let shared_expert = layers::Mlp::new_partial(
             vb.pp("shared_expert"),
             cfg.hidden_size,
             cfg.shared_expert_intermediate_size,
@@ -140,6 +142,7 @@ impl SparseMoeBlock {
             shared_expert_gate,
             num_experts_per_tok: cfg.num_experts_per_tok,
             norm_topk_prob: cfg.norm_topk_prob,
+            all_reduce: mistralrs_quant::SumAllReduce::new(comm),
         })
     }
 
@@ -168,28 +171,46 @@ impl SparseMoeBlock {
             None,
             None,
         )?;
-        let y = self
-            .experts
-            .forward(xs, topk.values, &topk.indices)?
-            .reshape((b_size, seq_len, hidden_dim))?;
-        let shared_logit = self.shared_expert_gate.forward(&xs_flat)?;
-        #[cfg(feature = "rocm")]
-        if xs.device().is_rocm() {
-            let shared_out = self.shared_expert.forward(xs)?;
-            if y.dtype() == shared_out.dtype() && shared_logit.dtype() == y.dtype() {
-                return crate::rocm::moe_glue::add_sigmoid_gated(&y, &shared_out, &shared_logit);
-            }
-            let shared_gate =
-                candle_nn::ops::sigmoid(&shared_logit)?.reshape((b_size, seq_len, 1))?;
-            return y + shared_out.broadcast_mul(&shared_gate)?;
+        // Under tensor parallelism both expert outputs are partial sums. The shared expert's
+        // gate is one scalar per token, so it applies to each partial sum and the two reduce
+        // together.
+        let (y, routed_partial) = self.experts.forward_partial(xs, topk.values, &topk.indices)?;
+        let mut y = y.reshape((b_size, seq_len, hidden_dim))?;
+        let shared_partial = !self.all_reduce.is_noop();
+        if shared_partial && !routed_partial {
+            // Replicated experts are already complete; give each rank an equal share.
+            y = (y / self.all_reduce_world() as f64)?;
         }
-        let shared_gate =
-            candle_nn::ops::sigmoid(&shared_logit)?.reshape((b_size, seq_len, 1))?;
-        let shared_out = self
-            .shared_expert
-            .forward(xs)?
-            .broadcast_mul(&shared_gate)?;
-        y + shared_out
+        let shared_logit = self.shared_expert_gate.forward(&xs_flat)?;
+        let shared_out = self.shared_expert.forward(xs)?;
+        let mut combined = None;
+        #[cfg(feature = "rocm")]
+        if xs.device().is_rocm()
+            && y.dtype() == shared_out.dtype()
+            && shared_logit.dtype() == y.dtype()
+        {
+            combined = Some(crate::rocm::moe_glue::add_sigmoid_gated(
+                &y,
+                &shared_out,
+                &shared_logit,
+            )?);
+        }
+        let combined = match combined {
+            Some(combined) => combined,
+            None => {
+                let shared_gate =
+                    candle_nn::ops::sigmoid(&shared_logit)?.reshape((b_size, seq_len, 1))?;
+                (y + shared_out.broadcast_mul(&shared_gate)?)?
+            }
+        };
+        if shared_partial {
+            return self.all_reduce.sum_all_reduce(&combined.contiguous()?);
+        }
+        Ok(combined)
+    }
+
+    fn all_reduce_world(&self) -> usize {
+        self.experts.world_size()
     }
 }
 

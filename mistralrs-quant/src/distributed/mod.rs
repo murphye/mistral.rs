@@ -549,6 +549,21 @@ impl SumAllReduce {
         self.world_size == 1
     }
 
+    /// A reduction that leaves its input as is, for layers whose partial sums are reduced by
+    /// the caller.
+    pub fn noop() -> Self {
+        Self {
+            #[cfg(all(feature = "cuda", feature = "nccl"))]
+            nccl: None,
+            #[cfg(feature = "ring")]
+            ring: None,
+            #[cfg(feature = "rccl")]
+            rccl: None,
+            dummy: None,
+            world_size: 1,
+        }
+    }
+
     pub fn sum_all_reduce(&self, xs: &candle_core::Tensor) -> Result<candle_core::Tensor> {
         if self.is_noop() {
             return Ok(xs.clone());

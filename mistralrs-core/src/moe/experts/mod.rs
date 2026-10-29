@@ -331,6 +331,27 @@ impl MoEExperts {
     /// # Returns
     /// Output tensor of shape [batch, seq_len, hidden_dim]
     pub fn forward(&self, xs: &Tensor, topk_weights: Tensor, topk_ids: &Tensor) -> Result<Tensor> {
+        let (ys, partial) = self.forward_partial(xs, topk_weights, topk_ids)?;
+        if partial {
+            let shape = ys.shape().clone();
+            return self.all_reduce.sum_all_reduce(&ys.contiguous()?)?.reshape(shape);
+        }
+        Ok(ys)
+    }
+
+    /// Tensor-parallel ranks the experts are split over.
+    pub fn world_size(&self) -> usize {
+        self.world_size
+    }
+
+    /// The experts' output before the tensor-parallel reduction, and whether it is a partial
+    /// sum the caller must still all-reduce.
+    pub fn forward_partial(
+        &self,
+        xs: &Tensor,
+        topk_weights: Tensor,
+        topk_ids: &Tensor,
+    ) -> Result<(Tensor, bool)> {
         let (batch_size, seq_len, hidden_dim) = xs.dims3()?;
         let shape = MoEForwardShape::new(batch_size, seq_len, hidden_dim);
         let xs_flat = xs.reshape(shape.flat())?;
@@ -351,7 +372,7 @@ impl MoEExperts {
         };
 
         let config = self.forward_config();
-        let mut ys = self
+        let ys = self
             .backend
             .forward(&forward, config)
             .map_err(|err| err.context("moe experts forward"))?;
@@ -361,11 +382,10 @@ impl MoEExperts {
             MoEExpertsBackendImpl::Fast(w) => w.sharded,
             _ => true,
         };
-        if self.world_size > 1 && sharded {
-            ys = self.all_reduce.sum_all_reduce(&ys)?;
-        }
-
-        ys.reshape(forward.shape.output())
+        Ok((
+            ys.reshape(forward.shape.output())?,
+            self.world_size > 1 && sharded,
+        ))
     }
 
     fn forward_config(&self) -> MoEForwardConfig {

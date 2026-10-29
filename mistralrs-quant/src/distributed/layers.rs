@@ -784,7 +784,39 @@ pub struct RowParallelLayer {
     all_reduce: distributed::SumAllReduce,
 }
 
+thread_local! {
+    static PARTIAL_ROW_PARALLEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl RowParallelLayer {
+    fn reducer(comm: &Arc<crate::Comm>) -> distributed::SumAllReduce {
+        if PARTIAL_ROW_PARALLEL.with(|p| p.get()) {
+            distributed::SumAllReduce::noop()
+        } else {
+            distributed::SumAllReduce::new(comm)
+        }
+    }
+
+    /// Like [`Self::new`], but the layer returns this rank's partial sum: the caller reduces
+    /// it, so several partial sums can share one all-reduce.
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new_partial(
+        in_dim: usize,
+        out_dim: usize,
+        config: &Option<QuantizedConfig>,
+        bias: bool,
+        comm: &Arc<crate::Comm>,
+        vb: ShardedVarBuilder,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        if bias && comm.world_size() > 1 {
+            candle_core::bail!("partial row-parallel layers cannot add a bias");
+        }
+        PARTIAL_ROW_PARALLEL.with(|p| p.set(true));
+        let layer = Self::new(in_dim, out_dim, config, bias, comm, vb);
+        PARTIAL_ROW_PARALLEL.with(|p| p.set(false));
+        layer
+    }
+
     #[allow(clippy::new_ret_no_self)]
     pub fn new(
         in_dim: usize,
@@ -846,7 +878,7 @@ impl RowParallelLayer {
                 Arc::new(Self {
                     weight,
                     bias,
-                    all_reduce: distributed::SumAllReduce::new(comm),
+                    all_reduce: Self::reducer(comm),
                 })
             };
             return apply_immediate_isq_sharded(layer, base_vb, Some(shard));
@@ -921,7 +953,7 @@ impl RowParallelLayer {
         let this_unquant = Arc::new(Self {
             weight,
             bias,
-            all_reduce: distributed::SumAllReduce::new(comm),
+            all_reduce: Self::reducer(comm),
         });
         let this: Arc<dyn QuantMethod> =
             apply_immediate_isq_sharded(this_unquant, base_vb, Some(shard))?;
@@ -970,7 +1002,7 @@ impl RowParallelLayer {
             let layer = Arc::new(Self {
                 weight,
                 bias,
-                all_reduce: distributed::SumAllReduce::new(comm),
+                all_reduce: Self::reducer(comm),
             });
             return apply_immediate_isq_sharded(layer, base_vb, None);
         }
@@ -1019,7 +1051,7 @@ impl RowParallelLayer {
         let this_unquant = Arc::new(Self {
             weight,
             bias,
-            all_reduce: distributed::SumAllReduce::new(comm),
+            all_reduce: Self::reducer(comm),
         });
         let this: Arc<dyn QuantMethod> = apply_immediate_isq_sharded(this_unquant, base_vb, None)?;
         Ok(this)
