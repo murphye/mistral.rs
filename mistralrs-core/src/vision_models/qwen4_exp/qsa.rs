@@ -530,8 +530,11 @@ impl QsaAttention {
                 eps: self.eps,
             })?;
             let QsaMode::Sparse { max_blocks } = step.mode else {
+                // The dense prompt paths multiply `q` as `[b, heads, tokens, d]`, which the
+                // token-major buffer only is after a copy (the ROCm matmul takes no other
+                // row stride).
                 let y = paged_attn.forward(
-                    q,
+                    &q.contiguous()?,
                     k,
                     &v.transpose(1, 2)?.contiguous()?,
                     attention_mask,
