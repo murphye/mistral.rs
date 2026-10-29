@@ -170,6 +170,14 @@ impl SparseMoeBlock {
     }
 
     pub(super) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_seeded(xs, None)
+    }
+
+    /// [`Self::forward`] where `seed` names the shared q8 quantization of `xs` its producer
+    /// left (ROCm decode), so the expert launch can reuse it.
+    pub(super) fn forward_seeded(&self, xs: &Tensor, seed: Option<u64>) -> Result<Tensor> {
+        #[cfg(not(feature = "rocm"))]
+        let _ = seed;
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let xs_flat = xs.reshape(((), hidden_dim))?;
         let router_config = crate::ops::MoeRouterTopKConfig {
@@ -207,7 +215,9 @@ impl SparseMoeBlock {
                 &slot_weights,
                 &slot_ids,
             )?;
-            if let Some(out) = self.forward_rocm_fused(xs, &xs_flat, &slot_ids, &slot_weights)? {
+            if let Some(out) =
+                self.forward_rocm_fused(xs, &xs_flat, &slot_ids, &slot_weights, seed)?
+            {
                 return Ok(out);
             }
             // The unfused path takes the routed slots only.
@@ -281,6 +291,7 @@ impl SparseMoeBlock {
         xs_flat: &Tensor,
         ids: &Tensor,
         weights: &Tensor,
+        seed: Option<u64>,
     ) -> Result<Option<Tensor>> {
         use candle_core::quantized::rocm::{
             indexed_moe_forward_with_extra_reduce, indexed_moe_glu_forward_with_extra,
@@ -307,6 +318,10 @@ impl SparseMoeBlock {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let tokens = b_size * seq_len;
         let x3 = xs_flat.reshape((tokens, 1, hidden_dim))?.contiguous()?;
+        // The gate and router launches since the mixer seeded `xs`'s q8 form did not touch it.
+        if let Some(seed) = seed {
+            candle_core::quantized::rocm::renew_shared_activation(xs.device(), seed);
+        }
         let down_in = indexed_moe_glu_forward_with_extra(&gate, &up, 0, &s_gate, &s_up, &x3, ids)?;
         // The down projection sums each token's slots in the kernel.
         let out = indexed_moe_forward_with_extra_reduce(&down, &s_down, &down_in, ids, weights)?
@@ -1278,7 +1293,7 @@ impl Qwen4ExpTextModel {
             };
             let (h, inject) = layer.mlp_hc.mix_inject(&xn)?;
             let defer = DeferredReductions::begin();
-            let out = layer.moe.forward(&h)?;
+            let out = layer.moe.forward_seeded(&h, layer.mlp_hc.take_seed())?;
             let skipped = defer.finish();
             let next = match self.layers.get(i + 1) {
                 Some(next) if next.ple.is_none() => Some(&next.attn_hc),

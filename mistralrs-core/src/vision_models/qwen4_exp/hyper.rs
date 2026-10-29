@@ -15,6 +15,9 @@ pub(super) struct GatedResidual {
     hc: usize,
     hidden: usize,
     eps: f64,
+    /// The shared q8 activation seed the last fused mix left (ROCm decode), for the consumer
+    /// that runs other launches first to renew.
+    last_seed: std::sync::atomic::AtomicU64,
 }
 
 impl GatedResidual {
@@ -58,6 +61,7 @@ impl GatedResidual {
             hc: cfg.hc_count,
             hidden: cfg.hidden_size,
             eps: cfg.rms_norm_eps,
+            last_seed: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -133,10 +137,20 @@ impl GatedResidual {
         };
         // The mixed activations feed quantized matmuls next (the GDN or QSA projections, the
         // MoE experts); the kernel leaves their q8_1 form for those to pick up.
-        let Some(h) = qgemv_gate_mean_seeded(&lo, &up, xn, self.hc)? else {
+        let Some((h, seed)) = qgemv_gate_mean_seeded(&lo, &up, xn, self.hc)? else {
             return Ok(None);
         };
+        self.last_seed
+            .store(seed.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
         Ok(Some((h, logits)))
+    }
+
+    /// The shared q8 activation seed left by the last [`Self::mix_inject`], once.
+    pub(super) fn take_seed(&self) -> Option<u64> {
+        match self.last_seed.swap(0, std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            seed => Some(seed),
+        }
     }
 
     /// Raw per-stream injection logits `[.., hc]`.
