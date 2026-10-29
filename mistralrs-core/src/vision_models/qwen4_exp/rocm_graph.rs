@@ -9,6 +9,11 @@
 //! The decode forward is graph-safe by construction: QSA decode runs in sparse mode with a
 //! fixed block budget and reads kv lengths from the device, recurrent state is updated in place
 //! through the slot tensor, and the PLE host gather happens before the graph runs.
+//!
+//! Speculative verify steps (`1 + n_draft` tokens per sequence) are graphs too, keyed by their
+//! token count. The model's speculative outputs (hidden captures, GDN replay stash) live in
+//! graph-owned buffers that every replay rewrites; the state object taken after capture is
+//! reinstalled after each replay so the proposer and the commit read the fresh values.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -18,9 +23,12 @@ use candle_core::{DType, Device, DeviceLocation, Result, Tensor};
 
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::{ModelForwardContext, RecurrentBatchKind, RecurrentMetadata};
+use crate::speculative::hybrid_state::SpecGraphState;
 
 const ENABLE_ENV: &str = "MISTRALRS_ROCM_DECODE_GRAPHS";
 pub(super) const MAX_GRAPH_BATCH: usize = 8;
+/// Tokens per sequence a captured step may carry (one, or a verify step's `1 + n_draft`).
+pub(super) const MAX_GRAPH_TOKENS: usize = 8;
 
 pub(super) fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -32,6 +40,8 @@ struct Entry {
     graph: HipGraph,
     inputs: StaticInputs,
     output: Tensor,
+    /// The speculative outputs of the captured forward, when a proposer is attached.
+    spec_state: Option<SpecGraphState>,
 }
 
 struct StaticInputs {
@@ -115,11 +125,12 @@ impl StaticInputs {
     }
 }
 
-/// Captured decode graphs, one per batch size. Batch sizes whose capture failed run eagerly.
+/// Captured decode graphs, one per (batch, tokens per sequence). Shapes whose capture failed
+/// run eagerly.
 #[derive(Default)]
 pub(super) struct DecodeGraphs {
-    entries: Mutex<HashMap<usize, Entry>>,
-    failed: Mutex<std::collections::HashSet<usize>>,
+    entries: Mutex<HashMap<(usize, usize), Entry>>,
+    failed: Mutex<std::collections::HashSet<(usize, usize)>>,
 }
 
 /// What the runner needs from the model to capture a step.
@@ -131,13 +142,17 @@ where
     pub max_blocks: usize,
     pub set_ple: &'a dyn Fn(Option<Tensor>),
     pub set_state_indices: &'a dyn Fn(Tensor),
+    pub batch_kind: RecurrentBatchKind,
+    /// Detaches what the forward left for the proposer, and reinstalls it.
+    pub take_spec: &'a dyn Fn() -> Option<SpecGraphState>,
+    pub install_spec: &'a dyn Fn(&SpecGraphState) -> Result<()>,
     /// Runs the model's forward pass on these token ids against `ctx`.
     pub forward: F,
 }
 
 impl DecodeGraphs {
-    pub(super) fn has_failed(&self, batch: usize) -> bool {
-        self.failed.lock().unwrap().contains(&batch)
+    pub(super) fn has_failed(&self, key: (usize, usize)) -> bool {
+        self.failed.lock().unwrap().contains(&key)
     }
 
     /// Replays (capturing first if needed) the decode graph for this step's batch size and
@@ -151,27 +166,41 @@ impl DecodeGraphs {
     where
         F: FnMut(&Tensor, &ModelForwardContext<'_>) -> Result<Tensor>,
     {
-        let batch = step.input_ids.dim(0)?;
+        let (batch, tokens) = step.input_ids.dims2()?;
+        let key = (batch, tokens);
         let rocm = hooks.device.as_rocm_device()?;
         let mut entries = self.entries.lock().unwrap();
-        if let Some(entry) = entries.get(&batch) {
+        if let Some(entry) = entries.get(&key) {
             let timing = std::env::var_os("MISTRALRS_GRAPH_TIMING").is_some();
-            if timing {
+            let sync = timing && std::env::var_os("MISTRALRS_GRAPH_TIMING_SYNC").is_some();
+            if sync {
                 hooks.device.synchronize()?;
             }
             let t0 = std::time::Instant::now();
             entry.inputs.refresh(&step)?;
+            let refreshed = t0.elapsed();
             rocm.launch_graph(&entry.graph)?;
             let launched = t0.elapsed();
             if timing {
+                eprintln!("GRAPH_HOST refresh={:.3}ms launch={:.3}ms", refreshed.as_secs_f64() * 1e3, (launched - refreshed).as_secs_f64() * 1e3);
+            }
+            if sync {
                 hooks.device.synchronize()?;
                 eprintln!(
-                    "GRAPH_TIMING batch={batch} launch_host={:.3}ms gpu={:.3}ms",
+                    "GRAPH_TIMING batch={batch} tokens={tokens} launch_host={:.3}ms gpu={:.3}ms",
                     launched.as_secs_f64() * 1e3,
                     t0.elapsed().as_secs_f64() * 1e3
                 );
             }
-            return entry.output.copy();
+            let t1 = std::time::Instant::now();
+            if let Some(spec) = &entry.spec_state {
+                (hooks.install_spec)(spec)?;
+            }
+            let out = entry.output.copy();
+            if timing {
+                eprintln!("GRAPH_HOST install_copy={:.3}ms", t1.elapsed().as_secs_f64() * 1e3);
+            }
+            return out;
         }
 
         let inputs = StaticInputs::new(&step, hooks.max_blocks)?;
@@ -191,7 +220,7 @@ impl DecodeGraphs {
             ctx.flash_params(),
         )
         .with_recurrent_metadata(Some(RecurrentMetadata::new(
-            RecurrentBatchKind::Decode,
+            hooks.batch_kind,
             inputs.state_indices.clone(),
             host_slots,
         )));
@@ -207,23 +236,32 @@ impl DecodeGraphs {
             (Ok(output), Ok(graph)) => {
                 rocm.launch_graph(&graph)?;
                 let logits = output.copy()?;
+                // The capture stored its speculative outputs on the model; keep them for
+                // replays and put them back for this step.
+                let spec_state = (hooks.take_spec)();
+                if let Some(spec) = &spec_state {
+                    (hooks.install_spec)(spec)?;
+                }
                 entries.insert(
-                    batch,
+                    key,
                     Entry {
                         graph,
                         inputs,
                         output,
+                        spec_state,
                     },
                 );
-                tracing::info!("Captured a ROCm decode graph for batch size {batch}");
+                tracing::info!(
+                    "Captured a ROCm decode graph for batch size {batch}, {tokens} token(s) per sequence"
+                );
                 Ok(logits)
             }
             (captured, graph) => {
                 let err = captured.err().or(graph.err()).expect("one side failed");
                 tracing::warn!(
-                    "ROCm decode graph capture failed for batch size {batch}; running eagerly: {err}"
+                    "ROCm decode graph capture failed for batch size {batch}, {tokens} token(s); running eagerly: {err}"
                 );
-                self.failed.lock().unwrap().insert(batch);
+                self.failed.lock().unwrap().insert(key);
                 // Nothing ran during the capture: run this step for real.
                 forward(&inputs.input_ids, &stable_ctx)
             }
@@ -235,12 +273,14 @@ impl DecodeGraphs {
 
 /// Whether the step's tensors are the shapes a decode graph takes.
 pub(super) fn step_shapes_ok(step: &StepInputs<'_>) -> Result<bool> {
-    let batch = step.input_ids.dim(0)?;
-    Ok(step.input_ids.dims() == [batch, 1]
-        && step.block_tables.dims2()?.0 == batch
-        && step.context_lens.elem_count() == batch
-        && step.slot_mappings.elem_count() == batch
-        && step.positions.elem_count() == batch
+    let (batch, tokens) = step.input_ids.dims2()?;
+    let rows = batch * tokens;
+    Ok(tokens >= 1
+        && tokens <= MAX_GRAPH_TOKENS
+        && step.block_tables.dims2()?.0 == rows
+        && step.context_lens.elem_count() == rows
+        && step.slot_mappings.elem_count() == rows
+        && step.positions.elem_count() == rows
         && step.state_indices.elem_count() == batch
         && step.state_indices.dtype() != DType::F32)
 }

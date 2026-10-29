@@ -238,8 +238,8 @@ impl Qwen4ExpModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// Runs a plain decode step (one token per sequence, paged, no speculation) as a replayed
-    /// HIP graph; `None` when the step doesn't qualify and must run eagerly.
+    /// Runs a decode step (one token per sequence, or a speculative verify step's few tokens,
+    /// paged) as a replayed HIP graph; `None` when the step doesn't qualify and must run eagerly.
     #[cfg(feature = "rocm")]
     fn try_decode_graph<F>(
         &self,
@@ -252,18 +252,21 @@ impl Qwen4ExpModel {
     {
         use rocm_graph::{CaptureHooks, StepInputs};
         let device = &self.text.device;
-        let Ok((batch, 1)) = input_ids.dims2() else {
+        let Ok((batch, tokens)) = input_ids.dims2() else {
             return Ok(None);
+        };
+        // Plain decode steps carry one token per sequence; verify steps of an attached MTP
+        // proposer carry 1 + n_draft and store their speculative outputs for the drafter.
+        let batch_kind = match (ctx.recurrent_batch_kind(), self.text.store_spec_hidden_enabled()) {
+            (Some(kind @ crate::pipeline::RecurrentBatchKind::Decode), false) if tokens == 1 => kind,
+            (Some(kind @ crate::pipeline::RecurrentBatchKind::SpeculativeDecode), true) => kind,
+            _ => return Ok(None),
         };
         if !rocm_graph::enabled()
             || !device.is_rocm()
             || batch > rocm_graph::MAX_GRAPH_BATCH
-            || self.decode_graphs.has_failed(batch)
-            || self.text.store_spec_hidden_enabled()
-            || !matches!(
-                ctx.recurrent_batch_kind(),
-                Some(crate::pipeline::RecurrentBatchKind::Decode)
-            )
+            || tokens > rocm_graph::MAX_GRAPH_TOKENS
+            || self.decode_graphs.has_failed((batch, tokens))
             || !self.text.runs_on_one_device()
         {
             return Ok(None);
@@ -285,10 +288,15 @@ impl Qwen4ExpModel {
         };
         let positions = match metadata.rope_positions.as_ref().and_then(|t| t.get(&location)) {
             Some(positions) => positions.clone(),
-            None => crate::pipeline::decode_positions_tensor(ctx.position_ids(), 1, device)?,
+            None => crate::pipeline::decode_positions_tensor(ctx.position_ids(), tokens, device)?,
         };
+        let timing = std::env::var_os("MISTRALRS_GRAPH_TIMING").is_some();
+        let t_prep = std::time::Instant::now();
         let state_indices = recurrent.state_indices().to_device(device)?;
         let ple = self.text.decode_ple_embeddings(input_ids)?;
+        if timing {
+            eprintln!("GRAPH_PREP ple_host={:.3}ms", t_prep.elapsed().as_secs_f64() * 1e3);
+        }
         let step = StepInputs {
             input_ids,
             block_tables,
@@ -315,6 +323,9 @@ impl Qwen4ExpModel {
                     max_blocks: self.text.max_seq_len.div_ceil(block_size),
                     set_ple: &|emb| self.text.set_ple_pending_embeddings(emb),
                     set_state_indices: &|indices| self.text.replace_state_indices(indices),
+                    batch_kind,
+                    take_spec: &|| self.text.take_spec_graph_state(),
+                    install_spec: &|state| self.text.install_spec_graph_state(state),
                     forward,
                 },
             )

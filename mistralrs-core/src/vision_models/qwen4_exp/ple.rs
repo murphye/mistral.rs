@@ -700,10 +700,12 @@ impl PleTable {
                 let row_bytes = format.row_bytes(self.head_dim);
                 let bytes = archive.tensor_data(GGUF_TABLE_NAME)?.bytes();
                 let mut out = vec![0f32; rows.len() * self.head_dim];
-                // Rows not in the page cache each fault in from disk; a prompt touches
-                // thousands, so fault them in parallel to keep the drive's queue full.
+                // Rows not in the page cache each fault in from disk (~100 us), and new
+                // n-grams hash to cold rows, so every row gets its own task: a decode step's
+                // few dozen faults then overlap instead of running one after another, which
+                // matters once the step's kernels sit in a graph waiting on this gather.
                 out.par_chunks_exact_mut(self.head_dim)
-                    .with_min_len(16)
+                    .with_max_len(1)
                     .zip(rows.par_iter())
                     .try_for_each(|(dst, &row)| -> Result<()> {
                         let offset = row as usize * row_bytes;
