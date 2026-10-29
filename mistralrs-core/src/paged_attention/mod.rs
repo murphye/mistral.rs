@@ -659,6 +659,20 @@ impl CacheDeviceAllocation<'_> {
     }
 }
 
+/// Device memory the ROCm allocator holds back from live allocations: candle's block cache
+/// bound (`CANDLE_ROCM_BLOCK_CACHE_MB`) plus a margin for pool fragmentation.
+fn rocm_allocator_retention_bytes() -> usize {
+    const FRAGMENTATION_MARGIN: usize = 256 << 20;
+    #[cfg(feature = "rocm")]
+    {
+        candle_core::rocm_backend::hip::block_cache_max_bytes() + FRAGMENTATION_MARGIN
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        FRAGMENTATION_MARGIN
+    }
+}
+
 fn cache_device_allocations<'a>(
     config: &dyn ModelConfigLike,
     cache_dtype: DType,
@@ -829,6 +843,15 @@ pub fn calculate_cache_config(
             memory_reservations.primary_device_bytes
         } else {
             memory_reservations.secondary_device_bytes
+        };
+        // candle's ROCm stream keeps freed blocks for reuse up to a bound, and the HIP pool
+        // fragments; that memory never reaches a live allocation, so the KV cache cannot
+        // take it. Running out of device memory under HIP's stream-ordered allocator has
+        // faulted the process rather than returning an error.
+        let reserved = if cache_device.is_rocm() {
+            reserved.saturating_add(rocm_allocator_retention_bytes())
+        } else {
+            reserved
         };
         let affine = if cache_device.is_cuda() {
             mistralrs_quant::gguf_affine_budget_bytes(cache_device, dtype)
