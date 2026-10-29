@@ -104,6 +104,39 @@ impl GatedResidual {
             .to_dtype(xn.dtype())
     }
 
+    /// [`Self::mix`] and [`Self::inject`] together. On ROCm decode batches both run as two
+    /// fused launches over the quantized weights instead of eight small ones.
+    pub(super) fn mix_inject(&self, xn: &Tensor) -> Result<(Tensor, Tensor)> {
+        #[cfg(feature = "rocm")]
+        if let Some(fused) = self.mix_inject_fused(xn)? {
+            return Ok(fused);
+        }
+        Ok((self.mix(xn)?, self.inject(xn)?))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn mix_inject_fused(&self, xn: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
+        use candle_core::quantized::rocm::{qgemv_gate_mean, qgemv_pair};
+        let Some(inject) = &self.inject else {
+            return Ok(None);
+        };
+        let (Some(down), Some(up), Some(inject)) =
+            (self.down.get_qtensor(), self.up.get_qtensor(), inject.get_qtensor())
+        else {
+            return Ok(None);
+        };
+        if !xn.device().is_rocm() {
+            return Ok(None);
+        }
+        let Some((lo, logits)) = qgemv_pair(xn, &down, Some(1.0 / self.hc as f32), &inject)? else {
+            return Ok(None);
+        };
+        let Some(h) = qgemv_gate_mean(&lo, &up, xn, self.hc)? else {
+            return Ok(None);
+        };
+        Ok(Some((h, logits)))
+    }
+
     /// Raw per-stream injection logits `[.., hc]`.
     pub(super) fn inject(&self, xn: &Tensor) -> Result<Tensor> {
         self.inject

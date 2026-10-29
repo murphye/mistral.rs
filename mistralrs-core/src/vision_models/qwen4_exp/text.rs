@@ -1030,8 +1030,7 @@ impl Qwen4ExpTextModel {
                 Some(xn) if xn.device().same_device(res.device()) => xn,
                 _ => layer.attn_hc.norm(&res)?,
             };
-            let h = layer.attn_hc.mix(&xn)?;
-            let inject = layer.attn_hc.inject(&xn)?;
+            let (h, inject) = layer.attn_hc.mix_inject(&xn)?;
             let out = match &layer.mixer {
                 Mixer::Attention(attn) => {
                     let Some(HybridLayerCache::Attention(kv_cache)) = hybrid_cache.get_mut(i)
@@ -1127,8 +1126,7 @@ impl Qwen4ExpTextModel {
                 Some(xn) => xn,
                 None => layer.mlp_hc.norm(&res)?,
             };
-            let h = layer.mlp_hc.mix(&xn)?;
-            let inject = layer.mlp_hc.inject(&xn)?;
+            let (h, inject) = layer.mlp_hc.mix_inject(&xn)?;
             let out = layer.moe.forward(&h)?;
             let next = match self.layers.get(i + 1) {
                 Some(next) if next.ple.is_none() => Some(&next.attn_hc),
