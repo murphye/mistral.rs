@@ -223,6 +223,17 @@ impl SparseMoeBlock {
                 &slot_weights,
                 &slot_ids,
             )?;
+            expert_stats::record(
+                &slot_ids,
+                b_size * seq_len,
+                self.num_experts_per_tok,
+                self.experts.num_experts(),
+            )?;
+            expert_stats::record_histogram(
+                &slot_ids,
+                self.num_experts_per_tok,
+                self.experts.num_experts(),
+            )?;
             if let Some(out) =
                 self.forward_rocm_fused(xs, &xs_flat, &slot_ids, &slot_weights, seed)?
             {
@@ -341,6 +352,121 @@ impl SparseMoeBlock {
             return self.all_reduce.sum_all_reduce(&out.contiguous()?).map(Some);
         }
         Ok(Some(out))
+    }
+}
+
+/// `MISTRALRS_EXPERT_STATS=<rows per sequence>`: on 9..=64-row batches (speculative verify
+/// steps), count the distinct routed experts per MoE call, over the whole batch and within each
+/// sequence's consecutive rows, and print a running summary every 480 calls. The routing table's
+/// host copy is a device sync, so this is a measurement mode: run it with decode graphs off.
+#[cfg(feature = "rocm")]
+mod expert_stats {
+    use candle_core::{Result, Tensor};
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    struct Totals {
+        calls: u64,
+        rows: u64,
+        pairs: u64,
+        distinct: u64,
+        seq_distinct: u64,
+    }
+    static TOTALS: Mutex<Totals> =
+        Mutex::new(Totals { calls: 0, rows: 0, pairs: 0, distinct: 0, seq_distinct: 0 });
+
+    fn rows_per_seq() -> Option<usize> {
+        static ROWS: OnceLock<Option<usize>> = OnceLock::new();
+        *ROWS.get_or_init(|| {
+            if crate::distributed::is_daemon() {
+                return None;
+            }
+            std::env::var("MISTRALRS_EXPERT_STATS").ok()?.parse().ok().filter(|r| *r > 0)
+        })
+    }
+
+    pub(super) fn record(ids: &Tensor, rows: usize, top_k: usize, num_experts: usize) -> Result<()> {
+        let Some(group) = rows_per_seq() else {
+            return Ok(());
+        };
+        if !(9..=64).contains(&rows) {
+            return Ok(());
+        }
+        let ids = ids.to_vec2::<u32>()?;
+        let mut all = HashSet::new();
+        let mut seq_distinct = 0u64;
+        for chunk in ids.chunks(group) {
+            let mut seq = HashSet::new();
+            for row in chunk {
+                for &e in row.iter().take(top_k).filter(|e| (**e as usize) < num_experts) {
+                    seq.insert(e);
+                    all.insert(e);
+                }
+            }
+            seq_distinct += seq.len() as u64;
+        }
+        let mut t = TOTALS.lock().unwrap();
+        t.calls += 1;
+        t.rows += rows as u64;
+        t.pairs += (rows * top_k) as u64;
+        t.distinct += all.len() as u64;
+        t.seq_distinct += seq_distinct;
+        if t.calls.is_multiple_of(480) {
+            let c = t.calls as f64;
+            eprintln!(
+                "EXPERT_STATS calls={} rows/call={:.1} pairs/call={:.1} distinct/call={:.1} ({:.0}% of pairs) \
+                 per-seq distinct/call={:.1} ({:.0}% of pairs)",
+                t.calls,
+                t.rows as f64 / c,
+                t.pairs as f64 / c,
+                t.distinct as f64 / c,
+                100.0 * t.distinct as f64 / t.pairs as f64,
+                t.seq_distinct as f64 / c,
+                100.0 * t.seq_distinct as f64 / t.pairs as f64,
+            );
+        }
+        Ok(())
+    }
+
+    /// `MISTRALRS_EXPERT_HISTOGRAM=<num_experts>:<path>`: count how often each expert of the
+    /// `<num_experts>`-expert tables is routed to, on every ROCm decode-path call, and rewrite
+    /// `<path>` as a JSON array every 200 calls. Choosing the table by its expert count keeps the
+    /// host copy out of captured graphs: the MTP head (512 experts) drafts eagerly.
+    pub(super) fn record_histogram(ids: &Tensor, top_k: usize, num_experts: usize) -> Result<()> {
+        static TARGET: OnceLock<Option<(usize, String)>> = OnceLock::new();
+        static COUNTS: Mutex<(u64, Vec<u64>)> = Mutex::new((0, Vec::new()));
+        let target = TARGET.get_or_init(|| {
+            if crate::distributed::is_daemon() {
+                return None;
+            }
+            let spec = std::env::var("MISTRALRS_EXPERT_HISTOGRAM").ok()?;
+            let (experts, path) = spec.split_once(':')?;
+            Some((experts.parse().ok()?, path.to_string()))
+        });
+        let Some((experts, path)) = target else {
+            return Ok(());
+        };
+        if *experts != num_experts {
+            return Ok(());
+        }
+        let ids = ids.to_vec2::<u32>()?;
+        let mut guard = COUNTS.lock().unwrap();
+        let (calls, counts) = &mut *guard;
+        counts.resize(num_experts, 0);
+        for row in &ids {
+            for &e in row.iter().take(top_k).filter(|e| (**e as usize) < num_experts) {
+                counts[e as usize] += 1;
+            }
+        }
+        *calls += 1;
+        if calls.is_multiple_of(200) {
+            let json = format!(
+                "[{}]",
+                counts.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
+            );
+            let _ = std::fs::write(path, json);
+        }
+        Ok(())
     }
 }
 
