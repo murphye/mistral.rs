@@ -154,6 +154,35 @@ fn has_incomplete_utf8_tail(bytes: &[u8]) -> bool {
     false
 }
 
+/// With `MISTRALRS_TOKEN_DUMP=<path>`, append one JSON line per finished sequence holding its
+/// prompt length and every token id. Offline analysis (drafting acceptance, n-gram reuse) needs the
+/// exact ids, which the HTTP API does not return. A tensor-parallel worker runs the same sequences,
+/// so only the leader writes, and each line goes out in one write so appends cannot interleave.
+fn dump_finished_tokens(prompt_len: usize, tokens: &[u32]) {
+    static DUMP: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let dump = DUMP.get_or_init(|| {
+        if crate::distributed::is_daemon() {
+            return None;
+        }
+        let path = std::env::var_os("MISTRALRS_TOKEN_DUMP")?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(std::sync::Mutex::new)
+    });
+    if let Some(file) = dump {
+        use std::io::Write;
+        let line = format!(
+            "{}\n",
+            serde_json::json!({ "prompt_len": prompt_len, "tokens": tokens })
+        );
+        let _ = file.lock().unwrap().write_all(line.as_bytes());
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SequenceState {
     Done(StopReason),
@@ -1700,6 +1729,7 @@ impl Sequence {
             if !matches!(self.getstate(), SequenceState::Done(_)) {
                 metrics::counter!("mistralrs_sequences_completed_total", "reason" => reason.metric_label())
                     .increment(1);
+                dump_finished_tokens(self.prompt_len, self.get_toks());
             }
         }
         *self.state.write().unwrap() = state;
