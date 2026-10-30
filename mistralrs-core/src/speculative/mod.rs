@@ -52,3 +52,28 @@ mod tests {
         assert_eq!(config.n_predict, Some(3));
     }
 }
+
+/// Temporary phase timing: with `MISTRALRS_SPEC_TIMING` set, synchronize the GPUs and log
+/// how long the phase that began at `start` took.
+pub(crate) fn spec_timing(phase: &str, start: std::time::Instant) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("MISTRALRS_SPEC_TIMING").is_some()) {
+        return;
+    }
+    let host = start.elapsed().as_secs_f64() * 1e3;
+    #[cfg(feature = "rocm")]
+    {
+        static DEVICES: std::sync::OnceLock<Vec<candle_core::Device>> = std::sync::OnceLock::new();
+        for device in DEVICES.get_or_init(|| {
+            (0..2)
+                .filter_map(|ordinal| candle_core::Device::new_rocm(ordinal).ok())
+                .collect()
+        }) {
+            let _ = device.synchronize();
+        }
+    }
+    eprintln!(
+        "SPEC_TIMING {phase} {:.2}ms host {host:.2}ms",
+        start.elapsed().as_secs_f64() * 1e3
+    );
+}
