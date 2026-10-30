@@ -699,7 +699,6 @@ fn recurrence_rocm_from_convolved(
     cache: &mut GdnLayerCache,
     dtype: DType,
 ) -> Result<Tensor> {
-    use crate::rocm::gdn::RecurrenceKernel;
 
     let mixed_qkv = mixed_qkv.contiguous()?;
     let (b, a) = if seq_len == 1 {
@@ -778,14 +777,7 @@ fn recurrence_rocm_from_convolved(
             g: &g_bh,
             beta: &beta_bh,
         };
-        let kernel =
-            if seq_len >= RECURRENCE_CHUNK_THRESHOLD && matches!(dims.head_k_dim, 64 | 128) {
-                RecurrenceKernel::Warp
-            } else if seq_len >= RECURRENCE_CHUNK_THRESHOLD {
-                RecurrenceKernel::Chunked
-            } else {
-                RecurrenceKernel::Scalar
-            };
+        let kernel = rocm_prefill_recurrence_kernel(seq_len, dims.head_k_dim);
         crate::rocm::gdn::gated_delta_rule_recurrence_rocm(kernel, inputs, &mut state_flat, slots)?
     };
     finish_recurrence(
@@ -797,6 +789,32 @@ fn recurrence_rocm_from_convolved(
         cache,
         dtype,
     )
+}
+
+/// The ROCm recurrence kernel for a step of `seq_len` tokens: the CUDA key-major policy
+/// (one warp per value column above the chunk threshold), or `MISTRALRS_GDN_PREFILL_KERNEL`
+/// = `scalar` (one thread per value column, state in registers) | `warp` | `chunked`.
+#[cfg(feature = "rocm")]
+fn rocm_prefill_recurrence_kernel(
+    seq_len: usize,
+    head_k_dim: usize,
+) -> crate::rocm::gdn::RecurrenceKernel {
+    use crate::rocm::gdn::RecurrenceKernel;
+    if seq_len >= RECURRENCE_CHUNK_THRESHOLD {
+        match std::env::var("MISTRALRS_GDN_PREFILL_KERNEL").as_deref() {
+            Ok("scalar") => return RecurrenceKernel::Scalar,
+            Ok("warp") => return RecurrenceKernel::Warp,
+            Ok("chunked") => return RecurrenceKernel::Chunked,
+            _ => {}
+        }
+    }
+    if seq_len >= RECURRENCE_CHUNK_THRESHOLD && matches!(head_k_dim, 64 | 128) {
+        RecurrenceKernel::Warp
+    } else if seq_len >= RECURRENCE_CHUNK_THRESHOLD {
+        RecurrenceKernel::Chunked
+    } else {
+        RecurrenceKernel::Scalar
+    }
 }
 
 /// Key-major recurrence with the CUDA kernels compiled for ROCm.
@@ -814,7 +832,6 @@ fn recurrence_rocm(
     cache: &mut GdnLayerCache,
     dtype: DType,
 ) -> Result<Tensor> {
-    use crate::rocm::gdn::RecurrenceKernel;
 
     let q_bh = prepare_q_for_backend(q, dims, batch_size, seq_len)?;
     let k_bh = prepare_kv_for_backend(k, dims, batch_size, seq_len, dims.head_k_dim)?;
@@ -830,14 +847,7 @@ fn recurrence_rocm(
         g: &g_bh,
         beta: &beta_bh,
     };
-    // Same policy as the CUDA backend's key-major path.
-    let kernel = if seq_len >= RECURRENCE_CHUNK_THRESHOLD && matches!(dims.head_k_dim, 64 | 128) {
-        RecurrenceKernel::Warp
-    } else if seq_len >= RECURRENCE_CHUNK_THRESHOLD {
-        RecurrenceKernel::Chunked
-    } else {
-        RecurrenceKernel::Scalar
-    };
+    let kernel = rocm_prefill_recurrence_kernel(seq_len, dims.head_k_dim);
     let out_bh =
         crate::rocm::gdn::gated_delta_rule_recurrence_rocm(kernel, inputs, &mut state_flat, slots)?;
     finish_recurrence(
