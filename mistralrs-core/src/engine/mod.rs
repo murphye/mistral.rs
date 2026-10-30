@@ -149,6 +149,9 @@ impl FromStr for SearchEmbeddingModel {
 }
 
 const SEED: u64 = 0;
+/// Admission budget rank 0 broadcasts when it leaves its loop; the workers then leave theirs.
+const ADMISSION_TERMINATE: usize = u32::MAX as usize;
+
 /// Terminate all sequences on the next scheduling step. Be sure to reset this.
 /// This is a global flag for terminating all engines at once (e.g., Ctrl+C).
 pub static TERMINATE_ALL_NEXT_STEP: AtomicBool = AtomicBool::new(false);
@@ -1210,6 +1213,7 @@ impl Engine {
                     }
                 }
                 self.replicate_request_to_daemons(&Request::Terminate);
+                self.release_mirroring_workers();
                 break 'lp;
             }
 
@@ -1235,6 +1239,7 @@ impl Engine {
                     }
                 }
                 self.replicate_request_to_daemons(&request);
+                self.release_mirroring_workers();
                 break 'lp;
             }
 
@@ -1244,6 +1249,7 @@ impl Engine {
                     break;
                 };
                 if !self.dispatch_prepared_request(request).await {
+                    self.release_mirroring_workers();
                     break 'lp;
                 }
                 dispatches += 1;
@@ -1257,6 +1263,11 @@ impl Engine {
                 match tp_timing::barrier("worker", || {
                     mistralrs_quant::distributed::broadcast_from_first_rank(0)
                 }) {
+                    Ok(ADMISSION_TERMINATE) => {
+                        // Rank 0 is shutting down; leave with it so no collective of this rank
+                        // ever waits for a peer that is gone.
+                        break 'lp;
+                    }
                     Ok(budget) => {
                         if !self.await_replicated_requests(&mut pending, budget).await {
                             break 'lp;
@@ -1288,6 +1299,7 @@ impl Engine {
                     break;
                 };
                 if !self.dispatch_prepared_request(request).await {
+                    self.release_mirroring_workers();
                     break 'lp;
                 }
                 dispatches += 1;
@@ -1330,10 +1342,12 @@ impl Engine {
                     }
                 }
                 if channel_disconnected {
+                    self.release_mirroring_workers();
                     break 'lp;
                 }
                 if should_terminate() {
                     self.replicate_request_to_daemons(&Request::Terminate);
+                    self.release_mirroring_workers();
                     break 'lp;
                 }
                 enum WaitEvent {
@@ -1366,7 +1380,10 @@ impl Engine {
                         tokio::task::yield_now().await;
                         continue;
                     }
-                    WaitEvent::Request(None) => break 'lp,
+                    WaitEvent::Request(None) => {
+                        self.release_mirroring_workers();
+                        break 'lp;
+                    }
                     WaitEvent::Wake => {
                         continue;
                     }
@@ -2588,6 +2605,20 @@ impl Engine {
             Ok(SequenceRecognizer::Llguidance(Box::new(llg)))
         } else {
             Ok(SequenceRecognizer::None)
+        }
+    }
+
+    /// Rank 0's last admission broadcast: the workers wait in `broadcast_from_first_rank` at the
+    /// top of every iteration, and a worker left waiting when rank 0 exits sits in a collective
+    /// until it traps. The sentinel makes them leave their loops instead.
+    fn release_mirroring_workers(&self) {
+        if !distributed::is_daemon() && mistralrs_quant::distributed::mirrors_first_rank_admission()
+        {
+            if let Err(err) =
+                mistralrs_quant::distributed::broadcast_from_first_rank(ADMISSION_TERMINATE)
+            {
+                tracing::warn!("Failed to release tensor-parallel workers: {err}");
+            }
         }
     }
 

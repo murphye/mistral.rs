@@ -30,6 +30,8 @@ pub(crate) const IS_DAEMON_FLAG: &str = "__MISTRALRS_DAEMON_INTERNAL";
 const MISTRALRS_MN_GLOBAL_WORLD_SIZE: &str = "MISTRALRS_MN_GLOBAL_WORLD_SIZE";
 const MISTRALRS_MN_LOCAL_WORLD_SIZE: &str = "MISTRALRS_MN_LOCAL_WORLD_SIZE";
 const WORKER_READY_CONNECT_ATTEMPTS: usize = 200;
+/// Pause between a worker's attempts to reach the leader's replication endpoint.
+const DAEMON_CONNECT_RETRY_US: u64 = 200;
 const WORKER_READY_CONNECT_SLEEP_MS: u64 = 50;
 
 static TP_SESSION: OnceLock<Mutex<TensorParallelSession>> = OnceLock::new();
@@ -208,7 +210,13 @@ pub fn nccl_daemon_replicator(request_sender: Sender<Request>) {
                         continue;
                     }
                 };
-                if let Ok(stream) = LocalStream::connect(name) {
+                let Ok(stream) = LocalStream::connect(name) else {
+                    // The leader listens only while it replicates a request; retrying without
+                    // a pause pins a core for the whole run.
+                    std::thread::sleep(Duration::from_micros(DAEMON_CONNECT_RETRY_US));
+                    continue;
+                };
+                {
                     let mut reader = BufReader::new(stream);
                     let mut buf = String::new();
                     if let Err(e) = reader.read_line(&mut buf) {
@@ -254,7 +262,13 @@ pub fn nccl_daemon_replicator_mistralrs(mistralrs: Arc<crate::MistralRs>) {
                         continue;
                     }
                 };
-                if let Ok(stream) = LocalStream::connect(name) {
+                let Ok(stream) = LocalStream::connect(name) else {
+                    // The leader listens only while it replicates a request; retrying without
+                    // a pause pins a core for the whole run.
+                    std::thread::sleep(Duration::from_micros(DAEMON_CONNECT_RETRY_US));
+                    continue;
+                };
+                {
                     let mut reader = BufReader::new(stream);
                     let mut buf = String::new();
                     if let Err(e) = reader.read_line(&mut buf) {
@@ -494,11 +508,15 @@ fn spawn_tensor_parallel_workers(ids: &[mistralrs_quant::Id]) -> anyhow::Result<
 }
 
 fn spawn_worker_and_reap(cmd: &mut Command) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    cmd.env(DAEMON_IPC_NAME_ENV, ipc_name_string());
     let mut child = cmd.spawn().context("Failed to spawn process")?;
+    LIVE_WORKERS.fetch_add(1, Ordering::AcqRel);
     std::thread::spawn(move || {
         if let Err(e) = child.wait() {
             tracing::error!("Failed to wait for worker process: {e}");
         }
+        LIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
     });
     Ok(())
 }
@@ -559,9 +577,39 @@ fn send_worker_ready() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Workers inherit the leader's endpoint name through this variable.
+const DAEMON_IPC_NAME_ENV: &str = "MISTRALRS_DAEMON_IPC_NAME";
+
+/// One endpoint per leader process: a worker that outlives an earlier leader must not be able
+/// to connect to the next leader's ready handshake, which would block it forever.
+fn ipc_name_string() -> String {
+    env::var(DAEMON_IPC_NAME_ENV)
+        .unwrap_or_else(|_| format!("mistralrs_daemon_{}.sock", std::process::id()))
+}
+
 pub(crate) fn ipc_name() -> anyhow::Result<Name<'static>> {
-    let printname = "mistralrs_daemon.sock";
-    Ok(printname.to_ns_name::<GenericNamespaced>()?)
+    Ok(ipc_name_string().to_ns_name::<GenericNamespaced>()?)
+}
+
+/// Workers spawned by this process that have not exited yet.
+static LIVE_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Waits until every worker this leader spawned has exited, or `timeout` passes. Workers exit
+/// once their engine has processed the leader's terminate request, after their last collective,
+/// so the leader's GPU state (which the peer collectives read) stays valid until then.
+pub fn wait_for_workers(timeout: Duration) {
+    use std::sync::atomic::Ordering;
+    let deadline = std::time::Instant::now() + timeout;
+    while LIVE_WORKERS.load(Ordering::Acquire) > 0 {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "{} tensor parallel worker(s) still running after {timeout:?}",
+                LIVE_WORKERS.load(Ordering::Acquire)
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 pub(crate) enum DistributedWeightSource<'a> {
@@ -683,7 +731,6 @@ pub(crate) fn prepare_distributed_mapper<T: DeviceMappedModelLoader + IsqModelLo
     } else {
         id = mistralrs_quant::Id::new();
         let num_workers = global_world_size - 1;
-        let mut children = Vec::new();
         for worker_rank in 0..num_workers {
             let exe_path = env::current_exe().expect("Failed to get current exe");
 
@@ -706,7 +753,7 @@ pub(crate) fn prepare_distributed_mapper<T: DeviceMappedModelLoader + IsqModelLo
             }
             cmd.stdin(std::process::Stdio::null());
 
-            children.push(cmd.spawn().expect("Failed to spawn process"));
+            spawn_worker_and_reap(&mut cmd)?;
         }
 
         let listener = ListenerOptions::new().name(name).create_sync()?;

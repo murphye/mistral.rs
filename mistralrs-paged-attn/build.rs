@@ -316,13 +316,19 @@ fn main() -> Result<()> {
         anyhow::bail!("paged attention on ROCm needs a wave32 (gfx10/gfx11/gfx12) target");
     }
 
+    let extra_flags: Vec<String> = std::env::var("DEP_CANDLE_ROCM_KERNELS_HIPCC_FLAGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
     let hipcc = rocm_path.join("bin/hipcc");
     let objects = std::thread::scope(|scope| -> Result<Vec<PathBuf>> {
         let jobs: Vec<_> = ROCM_SOURCES
             .iter()
             .map(|src| {
-                let (hipcc, hip_compat, archs, out_dir) = (&hipcc, &hip_compat, &archs, &out_dir);
+                let (hipcc, hip_compat, archs, out_dir, extra_flags) =
+                    (&hipcc, &hip_compat, &archs, &out_dir, &extra_flags);
                 scope.spawn(move || -> Result<PathBuf> {
                     let stem = std::path::Path::new(src)
                         .file_stem()
@@ -347,6 +353,7 @@ fn main() -> Result<()> {
                     for arch in archs {
                         cmd.arg(format!("--offload-arch={arch}"));
                     }
+                    cmd.args(extra_flags);
                     let output = cmd.arg("-o").arg(&obj).arg(src).output()?;
                     if !output.status.success() {
                         anyhow::bail!(

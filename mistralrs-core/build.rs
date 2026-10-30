@@ -274,6 +274,11 @@ fn build_rocm_kernels() {
         .filter(|arch| !arch.is_empty())
         .map(String::from)
         .collect();
+    let extra_flags: Vec<String> = std::env::var("DEP_CANDLE_ROCM_KERNELS_HIPCC_FLAGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let hipcc = rocm_path.join("bin/hipcc");
 
@@ -281,7 +286,8 @@ fn build_rocm_kernels() {
         let jobs: Vec<_> = ROCM_SOURCES
             .iter()
             .map(|src| {
-                let (hipcc, hip_compat, archs, out_dir) = (&hipcc, &hip_compat, &archs, &out_dir);
+                let (hipcc, hip_compat, archs, out_dir, extra_flags) =
+                    (&hipcc, &hip_compat, &archs, &out_dir, &extra_flags);
                 scope.spawn(move || {
                     let stem = std::path::Path::new(src)
                         .file_stem()
@@ -299,6 +305,7 @@ fn build_rocm_kernels() {
                     for arch in archs {
                         cmd.arg(format!("--offload-arch={arch}"));
                     }
+                    cmd.args(extra_flags);
                     let output = cmd
                         .arg("-o")
                         .arg(&obj)

@@ -718,6 +718,26 @@ impl Drop for MistralRs {
                 engine.terminate();
             }
         }
+        // Tensor parallel workers read this process's buffers in their peer collectives; let them
+        // process the replicated terminate (after their in-flight step) and exit before this
+        // process tears its GPU state down, or they trap and dump a GPU core.
+        if !distributed::is_daemon() {
+            distributed::wait_for_workers(std::time::Duration::from_secs(20));
+        }
+    }
+}
+
+/// A tensor parallel worker whose engine has finished (the leader's terminate request) exits
+/// here: the leader waits for the worker processes before it releases its own GPU state.
+fn exit_terminated_worker() {
+    if distributed::is_daemon() {
+        info!("tensor parallel worker engine terminated; exiting");
+        #[cfg(unix)]
+        unsafe {
+            libc::_exit(0)
+        };
+        #[cfg(not(unix))]
+        std::process::exit(0);
     }
 }
 
@@ -1270,6 +1290,7 @@ impl MistralRs {
                         }
                     };
                     Arc::new(engine).run().await;
+                    exit_terminated_worker();
                 })
             });
 
@@ -1310,6 +1331,7 @@ impl MistralRs {
                         }
                     };
                     Arc::new(engine).run().await;
+                    exit_terminated_worker();
                 })
             }
         });
@@ -1618,8 +1640,21 @@ impl MistralRs {
                 distributed::nccl_daemon_replicator(request_sender);
             }
 
-            #[allow(clippy::empty_loop)]
-            loop {}
+            // The replicator threads do the work. The main thread only watches the leader:
+            // a worker that outlives it keeps its GPU's memory and the next leader stalls in
+            // the RCCL bootstrap, so exit once the parent process is gone (re-parented).
+            #[cfg(unix)]
+            let leader = unsafe { libc::getppid() };
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                #[cfg(unix)]
+                if unsafe { libc::getppid() } != leader {
+                    tracing::info!("tensor parallel leader exited; worker shutting down");
+                    // Not `exit`: HIP's atexit teardown can block on a queue whose collective
+                    // kernel lost its peer. The kernel reclaims the GPU state either way.
+                    unsafe { libc::_exit(0) };
+                }
+            }
         }
 
         // Determine if the current runtime is multi-threaded, as blocking operations are not allowed in single-threaded mode
