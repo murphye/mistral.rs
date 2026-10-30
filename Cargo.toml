@@ -37,11 +37,11 @@ rust-version = "1.94"
 # candle-metal-kernels = { version = "0.11.0" }
 # ROCm support lives on the rocm-backend branch of murphye/candle. To develop
 # against a sibling checkout instead, swap in the path dependencies below.
-candle-core = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "d3a1be5f307fcd83ff0ed8989c674b1f6936a8c0" }
-candle-nn = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "d3a1be5f307fcd83ff0ed8989c674b1f6936a8c0" }
-candle-flash-attn-v3 = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "d3a1be5f307fcd83ff0ed8989c674b1f6936a8c0" }
-candle-metal-kernels = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "d3a1be5f307fcd83ff0ed8989c674b1f6936a8c0" }
-candle-rocm-kernels = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "d3a1be5f307fcd83ff0ed8989c674b1f6936a8c0" }
+candle-core = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "2d7885f296bfd852dce7094c0d09c6c7077de679" }
+candle-nn = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "2d7885f296bfd852dce7094c0d09c6c7077de679" }
+candle-flash-attn-v3 = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "2d7885f296bfd852dce7094c0d09c6c7077de679" }
+candle-metal-kernels = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "2d7885f296bfd852dce7094c0d09c6c7077de679" }
+candle-rocm-kernels = { git = "https://github.com/murphye/candle.git", version = "0.11.0", rev = "2d7885f296bfd852dce7094c0d09c6c7077de679" }
 # candle-core = { path = "../candle/candle-core", version = "0.11.0" }
 # candle-nn = { path = "../candle/candle-nn", version = "0.11.0" }
 # candle-flash-attn-v3 = { path = "../candle/candle-flash-attn-v3", version = "0.11.0" }
