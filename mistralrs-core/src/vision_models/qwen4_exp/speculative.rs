@@ -31,6 +31,34 @@ fn max_verify_graph_batch(depth: usize) -> usize {
     }
 }
 
+/// Prefix-cache replay while the built-in MTP head is attached.
+///
+/// The head's KV for a block depends on the token after it (its inputs are shifted by one), which
+/// the target-only block hashes do not cover, so the shared default replays the whole prefix
+/// (`BUILTIN_MTP_PREFIX_REPLAY`) and a cached conversation pays a full prefill on every turn.
+/// Here the default keeps the hit and recomputes only its last block: that refreshes the head's
+/// KV for the final prompt tokens and the pending prompt tail it drafts from, while an interior
+/// block whose cached head KV was written under a different continuation can only lower draft
+/// acceptance, never change the verified output. `MISTRALRS_QWEN4EXP_MTP_PREFIX_REPLAY=full`
+/// restores the full replay.
+fn mtp_prefix_replay() -> SpeculativePrefixReplay {
+    static REPLAY: std::sync::OnceLock<SpeculativePrefixReplay> = std::sync::OnceLock::new();
+    *REPLAY.get_or_init(|| {
+        match std::env::var("MISTRALRS_QWEN4EXP_MTP_PREFIX_REPLAY")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("full") => BUILTIN_MTP_PREFIX_REPLAY,
+            // One token short of the hit: the clamp floors to a block boundary, so the hit's
+            // last block is replayed whatever the paged block size.
+            _ => SpeculativePrefixReplay::Suffix(1),
+        }
+    })
+}
+
 impl Qwen4ExpModel {
     fn mtp_n_predict(&self) -> usize {
         self.mtp_n_predict.load(Ordering::Relaxed)
@@ -150,7 +178,7 @@ impl SpeculativeTargetMixin for Qwen4ExpModel {
 
     fn speculative_prefix_replay(&self) -> SpeculativePrefixReplay {
         if self.mtp_n_predict() > 0 {
-            BUILTIN_MTP_PREFIX_REPLAY
+            mtp_prefix_replay()
         } else {
             SpeculativePrefixReplay::NotRequired
         }

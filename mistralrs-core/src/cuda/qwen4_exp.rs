@@ -1444,7 +1444,8 @@ mod tests {
     fn qsa_reopened_block_matches_fresh_prefill() -> Result<()> {
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
-        let aux_dim = QSA_HEAD_DIM + 2 * HALF_ROT;
+        // One raw indexer-key row: int8 per element plus an f32 scale.
+        let raw_row_bytes = QSA_HEAD_DIM + 4;
         let head_dim = u32::try_from(QSA_HEAD_DIM).unwrap();
         let half_rot = u32::try_from(HALF_ROT).unwrap();
         let raw = (Tensor::arange(0u32, u32::try_from(TOKENS).unwrap() * head_dim, &device)?
@@ -1477,11 +1478,30 @@ mod tests {
         let full_layout = TokenLayout::from_host(&[(0, TOKENS)], &[TOKENS], TOKENS, &device)?;
         let suffix_layout =
             TokenLayout::from_host(&[(0, REPLACED_TOKENS)], &[TOKENS], REPLACED_TOKENS, &device)?;
-        let aux = Tensor::zeros((SLOTS, aux_dim), dtype, &device)?;
+        // One sequence in recurrent state slot 0 with a single checkpoint lane; its carry holds
+        // the raw keys of the open block and the one before it.
+        let state_slots = Tensor::new(&[0u32], &device)?;
+        let lanes = 1usize;
+        let block_cs = Tensor::zeros((SLOTS / RATIO, 2 * HALF_ROT), dtype, &device)?;
+        let carry = Tensor::zeros((2 * RATIO, raw_row_bytes), DType::U8, &device)?;
         let keys = Tensor::zeros((SLOTS / RATIO, QSA_HEAD_DIM), dtype, &device)?;
-        let finalize = |aux: &Tensor, keys: &Tensor, layout: &TokenLayout| {
+        let write_and_finalize = |raw: &Tensor,
+                                  cos: &Tensor,
+                                  sin: &Tensor,
+                                  slots: &Tensor,
+                                  layout: &TokenLayout,
+                                  carry: &Tensor,
+                                  keys: &Tensor|
+         -> Result<()> {
+            // This step's raw keys, as the model hands them to the finalize.
+            let scratch = Tensor::zeros((raw.dim(0)?, raw_row_bytes), DType::U8, &device)?;
+            qsa_aux_write(raw, cos, sin, slots, &scratch, &block_cs, RATIO)?;
             qsa_finalize(QsaFinalizeArgs {
-                aux,
+                aux: &scratch,
+                carry,
+                state_slots: &state_slots,
+                lanes,
+                block_cs: &block_cs,
                 block_keys: keys,
                 layout,
                 paged: &paged,
@@ -1490,27 +1510,34 @@ mod tests {
                 eps: 1e-6,
             })
         };
-        qsa_aux_write(&raw, &cos, &sin, &slots, &aux)?;
-        let initial_aux = aux.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        finalize(&aux, &keys, &full_layout)?;
-        assert_eq!(aux.to_dtype(DType::F32)?.to_vec2::<f32>()?, initial_aux);
+        write_and_finalize(&raw, &cos, &sin, &slots, &full_layout, &carry, &keys)?;
 
+        // Replace the open block's last tokens and finalize only that suffix: the carry supplies
+        // the block's earlier raw keys.
         let suffix_start = TOKENS - REPLACED_TOKENS;
         let replacement = raw.narrow(0, suffix_start, REPLACED_TOKENS)?.neg()?;
-        qsa_aux_write(
+        write_and_finalize(
             &replacement,
             &cos.narrow(0, suffix_start, REPLACED_TOKENS)?,
             &sin.narrow(0, suffix_start, REPLACED_TOKENS)?,
             &slots.narrow(0, suffix_start, REPLACED_TOKENS)?,
-            &aux,
+            &suffix_layout,
+            &carry,
+            &keys,
         )?;
-        finalize(&aux, &keys, &suffix_layout)?;
 
-        let fresh_aux = Tensor::zeros((SLOTS, aux_dim), dtype, &device)?;
+        let fresh_carry = Tensor::zeros((2 * RATIO, raw_row_bytes), DType::U8, &device)?;
         let fresh_keys = Tensor::zeros((SLOTS / RATIO, QSA_HEAD_DIM), dtype, &device)?;
         let accepted = Tensor::cat(&[raw.narrow(0, 0, suffix_start)?, replacement], 0)?;
-        qsa_aux_write(&accepted, &cos, &sin, &slots, &fresh_aux)?;
-        finalize(&fresh_aux, &fresh_keys, &full_layout)?;
+        write_and_finalize(
+            &accepted,
+            &cos,
+            &sin,
+            &slots,
+            &full_layout,
+            &fresh_carry,
+            &fresh_keys,
+        )?;
         assert_eq!(
             keys.to_dtype(DType::F32)?.to_vec2::<f32>()?,
             fresh_keys.to_dtype(DType::F32)?.to_vec2::<f32>()?

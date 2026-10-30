@@ -113,7 +113,14 @@ pub struct PagedAttentionScheduler {
     prompt_chunks_require_block_alignment: bool,
     prefix_policy: SpeculativePrefixCheckpointPolicy,
     decode_steps_since_prefill: usize,
+    /// While no sequence is decoding, prompts are admitted at the full token budget and the
+    /// decode allowance between prompt batches is one step (the admission epoch). By default the
+    /// epoch ends as soon as any sequence decodes, so established decoders keep
+    /// `max_decode_steps_before_prefill` steps between the remaining prompt chunks;
+    /// `MISTRALRS_PA_PROMPT_EPOCH_HOLD=1` keeps the epoch until the prompt backlog drains, which
+    /// favours the backlog's time to first token over decode cadence.
     prompt_admission_epoch: bool,
+    prompt_epoch_holds_for_backlog: bool,
     waiting_prompt_preemption_enabled: bool,
     /// KV blocks a new prompt must leave free per decoding sequence, so admitting it does not
     /// push the running conversations into preemption as they grow
@@ -147,6 +154,8 @@ impl PagedAttentionScheduler {
         let growth_reserve_blocks = growth_reserve_tokens.div_ceil(cache_config.block_size);
         let prompt_preempts_running =
             std::env::var("MISTRALRS_PA_PROMPT_PREEMPTS").map_or(true, |v| v != "0");
+        let prompt_epoch_holds_for_backlog =
+            std::env::var("MISTRALRS_PA_PROMPT_EPOCH_HOLD").is_ok_and(|v| v != "0");
         info!(
             max_num_seqs = config.max_num_seqs,
             max_num_batched_tokens = config.max_num_batched_tokens,
@@ -154,6 +163,7 @@ impl PagedAttentionScheduler {
             max_decode_steps_before_prefill = config.max_decode_steps_before_prefill,
             growth_reserve_tokens,
             prompt_preempts_running,
+            prompt_epoch_holds_for_backlog,
             "Configured PagedAttention scheduler"
         );
         Self {
@@ -178,6 +188,7 @@ impl PagedAttentionScheduler {
             prefix_policy: SpeculativePrefixCheckpointPolicy::default(),
             decode_steps_since_prefill: 0,
             prompt_admission_epoch: false,
+            prompt_epoch_holds_for_backlog,
             waiting_prompt_preemption_enabled: true,
             growth_reserve_blocks,
             prompt_preempts_running,
@@ -221,14 +232,18 @@ impl PagedAttentionScheduler {
             .iter()
             .any(|seq| get_mut_arcmutex!(seq).is_prompt());
         let has_prompt = has_running_prompt || !self.waiting.is_empty();
-        if !has_prompt && self.decode_steps_since_prefill > 0 {
-            self.prompt_admission_epoch = false;
-        } else if !self
+        let has_completion = self
             .running
             .iter()
-            .any(|seq| get_mut_arcmutex!(seq).is_completion())
-        {
+            .any(|seq| get_mut_arcmutex!(seq).is_completion());
+        if !has_prompt && self.decode_steps_since_prefill > 0 {
+            self.prompt_admission_epoch = false;
+        } else if !has_completion {
             self.prompt_admission_epoch = true;
+        } else if !self.prompt_epoch_holds_for_backlog {
+            // A sequence is decoding: give it the configured cadence between the remaining
+            // prompt chunks instead of one step per chunk.
+            self.prompt_admission_epoch = false;
         }
     }
 
@@ -3308,8 +3323,9 @@ mod tests {
     }
 
     #[test]
-    fn admission_epoch_clears_after_prompt_backlog_drains() {
+    fn held_admission_epoch_clears_after_prompt_backlog_drains() {
         let mut scheduler = test_scheduler();
+        scheduler.prompt_epoch_holds_for_backlog = true;
         scheduler.prompt_admission_epoch = true;
         scheduler.running.push_back(test_sequence(0, 4));
 
@@ -3320,6 +3336,43 @@ mod tests {
         scheduler.update_prompt_admission_epoch();
 
         assert!(!scheduler.prompt_admission_epoch);
+    }
+
+    #[test]
+    fn admission_epoch_ends_once_a_sequence_decodes_beside_the_backlog() {
+        let mut scheduler = test_scheduler();
+        scheduler.prompt_admission_epoch = true;
+        scheduler.running.push_back(test_sequence(0, 4));
+        let prompt = test_sequence(1, 8192);
+        get_mut_arcmutex!(prompt).set_state(SequenceState::RunningPrompt);
+        scheduler.running.push_back(prompt);
+        let waiting = test_sequence(2, 8192);
+        get_mut_arcmutex!(waiting).set_state(SequenceState::Waiting);
+        scheduler.waiting.push_back(waiting);
+
+        scheduler.update_prompt_admission_epoch();
+
+        assert!(!scheduler.prompt_admission_epoch);
+        // The decoder now gets the configured cadence between prompt chunks.
+        scheduler.decode_steps_since_prefill = 1;
+        assert!(scheduler.completion_is_due());
+        scheduler.decode_steps_since_prefill = scheduler.config.max_decode_steps_before_prefill;
+        assert!(!scheduler.completion_is_due());
+    }
+
+    #[test]
+    fn held_admission_epoch_survives_a_decoding_sequence() {
+        let mut scheduler = test_scheduler();
+        scheduler.prompt_epoch_holds_for_backlog = true;
+        scheduler.prompt_admission_epoch = true;
+        scheduler.running.push_back(test_sequence(0, 4));
+        let prompt = test_sequence(1, 8192);
+        get_mut_arcmutex!(prompt).set_state(SequenceState::RunningPrompt);
+        scheduler.running.push_back(prompt);
+
+        scheduler.update_prompt_admission_epoch();
+
+        assert!(scheduler.prompt_admission_epoch);
     }
 
     #[test]
