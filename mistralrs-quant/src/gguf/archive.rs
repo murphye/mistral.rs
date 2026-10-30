@@ -565,6 +565,101 @@ impl GgufArchive {
         self.tensors.contains_key(name)
     }
 
+    /// Drops the file pages of every tensor except `keep` from this process and from the page
+    /// cache, and reads the kept tensors through in the background: once the weights are on the
+    /// device their pages only crowd out memory the host still needs (a memory-mapped lookup
+    /// table in `keep`, the rest of the system), while a table looked up at hash-random rows
+    /// is only ever fully cached if something reads it through. The mappings stay valid; a
+    /// later read of a dropped tensor comes from disk again. Returns the bytes advised away.
+    /// Linux only; elsewhere a no-op.
+    pub fn release_pages_except(&self, keep: &[&str]) -> Result<usize> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = keep;
+            return Ok(0);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+            // Ranges to release per shard, in file offsets; whole file minus the kept tensors
+            // would also drop the header, which is read once and tiny either way.
+            let mut released = 0usize;
+            let mut readers = Vec::new();
+            for (shard_index, shard) in self.shards.iter().enumerate() {
+                let mapping = &self.mappings[shard_index];
+                let file = std::fs::File::open(shard.path())?;
+                let fd = file.as_raw_fd();
+                for tensor in self.tensors.values() {
+                    if tensor.shard_index != shard_index {
+                        continue;
+                    }
+                    let range = tensor.storage_range();
+                    let start = shard.tensor_data_offset + range.start;
+                    let end = shard.tensor_data_offset + range.end;
+                    // Page-align inwards so a neighbouring tensor's page is never dropped.
+                    let start = start.div_ceil(page) * page;
+                    let end = end / page * page;
+                    if end <= start || end > mapping.len() {
+                        continue;
+                    }
+                    if keep.contains(&tensor.name.as_str()) {
+                        // Read the tensor through once, on a thread per kept tensor, so its
+                        // pages are in the cache before the lookups start: a WILLNEED advice is
+                        // capped at the device's read-ahead window (a few MB), and faults on a
+                        // mapping advised for random access read one page at a time. The read
+                        // is waited for below, so the first requests do not race it.
+                        let path = shard.path().to_path_buf();
+                        let reader = std::thread::Builder::new()
+                            .name("gguf-prefetch".into())
+                            .spawn(move || {
+                                use std::os::unix::fs::FileExt;
+                                let Ok(file) = std::fs::File::open(&path) else {
+                                    return;
+                                };
+                                let mut buf = vec![0u8; 16 << 20];
+                                let mut at = start;
+                                while at < end {
+                                    let n = buf.len().min(end - at);
+                                    if file.read_at(&mut buf[..n], at as u64).is_err() {
+                                        break;
+                                    }
+                                    at += n;
+                                }
+                            })
+                            .map_err(Error::wrap)?;
+                        readers.push(reader);
+                        continue;
+                    }
+                    // SAFETY: the mapping is read-only and file-backed, so dropped pages are
+                    // re-read from the file on the next access rather than lost.
+                    unsafe {
+                        mapping.unchecked_advise_range(
+                            memmap2::UncheckedAdvice::DontNeed,
+                            start,
+                            end - start,
+                        )
+                    }
+                    .map_err(Error::wrap)?;
+                    // Clean file pages leave the page cache on this advice.
+                    unsafe {
+                        libc::posix_fadvise(
+                            fd,
+                            start as libc::off_t,
+                            (end - start) as libc::off_t,
+                            libc::POSIX_FADV_DONTNEED,
+                        );
+                    }
+                    released += end - start;
+                }
+            }
+            for reader in readers {
+                let _ = reader.join();
+            }
+            Ok(released)
+        }
+    }
+
     pub fn tensor_data(&self, name: &str) -> Result<GgufTensorData<'_>> {
         let info = self.tensor_info(name)?;
         let range = info.data_range.as_ref().ok_or_else(|| {

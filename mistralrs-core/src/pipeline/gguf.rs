@@ -833,7 +833,8 @@ impl GGUFLoader {
             Some(path) => Some(fs::read_to_string(path)?),
             None => crate::gguf::qwen4exp::qwen4exp_preprocessor_config(&archive)?,
         };
-        self.load_native_synthesized_multimodal(
+        let mapped = archive.clone();
+        let pipeline = self.load_native_synthesized_multimodal(
             archive,
             args,
             SynthesizedMultimodalSource {
@@ -843,7 +844,22 @@ impl GGUFLoader {
                 preprocessor_config,
                 projector_files,
             },
-        )
+        )?;
+        // The weights are on the devices now; their file pages (tens of GB for this model)
+        // would only crowd the n-gram table, which stays memory-mapped and is looked up on
+        // the host, out of the page cache, and push other memory to swap.
+        if std::env::var_os("MISTRALRS_GGUF_KEEP_PAGES").is_none() {
+            let started = std::time::Instant::now();
+            match mapped.release_pages_except(&[crate::gguf::qwen4exp::PLE_TABLE_TENSOR]) {
+                Ok(bytes) => info!(
+                    "Released {} MiB of loaded GGUF weight pages from memory and read the n-gram table into the page cache in {:.1} s (MISTRALRS_GGUF_KEEP_PAGES=1 skips this)",
+                    bytes >> 20,
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(err) => warn!("Could not release the loaded GGUF weight pages: {err}"),
+            }
+        }
+        Ok(pipeline)
     }
 
     /// Load a GGUF whose config the loader builds itself into a model implemented as multimodal.

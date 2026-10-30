@@ -197,6 +197,9 @@ fn bind_layer(
     Ok(())
 }
 
+/// The n-gram (PLE) table tensor, memory-mapped and looked up on the host after load.
+pub(crate) const PLE_TABLE_TENSOR: &str = "per_layer_token_embd.weight";
+
 /// Environment variable naming a standalone MTP head GGUF (llama.cpp `nextn` layer, e.g.
 /// unsloth's `MTP/mtp-*.gguf`) to merge into a `qwen4exp` target for `--mtp`.
 pub(crate) const MTP_HEAD_ENV: &str = "MISTRALRS_QWEN4EXP_MTP_GGUF";
