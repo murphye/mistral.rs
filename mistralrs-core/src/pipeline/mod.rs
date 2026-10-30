@@ -623,12 +623,47 @@ fn paged_attention_memory_reservations(
         return Ok(reservations);
     }
     let bytes_by_device = cache.hybrid().recurrent_snapshot_bytes_by_device()?;
-    add_recurrent_prefix_memory_reservations(
-        reservations,
-        bytes_by_device,
+    let primary_snapshot = bytes_by_device
+        .get(&primary_device.location())
+        .copied()
+        .unwrap_or(0);
+    let base_and_activation = reservations.primary_device_bytes;
+    let on_host = crate::kv_cache::recurrent_snapshots_on_host();
+    let reservations = if on_host {
+        // The snapshots live in host memory; only the one being gathered sits on a device.
+        let mut reservations = reservations;
+        let secondary = bytes_by_device
+            .iter()
+            .filter(|(device, _)| **device != primary_device.location())
+            .map(|(_, bytes)| *bytes)
+            .max()
+            .unwrap_or(0);
+        reservations.primary_device_bytes = reservations
+            .primary_device_bytes
+            .checked_add(primary_snapshot)
+            .ok_or_else(|| candle_core::Error::msg("recurrent prefix reservation overflow"))?;
+        reservations.secondary_device_bytes = reservations
+            .secondary_device_bytes
+            .checked_add(secondary)
+            .ok_or_else(|| candle_core::Error::msg("recurrent prefix reservation overflow"))?;
+        reservations
+    } else {
+        add_recurrent_prefix_memory_reservations(
+            reservations,
+            bytes_by_device,
+            primary_device.location(),
+            paged_attn_config.recurrent_prefix_capacity,
+        )?
+    };
+    tracing::info!(
+        "Runtime reservation on {:?}: base + activations {} MiB, recurrent prefix snapshots of {} MiB, up to {} kept in {} memory",
         primary_device.location(),
+        base_and_activation >> 20,
+        primary_snapshot >> 20,
         paged_attn_config.recurrent_prefix_capacity,
-    )
+        if on_host { "host" } else { "device" },
+    );
+    Ok(reservations)
 }
 
 pub(crate) type DeviceTensorMap = HashMap<DeviceLocation, Tensor>;

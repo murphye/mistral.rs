@@ -3942,6 +3942,19 @@ impl HybridCache {
     }
 }
 
+/// Whether prefix-cache recurrent snapshots are kept in host memory: on by default in ROCm
+/// builds, `MISTRALRS_RECURRENT_SNAPSHOTS_ON_HOST=0|1` overrides. A snapshot is every recurrent
+/// layer's state for one sequence (~55 MiB a rank on Qwen3.8-Flash-Next) and is taken once a
+/// request, at a prompt or turn boundary, so the copy costs a few milliseconds a request; on the
+/// device the planner held `prefix_cache_n + 1` of them out of the KV budget (~1 GiB a rank).
+pub(crate) fn recurrent_snapshots_on_host() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("MISTRALRS_RECURRENT_SNAPSHOTS_ON_HOST") {
+        Ok(value) => value != "0",
+        Err(_) => cfg!(feature = "rocm"),
+    })
+}
+
 /// Snapshot of a single recurrent layer's state for prefix caching.
 #[derive(Clone, Debug)]
 pub struct RecurrentStateSnapshot {
@@ -3975,12 +3988,18 @@ impl HybridCache {
                 "recurrent physical slot {physical_slot} exceeds u32"
             ))
         })?;
+        let on_host = recurrent_snapshots_on_host();
         let mut snapshots = Vec::new();
         for cache in &self.caches {
             if let HybridLayerCache::Recurrent(pool) = cache {
                 let idx_tensor = Tensor::from_vec(vec![physical_slot], (1,), pool.device())?;
-                let conv = pool.gather_conv_state(&idx_tensor)?;
-                let recurrent = pool.gather_recurrent_state(&idx_tensor)?;
+                let mut conv = pool.gather_conv_state(&idx_tensor)?;
+                let mut recurrent = pool.gather_recurrent_state(&idx_tensor)?;
+                // Restores copy back to the pool's device either way.
+                if on_host {
+                    conv = conv.to_device(&Device::Cpu)?;
+                    recurrent = recurrent.to_device(&Device::Cpu)?;
+                }
                 snapshots.push(RecurrentStateSnapshot {
                     conv_state: conv,
                     recurrent_state: recurrent,
