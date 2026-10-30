@@ -489,6 +489,46 @@ pub fn sample_draft_rows(
             return Ok(tokens);
         }
     }
+    // One batched device top-k for every row whose sampler allows it (greedy rows at k = 1),
+    // one read-back; the host then samples each row from its candidates. Per-row sampling
+    // read 1 MB of logits back and ran a softmax on the host for each draft row.
+    #[cfg(feature = "rocm")]
+    if logits.device().is_rocm() {
+        let plans = sequences
+            .iter()
+            .map(|seq| seq.sampler().rocm_batch_row_plan())
+            .collect::<Option<Vec<_>>>();
+        if let Some(plans) = plans {
+            let k = plans.iter().map(|(k, _)| *k).max().unwrap_or(1);
+            let inv_t = plans
+                .iter()
+                .map(|(_, t)| (1.0 / t) as f32)
+                .collect::<Vec<_>>();
+            let vocab = logits.dim(1)?;
+            let packed =
+                crate::rocm::sampling::topk_logits_packed_batched(&logits.contiguous()?, k.min(vocab), &inv_t)?;
+            let kk = k.min(vocab);
+            let mut tokens = Vec::with_capacity(batch);
+            for ((row, seq), (row_k, temperature)) in packed.iter().zip(sequences).zip(&plans) {
+                // Each row keeps its own candidate count: the first `row_k` of the common k,
+                // plus the row's softmax denominator and maximum.
+                let row_k = (*row_k).min(kk);
+                let mut own = Vec::with_capacity(2 * row_k + 2);
+                own.extend_from_slice(&row[..row_k]);
+                own.extend_from_slice(&row[kk..kk + row_k]);
+                own.extend_from_slice(&row[2 * kk..2 * kk + 2]);
+                let sequence_rng = seq.sampling_rng(rng);
+                let sampled = seq
+                    .sampler()
+                    .sample_packed_topk(&own, row_k, *temperature, sequence_rng)?;
+                tokens.push(sampled.token);
+            }
+            for (context, token) in contexts.iter_mut().zip(&tokens) {
+                context.push(*token);
+            }
+            return Ok(tokens);
+        }
+    }
     let mut tokens = Vec::with_capacity(batch);
     for (row, seq) in sequences.iter().enumerate() {
         let row_logits = logits.get(row)?.to_dtype(candle_core::DType::F32)?;

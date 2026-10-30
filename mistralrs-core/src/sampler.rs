@@ -1671,6 +1671,40 @@ impl Sampler {
     /// global_max]`, applying top-p and min-p to the k candidates.
     /// `(top_k, temperature)` when this sampler can take the batched ROCm top-k path:
     /// temperature sampling with 1..=128 candidates and nothing applied to the full logits.
+    /// Whether a greedy row can take the device top-1 path (no penalties, processors, bias or
+    /// logprob reporting).
+    #[cfg(feature = "rocm")]
+    pub(crate) fn rocm_greedy_plan(
+        &self,
+        return_logprobs: bool,
+        sample_speculative: bool,
+        multiple_sequences: bool,
+    ) -> bool {
+        self.frequency_penalty.unwrap_or(0.0) == 0.0
+            && self.presence_penalty.unwrap_or(0.0) == 0.0
+            && self.repetition_penalty.unwrap_or(1.0) == 1.0
+            && self.logits_bias.is_empty()
+            && !return_logprobs
+            && !sample_speculative
+            && !multiple_sequences
+            && self.temperature.is_none()
+            && self.logits_processors.is_empty()
+            && self
+                .dry_params
+                .as_ref()
+                .is_none_or(|params| params.multiplier == 0.0)
+    }
+
+    /// `(k, inverse temperature)` for one row of a batched device top-k over several rows'
+    /// samplers (greedy rows take k = 1), or `None` when this sampler needs the host path.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn rocm_batch_row_plan(&self) -> Option<(usize, f64)> {
+        if self.rocm_greedy_plan(false, false, false) {
+            return Some((1, 1.0));
+        }
+        self.rocm_topk_plan(false)
+    }
+
     #[cfg(feature = "rocm")]
     pub(crate) fn rocm_topk_plan(&self, return_logprobs: bool) -> Option<(usize, f64)> {
         let no_penalties = self.frequency_penalty.unwrap_or(0.0) == 0.0
@@ -2397,6 +2431,16 @@ impl Sampler {
             if let Some(temperature) = self.temperature {
                 return self.sample_topk_on_device_rocm(logits, temperature, rng);
             }
+        }
+        // Greedy rows take the same device top-k with k = 1: without it an argmax read the
+        // whole vocabulary back and ran the softmax on the host, ~3 ms per row, which made
+        // every speculative draft row a stall.
+        #[cfg(feature = "rocm")]
+        if logits.device().is_rocm()
+            && self.rocm_greedy_plan(return_logprobs, sample_speculative, multiple_sequences)
+        {
+            let packed = crate::rocm::sampling::topk_logits_packed(&logits, 1, 1.0)?;
+            return self.sample_packed_topk(&packed, 1, 1.0, rng);
         }
 
         let logits = logits.to_vec1()?;
