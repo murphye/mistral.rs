@@ -233,7 +233,10 @@ impl GatedResidual {
         if res.device().is_rocm() {
             let next = next.filter(|next| next.norm_weight.device().same_device(res.device()));
             if let Some(peer) = reducer.peer_raw_handles() {
-                if crate::rocm::qwen4_exp::hc_combine_ar_supports(out, self.hc, &peer) {
+                // The one-launch kernel pushes the partial from a single workgroup, which
+                // suits a few rows; speculative verify steps (3-32 rows) take the wide push.
+                let few_rows = out.elem_count() <= 8 * out.dims().last().copied().unwrap_or(1);
+                if few_rows && crate::rocm::qwen4_exp::hc_combine_ar_supports(out, self.hc, &peer) {
                     return crate::rocm::qwen4_exp::hc_combine_ar(
                         res,
                         out,
