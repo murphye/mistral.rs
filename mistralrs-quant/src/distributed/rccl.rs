@@ -284,6 +284,18 @@ pub fn sum_all_reduce(comm: &RcclComm, xs: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
+/// Pushes `xs` into the peers' receive slots for a kernel that reduces the partials as it
+/// consumes them (see `PeerAllReduce::push_wide`); false when the peer path does not take `xs`.
+pub fn peer_push_wide(comm: &RcclComm, xs: &Tensor) -> Result<bool> {
+    match comm.peer.as_ref().filter(|peer| peer.supports(xs)) {
+        Some(peer) => {
+            peer.push_wide(xs)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 /// Concatenates every rank's `xs` along `dim`.
 pub fn all_gather(comm: &RcclComm, xs: &Tensor, dim: usize) -> Result<Tensor> {
     let world = comm.world_size;

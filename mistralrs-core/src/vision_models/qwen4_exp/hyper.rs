@@ -244,6 +244,26 @@ impl GatedResidual {
                         &peer,
                     );
                 }
+                // Prefill chunks: the partial is pushed at the link's rate by a launch of its
+                // own, then combined straight from the peers' slots, so the reduced sum is
+                // never written out and read back. `MISTRALRS_HC_FUSED_AR=0` keeps the
+                // separate all-reduce.
+                if hc_fused_prefill_enabled()
+                    && crate::rocm::qwen4_exp::hc_combine_ar_pushed_supports(out, self.hc, &peer)
+                {
+                    let out = out.contiguous()?;
+                    if reducer.peer_push_wide(&out)? {
+                        return crate::rocm::qwen4_exp::hc_combine_ar_pushed(
+                            res,
+                            &out,
+                            inject,
+                            next.map(|next| &next.norm_weight),
+                            self.hc,
+                            self.eps,
+                            &peer,
+                        );
+                    }
+                }
             }
         }
         let out = reducer.sum_all_reduce(&out.contiguous()?)?;
@@ -327,4 +347,10 @@ mod tests {
         assert!(max_diff(&next.unwrap(), &next_reference)? < 0.05);
         Ok(())
     }
+}
+
+#[cfg(feature = "rccl")]
+fn hc_fused_prefill_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MISTRALRS_HC_FUSED_AR").map_or(true, |v| v != "0"))
 }

@@ -92,6 +92,27 @@ mod ffi {
             stream: i64,
         );
         #[cfg(feature = "rocm")]
+        pub(super) fn qwen4_hc_combine_ar_pushed(
+            res: *const c_void,
+            block_out: *const c_void,
+            inject: *const c_void,
+            res_out: *mut c_void,
+            next_weight: *const f32,
+            xn_out: *mut c_void,
+            rows: i32,
+            hc: i32,
+            hidden: i32,
+            eps: f32,
+            dtype: i32,
+            peers: *const u64,
+            rank: i32,
+            world: i32,
+            max_elems: i32,
+            epoch: *mut i32,
+            finished: *mut u32,
+            stream: i64,
+        );
+        #[cfg(feature = "rocm")]
         pub(super) fn qwen4_hc_combine_ar(
             res: *const c_void,
             block_out: *const c_void,
@@ -650,6 +671,21 @@ pub(crate) fn hc_combine_ar_supports(
         && tokens * hc <= 128
 }
 
+/// Whether [`hc_combine_ar_pushed`] takes `block_out`: any row count, since the partial is
+/// pushed by a launch of its own; the peers' slots must hold it.
+#[cfg(feature = "rocm")]
+pub(crate) fn hc_combine_ar_pushed_supports(
+    block_out: &Tensor,
+    hc: usize,
+    peer: &candle_core::rocm_backend::peer::PeerRawHandles,
+) -> bool {
+    let hidden = block_out.dims().last().copied().unwrap_or(0);
+    block_out.dtype() == DType::BF16
+        && hidden % (hc * 8) == 0
+        && block_out.elem_count() % 8 == 0
+        && block_out.elem_count() <= peer.max_elems as usize
+}
+
 /// [`hc_combine`] where `block_out` is this rank's partial sum: the kernel exchanges the
 /// partials with the other ranks over peer memory and combines their sum.
 #[cfg(feature = "rocm")]
@@ -662,21 +698,62 @@ pub(crate) fn hc_combine_ar(
     eps: f64,
     peer: &candle_core::rocm_backend::peer::PeerRawHandles,
 ) -> Result<(Tensor, Option<Tensor>)> {
+    hc_combine_ar_impl(res, block_out, inject, next_norm, hc, eps, peer, false)
+}
+
+/// [`hc_combine_ar`] for a partial that a `PeerAllReduce::push_wide` of `block_out` has
+/// already pushed to the peers (a prefill chunk's worth of rows): the kernel waits for the
+/// peers' pushes and sums as it combines.
+#[cfg(feature = "rocm")]
+pub(crate) fn hc_combine_ar_pushed(
+    res: &Tensor,
+    block_out: &Tensor,
+    inject: &Tensor,
+    next_norm: Option<&Tensor>,
+    hc: usize,
+    eps: f64,
+    peer: &candle_core::rocm_backend::peer::PeerRawHandles,
+) -> Result<(Tensor, Option<Tensor>)> {
+    hc_combine_ar_impl(res, block_out, inject, next_norm, hc, eps, peer, true)
+}
+
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn hc_combine_ar_impl(
+    res: &Tensor,
+    block_out: &Tensor,
+    inject: &Tensor,
+    next_norm: Option<&Tensor>,
+    hc: usize,
+    eps: f64,
+    peer: &candle_core::rocm_backend::peer::PeerRawHandles,
+    pushed: bool,
+) -> Result<(Tensor, Option<Tensor>)> {
     let res = res.contiguous()?;
     let block_out = block_out.contiguous()?;
     let inject = inject.contiguous()?;
     let width = res.dim(candle_core::D::Minus1)?;
     let hidden = width / hc;
     let rows = res.elem_count() / hidden;
-    if !hc_combine_ar_supports(&block_out, hc, peer) {
+    let supported = if pushed {
+        hc_combine_ar_pushed_supports(&block_out, hc, peer)
+    } else {
+        hc_combine_ar_supports(&block_out, hc, peer)
+    };
+    if !supported {
         candle_core::bail!("hc_combine_ar: unsupported shape {:?}", block_out.shape());
     }
     let out = empty(res.dims(), res.dtype(), res.device())?;
     let xn = next_norm
         .map(|_| empty(res.dims(), res.dtype(), res.device()))
         .transpose()?;
+    let launch = if pushed {
+        ffi::qwen4_hc_combine_ar_pushed
+    } else {
+        ffi::qwen4_hc_combine_ar
+    };
     unsafe {
-        ffi::qwen4_hc_combine_ar(
+        launch(
             dev_ptr(&res)? as *const _,
             dev_ptr(&block_out)? as *const _,
             dev_ptr(&inject)? as *const _,
@@ -693,7 +770,13 @@ pub(crate) fn hc_combine_ar(
             peer.world as i32,
             peer.max_elems as i32,
             peer.epoch as *mut i32,
-            peer.counters as *mut u32,
+            // The pushed variant follows a wide push, which leaves the first counter zero and
+            // keeps the second for its consumer.
+            if pushed {
+                (peer.counters as *mut u32).wrapping_add(1)
+            } else {
+                peer.counters as *mut u32
+            },
             stream(res.device())?,
         );
     }

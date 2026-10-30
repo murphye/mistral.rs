@@ -623,6 +623,17 @@ impl SumAllReduce {
         }
     }
 
+    /// Pushes this rank's partial `xs` to the peers for a kernel that sums the partials as it
+    /// consumes them (candle's `PeerAllReduce::push_wide`); false when the peer path does not
+    /// take `xs`, in which case the caller reduces through [`Self::sum_all_reduce`].
+    #[cfg(feature = "rccl")]
+    pub fn peer_push_wide(&self, xs: &candle_core::Tensor) -> Result<bool> {
+        match self.rccl.as_deref() {
+            Some(Comm::Rccl(comm)) if !self.is_noop() => rccl::peer_push_wide(comm, xs),
+            _ => Ok(false),
+        }
+    }
+
     pub fn sum_all_reduce(&self, xs: &candle_core::Tensor) -> Result<candle_core::Tensor> {
         if self.is_noop() {
             return Ok(xs.clone());

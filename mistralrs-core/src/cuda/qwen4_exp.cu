@@ -230,11 +230,14 @@ q4_hc_combine_kernel(const T *__restrict__ res, const T *__restrict__ block_out,
 // hc_combine over a tensor-parallel partial `block_out`: the ranks exchange their
 // partials through peer memory (the receive-buffer layout of candle's
 // peer_allreduce.cu) and each combines the full sum, so the all-reduce costs no
-// launch of its own. Workgroup 0 pushes the whole `[tokens, hidden]` partial to
-// every peer's slot for this rank and publishes the epoch (one system-scope
-// fence per launch); every workgroup waits for all peers' epochs before reading
-// their slots, and the last workgroup to finish advances the epoch. Every
-// workgroup of the grid must be resident at once, so `rows` stays small.
+// launch of its own. With PUSHED false, workgroup 0 pushes the whole
+// `[tokens, hidden]` partial to every peer's slot for this rank and publishes the
+// epoch (one system-scope fence per launch), which suits decode steps (a few rows;
+// every workgroup of the grid must be resident at once). With PUSHED true, candle's
+// `peer_push_bf16_wide` launch pushed the partial beforehand at the link's rate,
+// and the grid may be as tall as a prefill chunk: the workgroups only wait for the
+// peers' epochs before reading their slots. Either way the last workgroup to finish
+// advances the epoch.
 #define Q4_PEER_SPIN_TIMEOUT_TICKS 1000000000ull
 // Fence between the pushes into peer memory and the flag stores. Peer memory
 // needs system scope.
@@ -244,7 +247,7 @@ q4_hc_combine_kernel(const T *__restrict__ res, const T *__restrict__ block_out,
 
 typedef unsigned int q4_v4u __attribute__((ext_vector_type(4)));
 
-template <typename T>
+template <typename T, bool PUSHED>
 __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
     const T *__restrict__ res, const T *__restrict__ block_out,
     const T *__restrict__ inject, T *__restrict__ res_out,
@@ -264,7 +267,7 @@ __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
   __syncthreads();
   const int ep = ep_s;
   const int half = ep & 1;
-  if (blockIdx.x == 0) {
+  if (!PUSHED && blockIdx.x == 0) {
     // Push the whole partial, 16 bytes per lane.
     const int nv = (rows / hc) * hidden * (int)sizeof(T) / 16;
     const q4_v4u *src = reinterpret_cast<const q4_v4u *>(block_out);
@@ -298,6 +301,11 @@ __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
       if (peer != rank) {
         while (__hip_atomic_load(own + peer, __ATOMIC_ACQUIRE,
                                  __HIP_MEMORY_SCOPE_SYSTEM) < ep) {
+          if (PUSHED) {
+            // A prefill chunk's worth of workgroups poll at once; pace them so the polls
+            // do not crowd the memory path the peers' pushes are landing on.
+            __builtin_amdgcn_s_sleep(2);
+          }
           if (wall_clock64() - start > Q4_PEER_SPIN_TIMEOUT_TICKS) {
             __builtin_trap();
           }
@@ -314,24 +322,92 @@ __global__ void __launch_bounds__(512) q4_hc_combine_ar_kernel(
   const T *rr = res + row * hidden;
   T *orow = res_out + row * hidden;
   float ss = 0.0f;
-  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-    float b = 0.0f;
-    for (int r = 0; r < world; ++r) {
-      b += r == rank ? q4_f(br[i]) : q4_f(recv[(size_t)r * max_elems + i]);
+  if constexpr (PUSHED) {
+    // Sixteen bytes per lane per step (`hidden` is a multiple of eight T): the partials and
+    // the residual are streamed once, the peers' from uncached memory.
+    constexpr int V = 16 / (int)sizeof(T);
+    const int nv = hidden / V;
+    const q4_v4u *brv = reinterpret_cast<const q4_v4u *>(br);
+    const q4_v4u *rrv = reinterpret_cast<const q4_v4u *>(rr);
+    q4_v4u *orv = reinterpret_cast<q4_v4u *>(orow);
+    for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+      float b[V];
+#pragma unroll
+      for (int j = 0; j < V; ++j) {
+        b[j] = 0.0f;
+      }
+      for (int r = 0; r < world; ++r) {
+        const q4_v4u pv =
+            r == rank ? brv[i]
+                      : reinterpret_cast<const q4_v4u *>(recv + (size_t)r * max_elems)[i];
+        const T *p = reinterpret_cast<const T *>(&pv);
+#pragma unroll
+        for (int j = 0; j < V; ++j) {
+          b[j] += q4_f(p[j]);
+        }
+      }
+      const q4_v4u rv = rrv[i];
+      const T *rp = reinterpret_cast<const T *>(&rv);
+      q4_v4u ov;
+      T *op = reinterpret_cast<T *>(&ov);
+#pragma unroll
+      for (int j = 0; j < V; ++j) {
+        // The reduced block output is a T tensor on the unfused path; round it the same way.
+        const T v = q4_t<T>(fmaf(q4_f(q4_t<T>(b[j])), w, q4_f(rp[j])));
+        op[j] = v;
+        const float vf = q4_f(v);
+        ss = fmaf(vf, vf, ss);
+      }
+      orv[i] = ov;
     }
-    // The reduced block output is a T tensor on the unfused path; round it the same way.
-    const T v = q4_t<T>(fmaf(q4_f(q4_t<T>(b)), w, q4_f(rr[i])));
-    orow[i] = v;
-    const float vf = q4_f(v);
-    ss = fmaf(vf, vf, ss);
+  } else {
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+      float b = 0.0f;
+      for (int r = 0; r < world; ++r) {
+        b += r == rank ? q4_f(br[i]) : q4_f(recv[(size_t)r * max_elems + i]);
+      }
+      // The reduced block output is a T tensor on the unfused path; round it the same way.
+      const T v = q4_t<T>(fmaf(q4_f(q4_t<T>(b)), w, q4_f(rr[i])));
+      orow[i] = v;
+      const float vf = q4_f(v);
+      ss = fmaf(vf, vf, ss);
+    }
   }
   if (next_weight != nullptr) {
     ss = q4_block_sum(ss, smem);
     const float inv = rsqrtf(ss / (float)hidden + eps);
     const float *wr = next_weight + (size_t)stream * hidden;
     T *xr = xn_out + row * hidden;
-    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-      xr[i] = q4_t<T>(q4_f(orow[i]) * inv * wr[i]);
+    if constexpr (PUSHED) {
+      constexpr int V = 16 / (int)sizeof(T);
+      const int nv = hidden / V;
+      const q4_v4u *orv = reinterpret_cast<const q4_v4u *>(orow);
+      const float4 *wv = reinterpret_cast<const float4 *>(wr);
+      q4_v4u *xv = reinterpret_cast<q4_v4u *>(xr);
+      for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+        const q4_v4u o = orv[i];
+        const T *op = reinterpret_cast<const T *>(&o);
+        float wf[V];
+#pragma unroll
+        for (int q = 0; q < V / 4; ++q) {
+          const float4 w4 = wv[i * (V / 4) + q];
+          wf[4 * q] = w4.x;
+          wf[4 * q + 1] = w4.y;
+          wf[4 * q + 2] = w4.z;
+          wf[4 * q + 3] = w4.w;
+        }
+        q4_v4u x;
+        T *xp = reinterpret_cast<T *>(&x);
+#pragma unroll
+        for (int j = 0; j < V; ++j) {
+          xp[j] = q4_t<T>(q4_f(op[j]) * inv * wf[j]);
+        }
+        xv[i] = x;
+      }
+    } else {
+      for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        xr[i] = q4_t<T>(q4_f(orow[i]) * inv * wr[i]);
+      }
     }
   }
   // The last workgroup to finish advances the epoch: every workgroup has read it by now.
@@ -1694,7 +1770,27 @@ extern "C" void qwen4_hc_combine_ar(const void *res, const void *block_out,
     return;
   }
   const cudaStream_t s = (cudaStream_t)stream;
-  Q4_DISPATCH(dtype, q4_hc_combine_ar_kernel<scalar_t>
+  Q4_DISPATCH(dtype, q4_hc_combine_ar_kernel<scalar_t, false>
+              <<<rows, q4_row_threads(hidden), 0, s>>>(
+                  (const scalar_t *)res, (const scalar_t *)block_out,
+                  (const scalar_t *)inject, (scalar_t *)res_out, next_weight,
+                  (scalar_t *)xn_out, hc, hidden, eps, peers, rank, world,
+                  max_elems, epoch, finished));
+}
+
+// `qwen4_hc_combine_ar` after a `peer_push_bf16_wide` launch pushed `block_out` (PUSHED above).
+extern "C" void qwen4_hc_combine_ar_pushed(const void *res, const void *block_out,
+                                           const void *inject, void *res_out,
+                                           const float *next_weight, void *xn_out,
+                                           int rows, int hc, int hidden, float eps,
+                                           int dtype, const uint64_t *peers, int rank,
+                                           int world, int max_elems, int *epoch,
+                                           unsigned int *finished, int64_t stream) {
+  if (rows == 0) {
+    return;
+  }
+  const cudaStream_t s = (cudaStream_t)stream;
+  Q4_DISPATCH(dtype, q4_hc_combine_ar_kernel<scalar_t, true>
               <<<rows, q4_row_threads(hidden), 0, s>>>(
                   (const scalar_t *)res, (const scalar_t *)block_out,
                   (const scalar_t *)inject, (scalar_t *)res_out, next_weight,
