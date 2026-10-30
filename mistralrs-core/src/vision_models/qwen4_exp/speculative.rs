@@ -17,6 +17,10 @@ use crate::speculative::{
     SpeculativeTargetMixin,
 };
 
+/// MTP depth under tensor parallelism when none is requested (the autotuner cannot run there).
+/// Depth 2 measured best for a single stream on two R9700s.
+const TP_FIXED_DEPTH: usize = 2;
+
 #[cfg(feature = "cuda")]
 const GROUPED_VERIFY_GRAPH_DEPTHS: [usize; 2] = [3, 4];
 #[cfg(feature = "cuda")]
@@ -144,13 +148,27 @@ impl SpeculativeTargetMixin for Qwen4ExpModel {
                 "The built-in MTP head was not loaded; pass `--mtp` when loading the model."
             );
         }
-        let n_predict = config.n_predict.unwrap_or(AUTO_MAX_DEPTH);
+        // The depth autotuner scores candidates by each process's own step timings, so under
+        // tensor parallelism the ranks would pick different verify shapes and their collectives
+        // would diverge; there a fixed depth stands in for the automatic one.
+        let tp_mirrored = mistralrs_quant::distributed::mirrors_first_rank_admission();
+        let auto_depth = config.n_predict.is_none() && !tp_mirrored;
+        let n_predict = match config.n_predict {
+            Some(n) => n,
+            None if tp_mirrored => {
+                tracing::warn!(
+                    "MTP auto depth is unavailable under tensor parallelism; using a fixed depth \
+                     of {TP_FIXED_DEPTH} (pass --mtp-n-predict to choose it)."
+                );
+                TP_FIXED_DEPTH
+            }
+            None => AUTO_MAX_DEPTH,
+        };
         if n_predict == 0 {
             candle_core::bail!("MTP n_predict must be at least 1.");
         }
         self.mtp_n_predict.store(n_predict, Ordering::Relaxed);
-        self.mtp_auto_depth
-            .store(config.n_predict.is_none(), Ordering::Relaxed);
+        self.mtp_auto_depth.store(auto_depth, Ordering::Relaxed);
         self.text.set_store_spec_hidden(true);
         // A base-type copy of the promoted lm_head makes drafting cheaper without touching verification
         let draft_head = config
