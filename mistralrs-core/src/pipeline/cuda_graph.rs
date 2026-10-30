@@ -1879,6 +1879,7 @@ impl CudaDecodeGraphMetadataBuffers {
             cu_seqlens_q: metadata.cu_seqlens_q.clone(),
             cu_seqlens_kv: metadata.cu_seqlens_kv.clone(),
             decode_rows: metadata.decode_rows.clone(),
+            input_tokens_host: None,
         }
     }
 }

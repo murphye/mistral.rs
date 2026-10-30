@@ -897,9 +897,44 @@ pub(super) struct PleState<'a> {
     pub slots: &'a Tensor,
 }
 
+/// What the host already knows about a batch, so the n-gram step reads nothing back from
+/// the device (a read-back waits for every queued kernel, and the gather then runs on an
+/// idle device).
+#[derive(Clone, Copy)]
+pub(super) struct PleHostHints<'a> {
+    /// The input token ids as uploaded, one row per batch row, in the input's row order.
+    pub tokens: Option<&'a [Vec<u32>]>,
+    /// The recurrent-state slot of every sequence, in `seqs` order.
+    pub slots: Option<&'a [u32]>,
+    pub history: PleHistorySource,
+}
+
+impl PleHostHints<'_> {
+    /// Nothing known: every input is read back from the device.
+    pub(super) const NONE: PleHostHints<'static> = PleHostHints {
+        tokens: None,
+        slots: None,
+        history: PleHistorySource::Device,
+    };
+}
+
+/// Where a sequence's n-gram history (the tokens before this batch's) comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PleHistorySource {
+    /// A prompt's first chunk with nothing cached: no tokens precede it.
+    Fresh,
+    /// The host's mirror of the row it wrote last time, when it has one; a slot the host has
+    /// not written since the sequence (re)started reads the device row. For prompt chunks
+    /// after the first: nothing but this code writes a prompt's row between its chunks.
+    Mirror,
+    /// Read the row from the device: restored from a checkpoint, or unknown.
+    Device,
+}
+
 /// Where each logical sequence sits on the flattened token axis.
 pub(super) struct PleBatch<'a> {
     pub seqs: &'a [(usize, usize)],
+    pub hints: PleHostHints<'a>,
 #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub layout: Option<&'a super::kernels::TokenLayout>,
 }
@@ -924,6 +959,10 @@ pub(super) struct PleLayer {
     /// Embeddings gathered ahead of the forward pass, used instead of the host gather; a
     /// replayed graph reads them from a fixed buffer.
     pending_embeddings: std::sync::Mutex<Option<Tensor>>,
+    /// The n-gram history row the host last wrote for each recurrent-state slot (the tokens
+    /// before the next batch, `None` for no token), so the next step need not read it back.
+    /// Invalidated where the device row changes behind the host's back (rollbacks).
+    history_mirror: std::sync::Mutex<std::collections::HashMap<u32, Vec<Option<u32>>>>,
 }
 
 impl PleLayer {
@@ -975,6 +1014,7 @@ impl PleLayer {
             hidden: cfg.hidden_size,
             eps: cfg.rms_norm_eps,
             pending_embeddings: std::sync::Mutex::new(None),
+            history_mirror: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1071,7 +1111,7 @@ impl PleLayer {
             .clone();
         let emb = match pending {
             Some(emb) => emb,
-            None => self.host_embeddings(tokens, state, batch.seqs, n_tokens)?,
+            None => self.host_embeddings(tokens, state, batch.seqs, n_tokens, batch.hints)?,
         };
         let (gated, normed) = self.gate(&emb.to_dtype(flat.dtype())?, &flat)?;
         if let Some(out) = conv_inputs_out {
@@ -1135,31 +1175,64 @@ impl PleLayer {
 
     /// Hashes `tokens` against each sequence's n-gram history, advances the history, and
     /// gathers the embedding rows: `[n_tokens, heads * head_dim]` f32 on the state's device.
+    /// Forgets the mirrored history rows of `slots`: their device rows were rewritten.
+    pub(super) fn invalidate_history(&self, slots: &[u32]) {
+        let mut mirror = self.history_mirror.lock().expect("PLE history mirror poisoned");
+        for slot in slots {
+            mirror.remove(slot);
+        }
+    }
+
     pub(super) fn host_embeddings(
         &self,
         tokens: &Tensor,
         state: &PleState<'_>,
         seqs: &[(usize, usize)],
         n_tokens: usize,
+        hints: PleHostHints<'_>,
     ) -> Result<Tensor> {
         let timing = std::env::var_os("MISTRALRS_GRAPH_TIMING").is_some();
         let t0 = std::time::Instant::now();
-        let tokens = tokens
-            .flatten_all()?
-            .to_dtype(DType::U32)?
-            .to_vec1::<u32>()?;
-        let slots = state.slots.to_dtype(DType::U32)?.to_vec1::<u32>()?;
-        let history = state.history.to_device(&Device::Cpu)?;
+        // Every device read-back below waits for the queued kernels, so each is taken from
+        // the host when the hints cover it.
+        let tokens = match hints.tokens {
+            Some(rows) if rows.iter().map(Vec::len).sum::<usize>() == n_tokens => {
+                rows.iter().flatten().copied().collect::<Vec<u32>>()
+            }
+            _ => tokens.flatten_all()?.to_dtype(DType::U32)?.to_vec1::<u32>()?,
+        };
+        let slots = match hints.slots {
+            Some(slots) if slots.len() >= seqs.len() => slots[..seqs.len()].to_vec(),
+            _ => state.slots.to_dtype(DType::U32)?.to_vec1::<u32>()?,
+        };
         let heads = self.hash.num_heads();
         let context = self.cfg.context_len();
+        let mut device_history: Option<Tensor> = None;
+        let mut mirror = self.history_mirror.lock().expect("PLE history mirror poisoned");
         let mut rows = vec![self.hash.offsets[0]; n_tokens * heads];
         let mut new_history = Vec::with_capacity(seqs.len());
         for (seq, &(start, len)) in seqs.iter().enumerate() {
-            let stored = history.i(slots[seq] as usize)?.to_vec1::<f32>()?;
-            let mut hist = stored
-                .iter()
-                .map(|v| (*v > 0.0).then(|| *v as u32 - 1))
-                .collect::<Vec<_>>();
+            let slot = slots[seq];
+            let mirrored = match hints.history {
+                PleHistorySource::Fresh => Some(vec![None; context]),
+                PleHistorySource::Mirror => mirror.get(&slot).cloned(),
+                PleHistorySource::Device => None,
+            };
+            let mut hist = match mirrored {
+                Some(hist) => hist,
+                None => {
+                    let history = match &device_history {
+                        Some(history) => history,
+                        None => device_history.insert(state.history.to_device(&Device::Cpu)?),
+                    };
+                    history
+                        .i(slot as usize)?
+                        .to_vec1::<f32>()?
+                        .iter()
+                        .map(|v| (*v > 0.0).then(|| *v as u32 - 1))
+                        .collect::<Vec<_>>()
+                }
+            };
             let seq_tokens = &tokens[start..start + len];
             for local in 0..len {
                 let t = start + local;
@@ -1171,12 +1244,15 @@ impl PleLayer {
                 );
             }
             hist.extend(seq_tokens.iter().map(|t| Some(*t)));
-            let tail = hist[hist.len() - context..]
-                .iter()
-                .map(|t| t.map_or(0.0, |t| t as f32 + 1.0))
-                .collect::<Vec<_>>();
-            new_history.push(tail);
+            let tail = hist[hist.len() - context..].to_vec();
+            new_history.push(
+                tail.iter()
+                    .map(|t| t.map_or(0.0, |t| t as f32 + 1.0))
+                    .collect::<Vec<_>>(),
+            );
+            mirror.insert(slot, tail);
         }
+        drop(mirror);
         let t_hash = t0.elapsed();
         for (seq, tail) in new_history.into_iter().enumerate() {
             let row = Tensor::from_vec(tail, (1, context), state.history.device())?;

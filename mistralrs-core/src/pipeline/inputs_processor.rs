@@ -320,6 +320,11 @@ pub mod text_models_inputs_processor {
         pub cu_seqlens_kv: Option<HashMap<DeviceLocation, Tensor>>,
         /// Host rows this decode metadata was built from (decode steps only).
         pub decode_rows: Option<Arc<DecodePagedRows>>,
+        /// Each sequence row's input token ids as the host assembled them (prompt chunks
+        /// only, padded like the input tensor), for models that hash tokens on the host and
+        /// would otherwise read the input back from the device, which waits for every queued
+        /// kernel. `None` for decode rows and dummies.
+        pub input_tokens_host: Option<Vec<Vec<u32>>>,
     }
 
     impl PagedAttentionInputMetadata {
@@ -379,6 +384,7 @@ pub mod text_models_inputs_processor {
                 cu_seqlens_q: None,
                 cu_seqlens_kv: None,
                 decode_rows: None,
+                input_tokens_host: None,
             })
         }
 
@@ -639,6 +645,7 @@ pub mod text_models_inputs_processor {
                 cu_seqlens_q: Some(cu_q_map),
                 cu_seqlens_kv: Some(cu_kv_map),
                 decode_rows: None,
+                input_tokens_host: None,
             })
         }
     }
@@ -947,6 +954,7 @@ pub mod text_models_inputs_processor {
         let mut seqlens_k = if flash_attn { vec![0] } else { Vec::new() };
         let mut num_cached_tokens_vec: Vec<usize> = Vec::new();
         let mut query_lens_vec: Vec<usize> = Vec::new();
+        let mut input_tokens_host: Vec<Vec<u32>> = Vec::with_capacity(toks.len());
         for (seq_idx, (seq_id, ctxt)) in seq_ids.iter().zip(&toks).enumerate() {
             let cached = prefix_cache_lens.map_or(0, |lens| lens[seq_idx]);
             let full_prompt_len = ctxt.len();
@@ -985,6 +993,7 @@ pub mod text_models_inputs_processor {
                 seqlens_k.push((input_toks.len() + chunk_offset_toks + cached) as u32);
             }
 
+            input_tokens_host.push(input_toks.iter().map(|t| t.to_f64() as u32).collect());
             seqs_tensors.push(Tensor::new(input_toks, device)?.unsqueeze(0)?);
 
             if has_any_cache_hit {
@@ -1544,6 +1553,7 @@ pub mod text_models_inputs_processor {
                     None
                 },
                 decode_rows: None,
+                input_tokens_host: Some(input_tokens_host),
             })
         } else {
             None
@@ -2154,6 +2164,7 @@ pub mod text_models_inputs_processor {
                 cu_seqlens_q: None,
                 cu_seqlens_kv: None,
                 decode_rows: Some(self.clone()),
+                input_tokens_host: None,
             })
         }
 
@@ -2444,6 +2455,7 @@ pub mod text_models_inputs_processor {
                 cu_seqlens_q: None,
                 cu_seqlens_kv: None,
                 decode_rows: Some(self.clone()),
+                input_tokens_host: None,
             })
         }
     }

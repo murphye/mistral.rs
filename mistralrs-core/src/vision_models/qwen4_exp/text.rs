@@ -827,7 +827,16 @@ impl Qwen4ExpTextModel {
         let Some(HybridLayerCache::Recurrent(pool)) = hybrid_cache.get(self.layers.len()) else {
             candle_core::bail!("Qwen4-Exp PLE state pool is missing");
         };
-        ple.rollback(rows, &pool.conv_state, &pool.recurrent_state)
+        ple.rollback(rows, &pool.conv_state, &pool.recurrent_state)?;
+        // The rolled-back rows no longer match what the host wrote last.
+        let slots = rows
+            .iter()
+            .filter_map(|&(batch_idx, _)| ple.slots.get(batch_idx).copied())
+            .collect::<Vec<_>>();
+        for layer in self.layers.iter().filter_map(|layer| layer.ple.as_ref()) {
+            layer.invalidate_history(&slots);
+        }
+        Ok(())
     }
 
     fn gdn_transition_layers(&self) -> GdnTransitionLayers<'_> {
@@ -944,6 +953,7 @@ impl Qwen4ExpTextModel {
         let indices = hybrid_cache
             .state_indices_for_layer(n_layers)?
             .ok_or_else(|| candle_core::Error::msg("PLE state indices are missing"))?;
+        let slots_host = hybrid_cache.state_indices_host().map(<[u32]>::to_vec);
         let Some(HybridLayerCache::Recurrent(pool)) = hybrid_cache.get_mut(n_layers) else {
             candle_core::bail!("Qwen4-Exp PLE state pool is missing");
         };
@@ -953,7 +963,16 @@ impl Qwen4ExpTextModel {
             slots: &indices,
         };
         let spans = (0..batch).map(|b| (b * tokens, tokens)).collect::<Vec<_>>();
-        ple.host_embeddings(input_ids, &state, &spans, batch * tokens)
+        let hints = if ple_host_hints_enabled() {
+            super::ple::PleHostHints {
+                tokens: None,
+                slots: slots_host.as_deref(),
+                history: super::ple::PleHistorySource::Device,
+            }
+        } else {
+            super::ple::PleHostHints::NONE
+        };
+        ple.host_embeddings(input_ids, &state, &spans, batch * tokens, hints)
             .map(Some)
     }
 
@@ -1119,6 +1138,41 @@ impl Qwen4ExpTextModel {
             Self::sequence_spans(&xs, ctx)?
         };
         let kv_lens = Self::kv_lens(&spans, ctx);
+        // What the n-gram step can take from the host instead of reading back from the
+        // device: the uploaded prompt rows, the state slots, and whether the sequences'
+        // histories are fresh, mirrored from the host's last write, or restored on device.
+        let ple_hints = {
+            let paged = ctx.paged_input_metadata();
+            let history = match paged {
+                Some(meta) if meta.is_first_prompt_chunk => {
+                    let restored = meta
+                        .num_cached_tokens
+                        .as_ref()
+                        .is_some_and(|cached| cached.iter().any(|&n| n > 0));
+                    if restored {
+                        super::ple::PleHistorySource::Device
+                    } else {
+                        super::ple::PleHistorySource::Fresh
+                    }
+                }
+                // Decode steps keep the device row: with speculative decoding the committed
+                // state can move between checkpoint lanes or be replayed without passing
+                // through the host's rollback hook, and a decode step synchronizes for its
+                // logits anyway.
+                Some(meta) if meta.is_decode_step() => super::ple::PleHistorySource::Device,
+                Some(_) => super::ple::PleHistorySource::Mirror,
+                None => super::ple::PleHistorySource::Device,
+            };
+            if ple_host_hints_enabled() {
+                super::ple::PleHostHints {
+                    tokens: paged.and_then(|meta| meta.input_tokens_host.as_deref()),
+                    slots: recurrent_metadata.state_indices_host(),
+                    history,
+                }
+            } else {
+                super::ple::PleHostHints::NONE
+            }
+        };
         // Decode and verify rows read kv lengths from the paged metadata on device, which keeps them graph-safe
         // and off the dense paged kernels; under the budget the selection keeps every block
         let rectangular = is_decode || (is_verify && ctx.is_paged());
@@ -1218,6 +1272,7 @@ impl Qwen4ExpTextModel {
                     &state,
                     &PleBatch {
                         seqs: &spans,
+                        hints: ple_hints,
                         #[cfg(any(feature = "cuda", feature = "rocm"))]
                         layout,
                     },
@@ -1448,4 +1503,11 @@ impl IsqModel for Qwen4ExpTextModel {
         }
         uvb.to_safetensors()
     }
+}
+
+/// Whether the n-gram step takes its inputs from the host (default). `MISTRALRS_PLE_HOST_HINTS=0`
+/// makes it read them back from the device as it used to, for comparison.
+fn ple_host_hints_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MISTRALRS_PLE_HOST_HINTS").map_or(true, |v| v != "0"))
 }

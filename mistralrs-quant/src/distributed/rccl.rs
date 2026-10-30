@@ -89,6 +89,11 @@ pub struct RcclComm {
     world_size: usize,
     device: Device,
     peer: Option<candle_core::rocm_backend::peer::PeerAllReduce>,
+    /// A second peer exchange on a stream of its own, for the host loops' agreements
+    /// (`all_reduce_max_u32`). On the compute stream the agreement's read-back would wait for
+    /// every queued kernel, draining the device once per step. `MISTRALRS_TP_CONTROL_STREAM=0`
+    /// keeps agreements on the compute stream.
+    control: Option<(Device, candle_core::rocm_backend::peer::PeerAllReduce)>,
 }
 
 // RCCL communicators may be used from any thread as long as calls are not concurrent; each rank
@@ -128,28 +133,52 @@ impl RcclComm {
             world_size,
             device: dev.clone(),
             peer: None,
+            control: None,
         };
         if std::env::var_os("MISTRALRS_NO_PEER_ALLREDUCE").is_none() {
-            match this.connect_peers() {
+            match this.connect_peers(&this.device, peer_max_elems()) {
                 Ok(peer) => this.peer = Some(peer),
                 Err(err) => tracing::warn!("Peer all-reduce unavailable, using RCCL only: {err}"),
+            }
+            if this.peer.is_some()
+                && std::env::var("MISTRALRS_TP_CONTROL_STREAM").map_or(true, |v| v != "0")
+            {
+                match this.connect_control_peer() {
+                    Ok(control) => this.control = Some(control),
+                    Err(err) => tracing::warn!(
+                        "Peer control stream unavailable, agreements use the compute stream: {err}"
+                    ),
+                }
             }
         }
         Ok(this)
     }
 
-    /// Shares each rank's peer all-reduce buffer with the others through an RCCL all-gather
-    /// of their IPC handles.
-    fn connect_peers(&self) -> Result<candle_core::rocm_backend::peer::PeerAllReduce> {
+    /// A small peer exchange on a fresh stream of this rank's GPU (see `control`).
+    fn connect_control_peer(
+        &self,
+    ) -> Result<(Device, candle_core::rocm_backend::peer::PeerAllReduce)> {
+        let device = Device::new_rocm(self.device.as_rocm_device()?.ordinal())?;
+        let peer = self.connect_peers(&device, 1 << 10)?;
+        Ok((device, peer))
+    }
+
+    /// Shares each rank's peer all-reduce buffer (on `device`'s stream, `max_elems` bf16
+    /// elements) with the others through an RCCL all-gather of their IPC handles.
+    fn connect_peers(
+        &self,
+        device: &Device,
+        max_elems: usize,
+    ) -> Result<candle_core::rocm_backend::peer::PeerAllReduce> {
         use candle_core::rocm_backend::peer::{PeerAllReduceSetup, HANDLE_BYTES};
         let (setup, handle) = PeerAllReduceSetup::new(
-            self.device.as_rocm_device()?,
+            device.as_rocm_device()?,
             self.rank,
             self.world_size,
-            peer_max_elems(),
+            max_elems,
         )?;
-        let local = Tensor::from_vec(handle.to_vec(), HANDLE_BYTES, &self.device)?;
-        let gathered = unsafe { Tensor::empty(HANDLE_BYTES * self.world_size, DType::U8, &self.device) }?;
+        let local = Tensor::from_vec(handle.to_vec(), HANDLE_BYTES, device)?;
+        let gathered = unsafe { Tensor::empty(HANDLE_BYTES * self.world_size, DType::U8, device) }?;
         let ptr = |t: &Tensor| -> Result<u64> {
             let (s, l) = t.storage_and_layout();
             let candle_core::Storage::Rocm(s) = &*s else {
@@ -300,14 +329,20 @@ pub fn all_gather(comm: &RcclComm, xs: &Tensor, dim: usize) -> Result<Tensor> {
 /// The largest `value` across ranks, read back to the host. Ranks call this at the same points
 /// of their host loops to agree on decisions that must not diverge.
 pub fn all_reduce_max_u32(comm: &RcclComm, value: u32) -> Result<u32> {
-    if let Some(peer) = comm.peer.as_ref() {
+    let channel = comm
+        .control
+        .as_ref()
+        .map(|(device, peer)| (device, peer))
+        .or_else(|| comm.peer.as_ref().map(|peer| (&comm.device, peer)));
+    if let Some((device, peer)) = channel {
         // The peer kernels move bf16 bit patterns, so the value rides in two of eight
         // elements of an all-gather and the maximum is taken on the host: one small kernel
-        // instead of an RCCL collective.
+        // instead of an RCCL collective. On the control stream the read-back waits for that
+        // kernel alone, not for the compute stream's queue.
         let mut bits = [half::bf16::ZERO; 8];
         bits[0] = half::bf16::from_bits(value as u16);
         bits[1] = half::bf16::from_bits((value >> 16) as u16);
-        let xs = Tensor::new(&bits[..], &comm.device)?;
+        let xs = Tensor::new(&bits[..], device)?;
         if peer.supports(&xs) {
             let rows = peer.all_gather(&xs)?.to_vec2::<half::bf16>()?;
             return Ok(rows
