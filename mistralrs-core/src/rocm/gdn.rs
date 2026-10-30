@@ -22,8 +22,10 @@ pub enum RecurrenceKernel {
     Scalar,
     /// One warp per value column.
     Warp,
-    /// 64-token chunks.
+    /// 64-token chunks, scalar math.
     Chunked,
+    /// 64-token chunks on the matrix cores (`gdn_chunked_wmma.cu`); 128/128 head dims only.
+    ChunkedWmma,
 }
 
 /// Gated delta rule recurrence. `state` is the key-major `[BH, K, V]` state (or
@@ -58,10 +60,69 @@ pub fn gated_delta_rule_recurrence_rocm(
 
     let output_buf = unsafe { dev.alloc::<f32>(bh * seq_len * v_dim) }?;
     let stream = dev.hip_stream().raw() as i64;
+    if matches!(kernel, RecurrenceKernel::ChunkedWmma) {
+        if k_dim != 128 || v_dim != 128 {
+            candle_core::bail!(
+                "the chunked WMMA GDN recurrence needs 128/128 head dims, got {k_dim}/{v_dim}"
+            );
+        }
+        let (bh_i, seq_i) = (bh as i32, seq_len as i32);
+        let tile_bytes =
+            unsafe { crate::rocm::ffi::chunked_wmma_gdn_tile_bytes(bh_i, seq_i) } as usize;
+        let snap_bytes =
+            unsafe { crate::rocm::ffi::chunked_wmma_gdn_snapshot_bytes(bh_i, seq_i) } as usize;
+        let chunks = unsafe { crate::rocm::ffi::chunked_wmma_gdn_num_chunks(seq_i) } as usize;
+        // Pass-1 products (W, U, K'), the deltas, the per-chunk state snapshots and decays; all
+        // transient, released with the stream's block cache after the launch.
+        let w = unsafe { dev.alloc::<u8>(tile_bytes) }?;
+        let u = unsafe { dev.alloc::<u8>(tile_bytes) }?;
+        let kp = unsafe { dev.alloc::<u8>(tile_bytes) }?;
+        let dlt = unsafe { dev.alloc::<u8>(tile_bytes) }?;
+        let snap = unsafe { dev.alloc::<u8>(snap_bytes) }?;
+        let gtot = unsafe { dev.alloc::<f32>(bh * chunks) }?;
+        with_slot_indices(slots, |slot_ptr, batch| {
+            let num_heads = bh.checked_div(batch).unwrap_or(1);
+            let launched = unsafe {
+                crate::rocm::ffi::chunked_wmma_gated_delta_rule_recurrence(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    g_ptr,
+                    beta_ptr,
+                    state_ptr,
+                    output_buf.device_ptr() as *mut f32,
+                    bh_i,
+                    seq_i,
+                    k_dim as i32,
+                    v_dim as i32,
+                    slot_ptr,
+                    num_heads as i32,
+                    state_dtype,
+                    w.device_ptr() as *mut core::ffi::c_void,
+                    u.device_ptr() as *mut core::ffi::c_void,
+                    kp.device_ptr() as *mut core::ffi::c_void,
+                    dlt.device_ptr() as *mut core::ffi::c_void,
+                    snap.device_ptr() as *mut core::ffi::c_void,
+                    gtot.device_ptr() as *mut f32,
+                    stream,
+                )
+            };
+            if launched == 0 {
+                candle_core::bail!("the chunked WMMA GDN recurrence rejected the launch shape");
+            }
+            Ok(())
+        })?;
+        let output_storage = candle::RocmStorage::wrap_rocm_slice(output_buf, dev.clone());
+        return Ok(Tensor::from((
+            candle::Storage::Rocm(output_storage),
+            (bh, seq_len, v_dim),
+        )));
+    }
     let launcher = match kernel {
         RecurrenceKernel::Scalar => crate::rocm::ffi::gated_delta_rule_recurrence,
         RecurrenceKernel::Warp => crate::rocm::ffi::warp_gated_delta_rule_recurrence,
         RecurrenceKernel::Chunked => crate::rocm::ffi::chunked_gated_delta_rule_recurrence,
+        RecurrenceKernel::ChunkedWmma => unreachable!("handled above"),
     };
     with_slot_indices(slots, |slot_ptr, batch| {
         let num_heads = bh.checked_div(batch).unwrap_or(1);

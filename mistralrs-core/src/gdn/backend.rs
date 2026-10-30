@@ -777,7 +777,7 @@ fn recurrence_rocm_from_convolved(
             g: &g_bh,
             beta: &beta_bh,
         };
-        let kernel = rocm_prefill_recurrence_kernel(seq_len, dims.head_k_dim);
+        let kernel = rocm_prefill_recurrence_kernel(seq_len, dims.head_k_dim, dims.head_v_dim);
         crate::rocm::gdn::gated_delta_rule_recurrence_rocm(kernel, inputs, &mut state_flat, slots)?
     };
     finish_recurrence(
@@ -793,22 +793,30 @@ fn recurrence_rocm_from_convolved(
 
 /// The ROCm recurrence kernel for a step of `seq_len` tokens: the CUDA key-major policy
 /// (one warp per value column above the chunk threshold), or `MISTRALRS_GDN_PREFILL_KERNEL`
-/// = `scalar` (one thread per value column, state in registers) | `warp` | `chunked`.
+/// = `scalar` (one thread per value column, state in registers) | `warp` | `chunked` |
+/// `chunked_wmma`.
 #[cfg(feature = "rocm")]
 fn rocm_prefill_recurrence_kernel(
     seq_len: usize,
     head_k_dim: usize,
+    head_v_dim: usize,
 ) -> crate::rocm::gdn::RecurrenceKernel {
     use crate::rocm::gdn::RecurrenceKernel;
+    let wmma_dims = head_k_dim == 128 && head_v_dim == 128;
     if seq_len >= RECURRENCE_CHUNK_THRESHOLD {
         match std::env::var("MISTRALRS_GDN_PREFILL_KERNEL").as_deref() {
             Ok("scalar") => return RecurrenceKernel::Scalar,
             Ok("warp") => return RecurrenceKernel::Warp,
             Ok("chunked") => return RecurrenceKernel::Chunked,
+            Ok("chunked_wmma") if wmma_dims => return RecurrenceKernel::ChunkedWmma,
             _ => {}
         }
     }
-    if seq_len >= RECURRENCE_CHUNK_THRESHOLD && matches!(head_k_dim, 64 | 128) {
+    if seq_len >= RECURRENCE_CHUNK_THRESHOLD && wmma_dims {
+        // 3.5x the warp kernel at 24-48 heads x 2048 tokens on gfx1201 (fp16 operands, ~5e-4
+        // relative RMS against the f32 recurrence).
+        RecurrenceKernel::ChunkedWmma
+    } else if seq_len >= RECURRENCE_CHUNK_THRESHOLD && matches!(head_k_dim, 64 | 128) {
         RecurrenceKernel::Warp
     } else if seq_len >= RECURRENCE_CHUNK_THRESHOLD {
         RecurrenceKernel::Chunked
@@ -847,7 +855,7 @@ fn recurrence_rocm(
         g: &g_bh,
         beta: &beta_bh,
     };
-    let kernel = rocm_prefill_recurrence_kernel(seq_len, dims.head_k_dim);
+    let kernel = rocm_prefill_recurrence_kernel(seq_len, dims.head_k_dim, dims.head_v_dim);
     let out_bh =
         crate::rocm::gdn::gated_delta_rule_recurrence_rocm(kernel, inputs, &mut state_flat, slots)?;
     finish_recurrence(

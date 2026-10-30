@@ -247,6 +247,7 @@ const ROCM_SOURCES: &[&str] = &[
     "src/cuda/gdn.cu",
     "src/cuda/moe_router.cu",
     "src/cuda/qwen4_exp.cu",
+    "src/rocm/gdn_chunked_wmma.cu",
     "src/rocm/moe_glue.cu",
     "src/rocm/sampling.cu",
 ];

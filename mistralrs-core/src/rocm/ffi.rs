@@ -57,6 +57,35 @@ extern "C" {
         stream: i64,
     );
 
+    /// Chunked gated delta rule prefill on the gfx12 matrix cores
+    /// (`src/rocm/gdn_chunked_wmma.cu`); returns 1 when launched, 0 for unhandled shapes.
+    pub fn chunked_wmma_gated_delta_rule_recurrence(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut c_void,
+        output: *mut f32,
+        bh: i32,
+        seq_len: i32,
+        k_dim: i32,
+        v_dim: i32,
+        slot_indices: *const i32,
+        num_heads: i32,
+        state_dtype: i32,
+        w: *mut c_void,
+        u: *mut c_void,
+        kp: *mut c_void,
+        dlt: *mut c_void,
+        snap: *mut c_void,
+        gtot: *mut f32,
+        stream: i64,
+    ) -> i32;
+    pub fn chunked_wmma_gdn_tile_bytes(bh: i32, seq_len: i32) -> i64;
+    pub fn chunked_wmma_gdn_snapshot_bytes(bh: i32, seq_len: i32) -> i64;
+    pub fn chunked_wmma_gdn_num_chunks(seq_len: i32) -> i64;
+
     pub fn causal_conv1d_update(
         x: *const c_void,
         weight: *const c_void,
