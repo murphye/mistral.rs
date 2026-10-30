@@ -125,16 +125,19 @@ impl ModelConfigLike for Qwen4ExpPagedConfig {
     ) -> crate::paged_attention::AttentionBackendKind {
         self.inner.attention_backend_kind_for_layer(layer_idx)
     }
-    // Token-major rows keep sparse gathers coalesced; decode never runs FlashInfer's group-limited kernels
+    // Token-major rows keep sparse gathers coalesced; decode never runs FlashInfer's group-limited kernels.
+    // On ROCm the same layout cuts the sparse gathers' cache-line over-fetch (the vLLM layout
+    // reads 4 B of every 32 B V row and 16 B of every 64 B K line); the QSA kernels write and
+    // read it themselves.
     fn kv_cache_layout(&self) -> crate::paged_attention::KvCacheLayout {
-        if cfg!(feature = "cuda") {
+        if cfg!(any(feature = "cuda", feature = "rocm")) {
             crate::paged_attention::KvCacheLayout::FlashInferHnd
         } else {
             self.inner.kv_cache_layout()
         }
     }
     fn kv_cache_layout_for_layer(&self, layer_idx: usize) -> crate::paged_attention::KvCacheLayout {
-        if cfg!(feature = "cuda") {
+        if cfg!(any(feature = "cuda", feature = "rocm")) {
             crate::paged_attention::KvCacheLayout::FlashInferHnd
         } else {
             self.inner.kv_cache_layout_for_layer(layer_idx)

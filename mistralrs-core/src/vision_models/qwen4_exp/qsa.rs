@@ -580,11 +580,58 @@ impl QsaAttention {
                 shape: &shape,
                 eps: self.eps,
             })?;
-            let QsaMode::Sparse { max_blocks } = step.mode else {
-                // The dense prompt paths multiply `q` as `[b, heads, tokens, d]`, which the
-                // token-major buffer only is after a copy (the ROCm matmul takes no other
-                // row stride).
-                let y = paged_attn.forward(
+            // On ROCm the token-major (HND) cache is only read by the QSA kernels, so dense mode
+            // runs them with every block selected wherever the layer's standard path would read
+            // the cache (decode, chunked or prefix-cached prompts). A first prompt chunk without
+            // cached context attends over its own bf16 K/V and keeps the exact dense path.
+            let hnd_cache = key_cache.rank() == 4;
+            let rocm_hnd = cfg!(all(feature = "rocm", not(feature = "cuda"))) && hnd_cache;
+            let exact_dense_prompt = metadata.is_first_prompt_chunk
+                && metadata
+                    .num_cached_tokens
+                    .as_ref()
+                    .is_none_or(|cached| cached.iter().all(|&n| n == 0))
+                && !metadata.has_noncausal_mm_context;
+            if std::env::var_os("MISTRALRS_QSA_ROUTE_DEBUG").is_some() {
+                eprintln!(
+                    "qsa route: mode={:?} hnd={hnd_cache} first_chunk={} cached={:?} noncausal_mm={} exact={exact_dense_prompt} tokens={n_tokens}",
+                    step.mode,
+                    metadata.is_first_prompt_chunk,
+                    metadata.num_cached_tokens,
+                    metadata.has_noncausal_mm_context
+                );
+            }
+            let max_blocks = match step.mode {
+                QsaMode::Sparse { max_blocks } => Some(max_blocks),
+                QsaMode::Dense if rocm_hnd && exact_dense_prompt => {
+                    // Written through the HND kernel; attention over this chunk's own bf16 K/V
+                    // (the layer's standard prompt path would gather from the cache in the
+                    // vLLM layout as soon as the scheduler reports cached tokens, even zero).
+                    let mut key_cache = key_cache.clone();
+                    let mut value_cache = value_cache.clone();
+                    paged_attn.write_cache(
+                        &k.transpose(1, 2)?.contiguous()?,
+                        &v.contiguous()?,
+                        &mut key_cache,
+                        &mut value_cache,
+                        metadata,
+                    )?;
+                    let y = Sdpa.run_attention(
+                        q,
+                        k,
+                        &v.transpose(1, 2)?.contiguous()?,
+                        attention_mask,
+                        Some(flash_params),
+                        &self.sdpa_params,
+                    )?;
+                    return Ok((y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?, false));
+                }
+                QsaMode::Dense if rocm_hnd => None,
+                QsaMode::Dense => {
+                    // The dense prompt paths multiply `q` as `[b, heads, tokens, d]`, which the
+                    // token-major buffer only is after a copy (the ROCm matmul takes no other
+                    // row stride).
+                    let y = paged_attn.forward(
                     &q.contiguous()?,
                     k,
                     &v.transpose(1, 2)?.contiguous()?,
@@ -595,7 +642,8 @@ impl QsaAttention {
                     &self.sdpa_params,
                     Some(flash_params),
                 )?;
-                return Ok((y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?, false));
+                    return Ok((y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?, false));
+                }
             };
             let mut key_cache = key_cache.clone();
             let mut value_cache = value_cache.clone();
@@ -607,23 +655,29 @@ impl QsaAttention {
                 metadata,
             )?;
             let index_q = index_q.reshape((n_tokens, self.qsa.n_heads, self.qsa.head_dim))?;
-            let (selected, n_selected) = match kernels::qsa_select_cutile(
-                &index_q,
-                &aux.block_keys,
-                layout,
-                &paged,
-                &shape,
-                max_blocks,
-            )? {
-                Some(selection) => selection,
-                None => kernels::qsa_select(
+            let (selected, n_selected) = match max_blocks {
+                #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+                None => kernels::qsa_select_all(layout, &paged, &shape, q.device())?,
+                #[cfg(not(all(feature = "rocm", not(feature = "cuda"))))]
+                None => unreachable!("dense QSA selects every block only on ROCm HND caches"),
+                Some(max_blocks) => match kernels::qsa_select_cutile(
                     &index_q,
                     &aux.block_keys,
                     layout,
                     &paged,
                     &shape,
                     max_blocks,
-                )?,
+                )? {
+                    Some(selection) => selection,
+                    None => kernels::qsa_select(
+                        &index_q,
+                        &aux.block_keys,
+                        layout,
+                        &paged,
+                        &shape,
+                        max_blocks,
+                    )?,
+                },
             };
             let q_tokens = q.transpose(1, 2)?.contiguous()?.reshape((
                 n_tokens,

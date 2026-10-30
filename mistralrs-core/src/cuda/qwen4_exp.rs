@@ -258,6 +258,33 @@ mod ffi {
             dtype: i32,
             stream: i64,
         );
+        #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+        pub(super) fn qwen4_qsa_select_all(
+            layout: Q4Tokens,
+            paged: Q4Paged,
+            ratio: i32,
+            topk: i32,
+            selected: *mut i32,
+            n_selected: *mut i32,
+            stream: i64,
+        );
+        #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+        pub(super) fn qwen4_kv_write_hnd(
+            k: *const c_void,
+            v: *const c_void,
+            slots: *const i64,
+            kc: *mut c_void,
+            vc: *mut c_void,
+            n_tokens: i32,
+            kv_heads: i32,
+            head_dim: i32,
+            block_size: i32,
+            k_scale: *const f32,
+            v_scale: *const f32,
+            dtype: i32,
+            cache_fp8: i32,
+            stream: i64,
+        );
         pub(super) fn qwen4_qsa_attention(
             q: *const c_void,
             k_cache: *const c_void,
@@ -1060,6 +1087,106 @@ pub(crate) fn qsa_select(
         );
     }
     Ok((selected, n_selected))
+}
+
+/// Dense mode on a token-major (HND) cache: every complete block of each query, in order.
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+pub(crate) fn qsa_select_all(
+    layout: &TokenLayout,
+    paged: &PagedView<'_>,
+    shape: &QsaShape,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let n_tokens = layout.n_tokens;
+    let selected = empty(&[n_tokens, shape.topk], DType::I32, device)?;
+    let n_selected = empty(&[n_tokens], DType::I32, device)?;
+    unsafe {
+        ffi::qwen4_qsa_select_all(
+            layout.ffi()?,
+            paged.ffi()?,
+            shape.ratio as i32,
+            shape.topk as i32,
+            dev_ptr(&selected)? as *mut i32,
+            dev_ptr(&n_selected)? as *mut i32,
+            stream(device)?,
+        );
+    }
+    Ok((selected, n_selected))
+}
+
+/// Writes `key`, `value` (`[tokens, kv_heads, head_dim]`) into token-major (HND) paged caches
+/// (`[blocks, kv_heads, block_size, head_dim]`, the activation dtype or f8e4m3) at the i64
+/// `slot_mapping`. fp8 caches store `x / scale` for the optional f32 scalar scales.
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+pub(crate) fn kv_write_hnd(
+    key: &Tensor,
+    value: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    slot_mapping: &Tensor,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+) -> Result<()> {
+    let key = key.contiguous()?;
+    let value = value.contiguous()?;
+    let (n_tokens, kv_heads, head_dim) = key.dims3()?;
+    let (blocks, cache_heads, block_size, cache_dim) = key_cache.dims4()?;
+    if value.dims() != key.dims()
+        || value_cache.dims() != key_cache.dims()
+        || cache_heads != kv_heads
+        || cache_dim != head_dim
+        || head_dim % 8 != 0
+        || key.dtype() != value.dtype()
+        || key_cache.dtype() != value_cache.dtype()
+    {
+        candle_core::bail!(
+            "kv_write_hnd: shapes disagree (k {:?}, cache {:?} x {blocks} blocks)",
+            key.dims(),
+            key_cache.dims()
+        );
+    }
+    if slot_mapping.dtype() != DType::I64 || slot_mapping.elem_count() != n_tokens {
+        candle_core::bail!(
+            "kv_write_hnd: expected an i64 slot mapping of {n_tokens} entries, got {:?} {:?}",
+            slot_mapping.dtype(),
+            slot_mapping.dims()
+        );
+    }
+    let slot_mapping = slot_mapping.contiguous()?;
+    let cache_fp8 = match key_cache.dtype() {
+        DType::F8E4M3 => true,
+        dtype if dtype == key.dtype() => false,
+        dtype => candle_core::bail!(
+            "kv_write_hnd: cache dtype {dtype:?} does not match {:?}",
+            key.dtype()
+        ),
+    };
+    let scale_ptr = |scale: Option<&Tensor>| -> Result<u64> {
+        match scale {
+            Some(s) if s.dtype() == DType::F32 && s.elem_count() == 1 => dev_ptr(s),
+            Some(s) => candle_core::bail!("kv_write_hnd: scales must be f32 scalars, got {s:?}"),
+            None => Ok(0),
+        }
+    };
+    unsafe {
+        ffi::qwen4_kv_write_hnd(
+            dev_ptr(&key)? as *const _,
+            dev_ptr(&value)? as *const _,
+            dev_ptr(&slot_mapping)? as *const i64,
+            dev_ptr(key_cache)? as *mut _,
+            dev_ptr(value_cache)? as *mut _,
+            n_tokens as i32,
+            kv_heads as i32,
+            head_dim as i32,
+            block_size as i32,
+            scale_ptr(k_scale)? as *const f32,
+            scale_ptr(v_scale)? as *const f32,
+            half_dtype_code(key.dtype())?,
+            i32::from(cache_fp8),
+            stream(key.device())?,
+        );
+    }
+    Ok(())
 }
 
 /// cuTile scoring plus the CUDA top-k, for prefill layouts on devices with the tile JIT.

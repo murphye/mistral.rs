@@ -1459,6 +1459,22 @@ __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
 #pragma unroll
       for (int i = 0; i < 8; ++i) k_lds[j * Q4W_LD + c * 8 + i] = static_cast<bf>(kv[i]);
     }
+    // Token-major caches hold an item's V as one contiguous row: load it like K.
+    if (flashinfer_layout) {
+      for (int e = tid; e < Q4W_ITEMS * (Q4_ATTN_HEAD_DIM / 8); e += Q4W_THREADS) {
+        const int j = e / (Q4_ATTN_HEAD_DIM / 8), c = e % (Q4_ATTN_HEAD_DIM / 8);
+        const TC *vp = v_item[j];
+        float vv[8];
+        if (vp) {
+          q4_load8c<TC>(vp + c * 8, v_scale, vv);
+        } else {
+#pragma unroll
+          for (int i = 0; i < 8; ++i) vv[i] = 0.0f;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v_lds[j * Q4W_LD + c * 8 + i] = static_cast<bf>(vv[i]);
+      }
+    } else
     // V by groups of four items: selected blocks and the tail start at multiples of
     // the ratio (4), so a full group is four consecutive positions of one paged block.
     for (int e = tid; e < (Q4W_ITEMS / 4) * Q4_ATTN_HEAD_DIM; e += Q4W_THREADS) {
@@ -1923,3 +1939,105 @@ extern "C" void qwen4_qsa_attention(
     }
   });
 }
+
+#ifdef USE_ROCM
+// Dense mode on a token-major cache: every complete block of each query is selected (the
+// paged-attention layer's standard kernels only know the vLLM layout).
+__global__ void q4_qsa_select_all_kernel(Q4Tokens l, Q4Paged pg, int ratio, int topk,
+                                         int *__restrict__ selected,
+                                         int *__restrict__ n_selected) {
+  const int t = blockIdx.x;
+  int seq;
+  const int pos = q4_pos_of(l, pg, t, seq);
+  const int nb = pos < 0 ? 0 : min((pos + 1) / ratio, topk);
+  for (int j = threadIdx.x; j < nb; j += blockDim.x) {
+    selected[(size_t)t * topk + j] = j;
+  }
+  if (threadIdx.x == 0) {
+    n_selected[t] = nb;
+  }
+}
+
+extern "C" void qwen4_qsa_select_all(Q4Tokens layout, Q4Paged paged, int ratio, int topk,
+                                     int *selected, int *n_selected, int64_t stream) {
+  if (layout.n_tokens == 0) {
+    return;
+  }
+  q4_qsa_select_all_kernel<<<layout.n_tokens, 128, 0, (cudaStream_t)stream>>>(
+      layout, paged, ratio, topk, selected, n_selected);
+}
+
+// A cache element from an activation: fp8 caches store x / scale (what the attention
+// kernels multiply back by `k_scale` / `v_scale`).
+template <typename T, typename TC>
+__device__ __forceinline__ TC q4_cache_store(T x, float inv_scale) {
+  return q4_t<TC>(q4_f(x));
+}
+template <>
+__device__ __forceinline__ uint8_t q4_cache_store<__half, uint8_t>(__half x, float inv_scale) {
+  return __hip_cvt_float_to_fp8(q4_f(x) * inv_scale, __HIP_SATFINITE, __HIP_E4M3);
+}
+template <>
+__device__ __forceinline__ uint8_t q4_cache_store<__nv_bfloat16, uint8_t>(__nv_bfloat16 x,
+                                                                            float inv_scale) {
+  return __hip_cvt_float_to_fp8(q4_f(x) * inv_scale, __HIP_SATFINITE, __HIP_E4M3);
+}
+
+// Writes `k`, `v` ([tokens, kv_heads, head_dim], contiguous) into a token-major paged cache
+// ([blocks, kv_heads, block_size, head_dim]) at `slots` (block * block_size + offset; a
+// negative slot skips the token). Eight consecutive elements per thread.
+template <typename T, typename TC>
+__global__ void q4_kv_write_hnd_kernel(const T *__restrict__ k, const T *__restrict__ v,
+                                       const int64_t *__restrict__ slots, TC *__restrict__ kc,
+                                       TC *__restrict__ vc, int kv_heads, int head_dim,
+                                       int block_size, const float *__restrict__ k_scale,
+                                       const float *__restrict__ v_scale) {
+  const int t = blockIdx.x;
+  const int64_t slot = slots[t];
+  if (slot < 0) {
+    return;
+  }
+  const int64_t blk = slot / block_size, off = slot % block_size;
+  const float ki = k_scale ? 1.0f / *k_scale : 1.0f;
+  const float vi = v_scale ? 1.0f / *v_scale : 1.0f;
+  const int n = kv_heads * head_dim;
+  for (int e8 = threadIdx.x * 8; e8 < n; e8 += blockDim.x * 8) {
+    const int h = e8 / head_dim, d = e8 - h * head_dim;
+    const size_t src = (size_t)t * n + e8;
+    const size_t dst = (((size_t)blk * kv_heads + h) * block_size + off) * head_dim + d;
+    struct __align__(16) In8 {
+      T x[8];
+    };
+    struct __align__(8 * sizeof(TC)) Out8 {
+      TC x[8];
+    };
+    const In8 kin = *reinterpret_cast<const In8 *>(k + src);
+    const In8 vin = *reinterpret_cast<const In8 *>(v + src);
+    Out8 kout, vout;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      kout.x[i] = q4_cache_store<T, TC>(kin.x[i], ki);
+      vout.x[i] = q4_cache_store<T, TC>(vin.x[i], vi);
+    }
+    *reinterpret_cast<Out8 *>(kc + dst) = kout;
+    *reinterpret_cast<Out8 *>(vc + dst) = vout;
+  }
+}
+
+extern "C" void qwen4_kv_write_hnd(const void *k, const void *v, const int64_t *slots, void *kc,
+                                   void *vc, int n_tokens, int kv_heads, int head_dim,
+                                   int block_size, const float *k_scale, const float *v_scale,
+                                   int dtype, int cache_fp8, int64_t stream) {
+  if (n_tokens == 0) {
+    return;
+  }
+  const int threads = min(256, max(32, (kv_heads * head_dim / 8 + 31) / 32 * 32));
+  Q4_DISPATCH_HALF(dtype, {
+    Q4_QSA_WITH_CACHE_T({
+      q4_kv_write_hnd_kernel<scalar_t, cache_t><<<n_tokens, threads, 0, (cudaStream_t)stream>>>(
+          (const scalar_t *)k, (const scalar_t *)v, slots, (cache_t *)kc, (cache_t *)vc,
+          kv_heads, head_dim, block_size, k_scale, v_scale);
+    });
+  });
+}
+#endif

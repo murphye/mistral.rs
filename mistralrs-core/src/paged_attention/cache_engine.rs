@@ -234,7 +234,7 @@ impl CacheEngine {
                 metal_layout.unwrap()
             } else if matches!(requested_kv_cache_layout, KvCacheLayout::MetalHnd)
                 || matches!(requested_kv_cache_layout, KvCacheLayout::FlashInferHnd)
-                    && !device.is_cuda()
+                    && !(device.is_cuda() || device.is_rocm())
             {
                 KvCacheLayout::Standard
             } else {

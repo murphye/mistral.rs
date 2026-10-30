@@ -315,15 +315,32 @@ fn write_kv_cache(
                 unreachable!("FlashInfer cache is only available with CUDA")
             }
         }
-        AttentionBackendKind::Standard => reshape_and_cache(
-            key,
-            value,
-            scales.k,
-            scales.v,
-            key_cache,
-            value_cache,
-            slot_mapping,
-        ),
+        AttentionBackendKind::Standard => {
+            // ROCm token-major (HND) caches: rank 4, written by the Qwen4-Exp kernels.
+            #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+            if key_cache.rank() == 4 && key_cache.device().is_rocm() {
+                let key = key.contiguous()?.reshape(cache_input_shape(key)?)?;
+                let value = value.contiguous()?.reshape(cache_input_shape(value)?)?;
+                return crate::rocm::qwen4_exp::kv_write_hnd(
+                    &key,
+                    &value,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    scales.k,
+                    scales.v,
+                );
+            }
+            reshape_and_cache(
+                key,
+                value,
+                scales.k,
+                scales.v,
+                key_cache,
+                value_cache,
+                slot_mapping,
+            )
+        }
     }
 }
 
