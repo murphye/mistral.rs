@@ -555,9 +555,65 @@ pub struct Logprobs {
     pub top_logprobs: Option<Vec<TopLogprob>>,
 }
 
+/// A probability per vocabulary token: a dense row, or only the candidates of a device top-k
+/// with every other token at zero, which spares building (and faulting in) two vocabulary-sized
+/// rows per verified position.
+#[derive(Clone, Debug)]
+pub(crate) enum TokenProbs {
+    Dense(Vec<f32>),
+    Sparse {
+        vocab: usize,
+        tokens: Vec<u32>,
+        probs: Vec<f32>,
+    },
+}
+
+impl TokenProbs {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Dense(probs) => probs.len(),
+            Self::Sparse { vocab, .. } => *vocab,
+        }
+    }
+
+    pub(crate) fn get(&self, token: usize) -> f32 {
+        match self {
+            Self::Dense(probs) => probs.get(token).copied().unwrap_or(0.0),
+            Self::Sparse { tokens, probs, .. } => tokens
+                .iter()
+                .position(|&t| t as usize == token)
+                .map_or(0.0, |i| probs[i]),
+        }
+    }
+
+    pub(crate) fn dense(&self) -> std::borrow::Cow<'_, [f32]> {
+        match self {
+            Self::Dense(probs) => std::borrow::Cow::Borrowed(probs),
+            Self::Sparse { .. } => std::borrow::Cow::Owned(self.clone().into_dense()),
+        }
+    }
+
+    pub(crate) fn into_dense(self) -> Vec<f32> {
+        match self {
+            Self::Dense(probs) => probs,
+            Self::Sparse {
+                vocab,
+                tokens,
+                probs,
+            } => {
+                let mut dense = vec![0.0; vocab];
+                for (token, p) in tokens.into_iter().zip(probs) {
+                    dense[token as usize] = p;
+                }
+                dense
+            }
+        }
+    }
+}
+
 pub(crate) struct SpeculativeProbs {
-    pub sampling: Vec<f32>,
-    pub reporting: Vec<f32>,
+    pub sampling: TokenProbs,
+    pub reporting: TokenProbs,
     /// Every token with nonzero `sampling` mass, when known to be a small set (a device top-k),
     /// so rejection sampling can skip the full vocabulary.
     pub support: Option<Vec<u32>>,
@@ -1896,7 +1952,8 @@ impl Sampler {
     ) -> Result<Vec<f32>> {
         Ok(self
             .speculative_probs(logits, context, prompt_len)?
-            .sampling)
+            .sampling
+            .into_dense())
     }
 
     fn speculative_probs(
@@ -1939,8 +1996,8 @@ impl Sampler {
         self.filter_top_kp_min_p(&mut sampling);
         Self::normalize_probs(&mut sampling)?;
         Ok(SpeculativeProbs {
-            sampling,
-            reporting,
+            sampling: TokenProbs::Dense(sampling),
+            reporting: TokenProbs::Dense(reporting),
             support: None,
         })
     }
@@ -2011,6 +2068,64 @@ impl Sampler {
             .map(Some)
     }
 
+    /// [`Self::speculative_target_probs_rows_rocm`] for several sequences at once: `logits` is
+    /// `[.., total rows, vocab]` with the first `rows[0]` rows for `samplers[0]`, the next
+    /// `rows[1]` for `samplers[1]`, and so on, all ranked by one device top-k and one read-back.
+    /// `None` when any sampler cannot use the device path.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn speculative_target_probs_batch_rocm(
+        samplers: &[Arc<Sampler>],
+        logits: &Tensor,
+        rows: &[usize],
+    ) -> Result<Option<Vec<Vec<SpeculativeProbs>>>> {
+        let Some(plans) = samplers
+            .iter()
+            .map(|sampler| sampler.speculative_rocm_plan())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        if !logits.device().is_rocm() || samplers.len() != rows.len() {
+            return Ok(None);
+        }
+        let vocab = logits.dim(candle_core::D::Minus1)?;
+        let total = logits.elem_count() / vocab;
+        if rows.iter().sum::<usize>() != total {
+            candle_core::bail!("batched target top-k: {rows:?} rows for {total} logit rows");
+        }
+        let logits = logits.reshape((total, vocab))?;
+        let k = plans.iter().map(|(k, _)| *k).max().unwrap_or(1).min(vocab);
+        let inv_t = plans
+            .iter()
+            .zip(rows)
+            .flat_map(|((_, t), &n)| std::iter::repeat_n((1.0 / t) as f32, n))
+            .collect::<Vec<_>>();
+        let packed = crate::rocm::sampling::topk_logits_packed_batched(&logits, k, &inv_t)?;
+        let mut packed = packed.iter();
+        samplers
+            .iter()
+            .zip(plans)
+            .zip(rows)
+            .map(|((sampler, (row_k, temperature)), &n)| {
+                // Each row keeps the first `row_k` of the common k (they come sorted), plus the
+                // softmax denominator and maximum, which do not depend on k.
+                let row_k = row_k.min(k);
+                packed
+                    .by_ref()
+                    .take(n)
+                    .map(|row| {
+                        let mut own = Vec::with_capacity(2 * row_k + 2);
+                        own.extend_from_slice(&row[..row_k]);
+                        own.extend_from_slice(&row[k..k + row_k]);
+                        own.extend_from_slice(&row[2 * k..2 * k + 2]);
+                        sampler.speculative_probs_from_packed(&own, row_k, temperature, vocab)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
     #[cfg(feature = "rocm")]
     fn speculative_probs_from_packed(
         &self,
@@ -2030,15 +2145,12 @@ impl Sampler {
             .iter()
             .map(|v| (v * inv_t - global_max).exp() / denom)
             .collect::<Vec<_>>();
-        let mut reporting = vec![0.0f32; vocab];
-        let mut sampling = vec![0.0f32; vocab];
-        for (&idx, &p) in indices.iter().zip(&probs) {
-            reporting[idx as usize] = p;
-        }
+        let tokens = indices.iter().map(|&idx| idx as u32).collect::<Vec<_>>();
         let mut support = Vec::with_capacity(k);
+        let mut sampling = Vec::with_capacity(k);
         if self.temperature.is_none() {
-            sampling[indices[0] as usize] = 1.0;
-            support.push(indices[0] as u32);
+            sampling.push(1.0);
+            support.push(tokens[0]);
         } else {
             // Candidates come sorted, as in sample_packed_topk: top-p then min-p over them.
             let mut kept = probs.clone();
@@ -2065,16 +2177,24 @@ impl Sampler {
             if total <= 0.0 || !total.is_finite() {
                 candle_core::bail!("all speculative sampling probabilities are zero after filtering");
             }
-            for (&idx, &p) in indices.iter().zip(&kept) {
+            for (&token, &p) in tokens.iter().zip(&kept) {
                 if p > 0.0 {
-                    sampling[idx as usize] = p / total;
-                    support.push(idx as u32);
+                    sampling.push(p / total);
+                    support.push(token);
                 }
             }
         }
         Ok(SpeculativeProbs {
-            sampling,
-            reporting,
+            sampling: TokenProbs::Sparse {
+                vocab,
+                tokens: support.clone(),
+                probs: sampling,
+            },
+            reporting: TokenProbs::Sparse {
+                vocab,
+                tokens,
+                probs,
+            },
             support: Some(support),
         })
     }
@@ -2085,16 +2205,44 @@ impl Sampler {
         probs: &[f32],
         return_logprobs: bool,
     ) -> Result<Logprobs> {
-        let prob = probs.get(token as usize).copied().unwrap_or(0.0);
-        let logprob = if prob > 0.0 {
-            prob.ln()
-        } else {
-            f32::NEG_INFINITY
-        };
         let top_logprobs = if return_logprobs {
             Some(self.get_top_logprobs(probs)?)
         } else {
             None
+        };
+        self.logprobs_for(
+            token,
+            probs.get(token as usize).copied().unwrap_or(0.0),
+            top_logprobs,
+        )
+    }
+
+    /// [`Self::logprobs_from_probs`] over [`TokenProbs`]: a sparse row becomes dense only for
+    /// the top logprobs.
+    pub(crate) fn logprobs_from_token_probs(
+        &self,
+        token: u32,
+        probs: &TokenProbs,
+        return_logprobs: bool,
+    ) -> Result<Logprobs> {
+        let top_logprobs = if return_logprobs {
+            Some(self.get_top_logprobs(&probs.dense())?)
+        } else {
+            None
+        };
+        self.logprobs_for(token, probs.get(token as usize), top_logprobs)
+    }
+
+    fn logprobs_for(
+        &self,
+        token: u32,
+        prob: f32,
+        top_logprobs: Option<Vec<TopLogprob>>,
+    ) -> Result<Logprobs> {
+        let logprob = if prob > 0.0 {
+            prob.ln()
+        } else {
+            f32::NEG_INFINITY
         };
         let bytes = if let Some(tokenizer) = &self.tokenizer {
             Some(
@@ -2119,7 +2267,7 @@ impl Sampler {
         &self,
         tokens: &[u32],
         weights: &[f32],
-        reporting_probs: &[f32],
+        reporting_probs: &TokenProbs,
         return_logprobs: bool,
         rng: Arc<Mutex<Isaac64Rng>>,
     ) -> Result<Logprobs> {
@@ -2127,7 +2275,7 @@ impl Sampler {
             Error::Msg(format!("Failed to construct speculative sampler: {e}"))
         })?;
         let idx = distr.sample(&mut *rng.lock().expect("could not lock rng mutex"));
-        self.logprobs_from_probs(tokens[idx], reporting_probs, return_logprobs)
+        self.logprobs_from_token_probs(tokens[idx], reporting_probs, return_logprobs)
     }
 
     pub(crate) fn sample_from_probs(
@@ -2635,14 +2783,14 @@ mod tests {
             .speculative_candidate_probs(logits, &context, 0)
             .unwrap();
 
-        assert_eq!(candidate_probs, target_probs.sampling);
+        assert_eq!(candidate_probs, *target_probs.sampling.dense());
         assert_eq!(candidate_probs, vec![0.0, 0.0, 1.0]);
         let expected = [
             1.0f32 / (1.0 + 1.0f32.exp() + 2.0f32.exp()),
             1.0f32.exp() / (1.0 + 1.0f32.exp() + 2.0f32.exp()),
             2.0f32.exp() / (1.0 + 1.0f32.exp() + 2.0f32.exp()),
         ];
-        for (actual, expected) in target_probs.reporting.iter().zip(expected) {
+        for (actual, expected) in target_probs.reporting.dense().iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6);
         }
     }

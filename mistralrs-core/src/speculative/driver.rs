@@ -38,6 +38,66 @@ struct PreparedVerification {
     proposal_distribution: Option<SpeculativeProposalDistribution>,
 }
 
+/// The target probabilities of every stochastically verified sequence's rows from one device
+/// top-k (one launch and one read-back for the batch instead of one per sequence), aligned with
+/// `seqs`; `None` where a sequence verifies on its own.
+#[cfg(feature = "rocm")]
+fn rocm_batched_target_probs(
+    seqs: &[&mut Sequence],
+    logits: &[Tensor],
+    batched_logits: Option<&Tensor>,
+    prepared: &[Option<PreparedVerification>],
+) -> Result<Vec<Option<Vec<crate::sampler::SpeculativeProbs>>>> {
+    let mut out = std::iter::repeat_with(|| None)
+        .take(seqs.len())
+        .collect::<Vec<_>>();
+    let active = prepared
+        .iter()
+        .enumerate()
+        .filter(|(idx, prepared)| {
+            prepared
+                .as_ref()
+                .is_some_and(|prepared| prepared.proposal_distribution.is_some())
+                && super::verifier::stochastic_verification_allowed_for_sequence(&*seqs[*idx])
+        })
+        .map(|(idx, _)| idx)
+        .collect::<Vec<_>>();
+    if active.len() < 2 {
+        return Ok(out);
+    }
+    let vocab = logits[active[0]].dim(candle_core::D::Minus1)?;
+    let rows = active
+        .iter()
+        .map(|&idx| logits[idx].elem_count() / vocab)
+        .collect::<Vec<_>>();
+    let total = rows.iter().sum::<usize>();
+    let all = match batched_logits {
+        Some(batched) if active.len() == seqs.len() && batched.elem_count() == total * vocab => {
+            batched.clone()
+        }
+        _ => Tensor::cat(
+            &active
+                .iter()
+                .zip(&rows)
+                .map(|(&idx, &n)| logits[idx].reshape((n, vocab)))
+                .collect::<Result<Vec<_>>>()?,
+            0,
+        )?,
+    };
+    let samplers = active
+        .iter()
+        .map(|&idx| seqs[idx].sampler())
+        .collect::<Vec<_>>();
+    if let Some(probs) =
+        crate::sampler::Sampler::speculative_target_probs_batch_rocm(&samplers, &all, &rows)?
+    {
+        for (idx, probs) in active.into_iter().zip(probs) {
+            out[idx] = Some(probs);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(any(feature = "cuda", test))]
 fn materialize_prepared_proposals(prepared: &mut [Option<PreparedVerification>]) -> Result<()> {
     let device_rows = prepared
@@ -531,6 +591,11 @@ where
         .take(seqs.len())
         .collect::<Vec<Option<DeviceVerification>>>();
 
+    #[cfg(feature = "rocm")]
+    let mut target_probs = rocm_batched_target_probs(seqs, logits, batched_logits, &prepared)?;
+    #[cfg(not(feature = "rocm"))]
+    let mut target_probs: Vec<Option<Vec<crate::sampler::SpeculativeProbs>>> = Vec::new();
+
     let mut outcomes: Vec<Option<VerificationOutcome>> = Vec::with_capacity(seqs.len());
     let mut cache_outcomes: Vec<Option<SpeculativeCacheOutcome>> = Vec::with_capacity(seqs.len());
     for (idx, (seq, logits)) in seqs.iter_mut().zip(logits.iter()).enumerate() {
@@ -549,6 +614,7 @@ where
                 base_len: prepared.base_len,
                 anchor_to_emit: None,
                 device_verification: device_verifications[idx].take(),
+                target_probs: target_probs.get_mut(idx).and_then(Option::take),
             },
             prefix_cacher,
             disable_eos_stop,

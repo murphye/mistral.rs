@@ -800,6 +800,9 @@ pub(crate) struct VerificationInput {
     pub(crate) base_len: usize,
     pub(crate) anchor_to_emit: Option<Logprobs>,
     pub(crate) device_verification: Option<DeviceVerification>,
+    /// The target's sampling probabilities for every verify row, when the caller ranked all
+    /// sequences' rows at once (ROCm), sparing a device top-k per sequence.
+    pub(crate) target_probs: Option<Vec<crate::sampler::SpeculativeProbs>>,
 }
 
 pub(crate) async fn finish_verified_step<P: Pipeline>(
@@ -818,6 +821,7 @@ pub(crate) async fn finish_verified_step<P: Pipeline>(
         base_len,
         anchor_to_emit,
         device_verification,
+        target_probs,
     } = input;
     let general_metadata = pipeline.get_metadata();
     let eos_tok = seq.effective_eos_tokens(&general_metadata.eos_tok, disable_eos_stop);
@@ -858,6 +862,7 @@ pub(crate) async fn finish_verified_step<P: Pipeline>(
             return_logprobs,
             rng,
             fallback_uniforms,
+            target_probs,
         )
         .await;
     }
@@ -1244,19 +1249,23 @@ async fn finish_verified_step_stochastic<P: Pipeline>(
     return_logprobs: bool,
     rng: Arc<std::sync::Mutex<Isaac64Rng>>,
     fallback_uniforms: Option<&SparseRejectionFallbackUniforms>,
+    target_probs: Option<Vec<crate::sampler::SpeculativeProbs>>,
 ) -> Result<VerificationOutcome> {
     let proposal_distribution = match proposal_distribution {
         Some(distribution) => PreparedProposalDistribution::new(distribution, proposal.len())?,
         None => PreparedProposalDistribution::Deterministic,
     };
-    // On ROCm every row's probabilities come from one batched device top-k.
+    // On ROCm every row's probabilities come from one batched device top-k, over all sequences
+    // when the caller ranked them together.
     #[cfg(feature = "rocm")]
-    let mut batched_target_probs = seq
-        .sampler()
-        .speculative_target_probs_rows_rocm(&verify_logits)?
-        .map(|rows| rows.into_iter().map(Some).collect::<Vec<_>>());
-    #[cfg(not(feature = "rocm"))]
-    let mut batched_target_probs: Option<Vec<Option<crate::sampler::SpeculativeProbs>>> = None;
+    let target_probs = match target_probs {
+        Some(rows) => Some(rows),
+        None => seq
+            .sampler()
+            .speculative_target_probs_rows_rocm(&verify_logits)?,
+    };
+    let mut batched_target_probs =
+        target_probs.map(|rows| rows.into_iter().map(Some).collect::<Vec<_>>());
     let mut accepted = 0usize;
     for (idx, draft) in proposal.iter().copied().enumerate() {
         let target_row = logit_row(&verify_logits, idx)?;
@@ -1281,7 +1290,7 @@ async fn finish_verified_step_stochastic<P: Pipeline>(
             target_probs.sampling.len(),
         )?;
         let draft_idx = draft as usize;
-        let p_i = target_probs.sampling.get(draft_idx).copied().unwrap_or(0.0);
+        let p_i = target_probs.sampling.get(draft_idx);
         let q_i = candidate_probs.probability(draft_idx);
         if candidate_probs.is_sparse() && q_i <= 0.0 {
             candle_core::bail!(
@@ -1307,8 +1316,11 @@ async fn finish_verified_step_stochastic<P: Pipeline>(
 
         if accepts_draft(draw, accept_prob) {
             accepted += 1;
-            let sampled =
-                sampler.logprobs_from_probs(draft, &target_probs.reporting, return_logprobs)?;
+            let sampled = sampler.logprobs_from_token_probs(
+                draft,
+                &target_probs.reporting,
+                return_logprobs,
+            )?;
             finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, sampled, eos_tok, false)
                 .await?;
             if matches!(seq.getstate(), SequenceState::Done(_)) {
@@ -1331,13 +1343,13 @@ async fn finish_verified_step_stochastic<P: Pipeline>(
                 .iter()
                 .map(|&token| {
                     let token = token as usize;
-                    (target_probs.sampling[token] - candidate_probs.probability(token)).max(0.0)
+                    (target_probs.sampling.get(token) - candidate_probs.probability(token)).max(0.0)
                 })
                 .collect::<Vec<_>>();
             if !(weights.iter().sum::<f32>() > 0.0) {
                 weights = support
                     .iter()
-                    .map(|&token| target_probs.sampling[token as usize])
+                    .map(|&token| target_probs.sampling.get(token as usize))
                     .collect();
             }
             let sampled = sample_weighted_tokens(
@@ -1370,25 +1382,25 @@ async fn finish_verified_step_stochastic<P: Pipeline>(
             });
         }
 
-        let mut adjusted_probs = target_probs.sampling.clone();
+        let mut adjusted_probs = target_probs.sampling.dense().into_owned();
         candidate_probs.subtract_from(&mut adjusted_probs)?;
         for prob in &mut adjusted_probs {
             *prob = prob.max(0.0);
         }
         if normalize_probs(&mut adjusted_probs).is_err() {
-            adjusted_probs = target_probs.sampling;
+            adjusted_probs = target_probs.sampling.into_dense();
         }
         let sampled = match fallback_uniforms {
             Some(uniforms) => sample_from_probs_with_uniform(
                 &sampler,
                 &adjusted_probs,
-                &target_probs.reporting,
+                &target_probs.reporting.dense(),
                 return_logprobs,
                 uniforms.sample,
             )?,
             None => sampler.sample_from_probs(
                 &adjusted_probs,
-                &target_probs.reporting,
+                &target_probs.reporting.dense(),
                 return_logprobs,
                 rng.clone(),
             )?,
@@ -1430,7 +1442,7 @@ async fn finish_verified_step_stochastic<P: Pipeline>(
         (fallback_uniforms, Some(support)) => {
             let weights = support
                 .iter()
-                .map(|&token| target_probs.sampling[token as usize])
+                .map(|&token| target_probs.sampling.get(token as usize))
                 .collect::<Vec<_>>();
             sample_weighted_tokens(
                 &sampler,
@@ -1444,14 +1456,14 @@ async fn finish_verified_step_stochastic<P: Pipeline>(
         }
         (Some(uniforms), None) => sample_from_probs_with_uniform(
             &sampler,
-            &target_probs.sampling,
-            &target_probs.reporting,
+            &target_probs.sampling.dense(),
+            &target_probs.reporting.dense(),
             return_logprobs,
             uniforms.sample,
         )?,
         (None, None) => sampler.sample_from_probs(
-            &target_probs.sampling,
-            &target_probs.reporting,
+            &target_probs.sampling.dense(),
+            &target_probs.reporting.dense(),
             return_logprobs,
             rng,
         )?,
@@ -1570,7 +1582,7 @@ fn sample_weighted_tokens(
     sampler: &Sampler,
     tokens: &[u32],
     weights: &[f32],
-    reporting_probs: &[f32],
+    reporting_probs: &crate::sampler::TokenProbs,
     return_logprobs: bool,
     uniform: Option<f32>,
     rng: Arc<std::sync::Mutex<Isaac64Rng>>,
@@ -1601,7 +1613,7 @@ fn sample_weighted_tokens(
         })
         .or_else(|| weights.iter().rposition(|weight| *weight > 0.0))
         .expect("positive fallback weight was validated");
-    sampler.logprobs_from_probs(tokens[idx], reporting_probs, return_logprobs)
+    sampler.logprobs_from_token_probs(tokens[idx], reporting_probs, return_logprobs)
 }
 
 fn valid_uniform(uniform: f32) -> bool {
