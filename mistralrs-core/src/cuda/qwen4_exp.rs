@@ -237,7 +237,6 @@ mod ffi {
             sin: *const c_void,
             slot_mapping: *const i64,
             aux: *mut c_void,
-            block_cs: *mut c_void,
             n_tokens: i32,
             key_dim: i32,
             half_rot: i32,
@@ -251,7 +250,6 @@ mod ffi {
             carry: *const c_void,
             state_slots: *const u32,
             lanes: i32,
-            block_cs: *const c_void,
             block_keys: *mut c_void,
             layout: Q4Tokens,
             paged: Q4Paged,
@@ -1069,13 +1067,18 @@ pub(crate) fn ple_conv(args: PleConvArgs<'_>) -> Result<Tensor> {
 }
 
 /// Store `[raw key | cos | sin]` of every token at its slot of the aux cache.
+/// Bytes of one aux row: the raw indexer key as int8 plus an f32 scale, then the token's cos
+/// and sin (read when it opens a compressed block) in the activation dtype.
+pub(crate) fn qsa_aux_row_bytes(head_dim: usize, half_rot: usize, dtype: DType) -> usize {
+    head_dim + 4 + 2 * half_rot * dtype.size_in_bytes()
+}
+
 pub(crate) fn qsa_aux_write(
     raw_key: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
     slot_mapping: &Tensor,
     aux: &Tensor,
-    block_cs: &Tensor,
     ratio: usize,
 ) -> Result<()> {
     let raw_key = raw_key.contiguous()?;
@@ -1091,6 +1094,17 @@ pub(crate) fn qsa_aux_write(
     let n_tokens = slot_mapping.dim(0)?;
     let key_dim = raw_key.elem_count() / n_tokens;
     let half_rot = cos.elem_count() / n_tokens;
+    let row_bytes = aux.dim(candle_core::D::Minus1)?;
+    if row_bytes != qsa_aux_row_bytes(key_dim, half_rot, raw_key.dtype())
+        || aux.dim(0)? < n_tokens
+        || cos.dtype() != raw_key.dtype()
+        || sin.dtype() != raw_key.dtype()
+    {
+        candle_core::bail!(
+            "qsa_aux_write: aux rows {:?} do not fit {n_tokens} tokens of key {key_dim} and half rotation {half_rot}",
+            aux.dims()
+        );
+    }
     unsafe {
         ffi::qwen4_qsa_aux_write(
             dev_ptr(&raw_key)? as *const _,
@@ -1098,11 +1112,10 @@ pub(crate) fn qsa_aux_write(
             dev_ptr(&sin)? as *const _,
             dev_ptr(&slot_mapping)? as *const i64,
             dev_ptr(aux)? as *mut _,
-            dev_ptr(block_cs)? as *mut _,
             n_tokens as i32,
             key_dim as i32,
             half_rot as i32,
-            aux.dim(candle_core::D::Minus1)? as i32,
+            row_bytes as i32,
             ratio as i32,
             half_dtype_code(raw_key.dtype())?,
             stream(aux.device())?,
@@ -1119,16 +1132,14 @@ pub(crate) struct QsaShape {
 }
 
 pub(crate) struct QsaFinalizeArgs<'a> {
-    /// This step's raw indexer keys, one int8 row per token.
+    /// This step's aux rows (`qsa_aux_row_bytes`), one per token.
     pub aux: &'a Tensor,
-    /// Raw keys of each sequence's open block and the one before, by recurrent state slot.
+    /// Aux rows of each sequence's open block and the one before, by recurrent state slot.
     pub carry: &'a Tensor,
     /// Physical recurrent state slot of each sequence of the step, u32 `[seqs]`, and the
     /// checkpoint lanes per logical slot (`physical = logical * lanes + lane`).
     pub state_slots: &'a Tensor,
     pub lanes: usize,
-    /// cos/sin of each block's first position, `[slots / ratio, 2 * half_rot]`.
-    pub block_cs: &'a Tensor,
     pub block_keys: &'a Tensor,
     pub layout: &'a TokenLayout,
     pub paged: &'a PagedView<'a>,
@@ -1144,7 +1155,6 @@ pub(crate) fn qsa_finalize(args: QsaFinalizeArgs<'_>) -> Result<()> {
         carry,
         state_slots,
         lanes,
-        block_cs,
         block_keys,
         layout,
         paged,
@@ -1161,7 +1171,6 @@ pub(crate) fn qsa_finalize(args: QsaFinalizeArgs<'_>) -> Result<()> {
             dev_ptr(carry)? as *const _,
             dev_ptr(state_slots)? as *const u32,
             lanes.max(1) as i32,
-            dev_ptr(block_cs)? as *const _,
             dev_ptr(block_keys)? as *mut _,
             layout.ffi()?,
             paged.ffi()?,
@@ -1577,8 +1586,7 @@ mod tests {
         #[cfg(not(feature = "rocm"))]
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
-        // One raw indexer-key row: int8 per element plus an f32 scale.
-        let raw_row_bytes = QSA_HEAD_DIM + 4;
+        let raw_row_bytes = qsa_aux_row_bytes(QSA_HEAD_DIM, HALF_ROT, dtype);
         let head_dim = u32::try_from(QSA_HEAD_DIM).unwrap();
         let half_rot = u32::try_from(HALF_ROT).unwrap();
         let raw = (Tensor::arange(0u32, u32::try_from(TOKENS).unwrap() * head_dim, &device)?
@@ -1615,7 +1623,6 @@ mod tests {
         // the raw keys of the open block and the one before it.
         let state_slots = Tensor::new(&[0u32], &device)?;
         let lanes = 1usize;
-        let block_cs = Tensor::zeros((SLOTS / RATIO, 2 * HALF_ROT), dtype, &device)?;
         let carry = Tensor::zeros((2 * RATIO, raw_row_bytes), DType::U8, &device)?;
         let keys = Tensor::zeros((SLOTS / RATIO, QSA_HEAD_DIM), dtype, &device)?;
         let write_and_finalize = |raw: &Tensor,
@@ -1628,13 +1635,12 @@ mod tests {
          -> Result<()> {
             // This step's raw keys, as the model hands them to the finalize.
             let scratch = Tensor::zeros((raw.dim(0)?, raw_row_bytes), DType::U8, &device)?;
-            qsa_aux_write(raw, cos, sin, slots, &scratch, &block_cs, RATIO)?;
+            qsa_aux_write(raw, cos, sin, slots, &scratch, RATIO)?;
             qsa_finalize(QsaFinalizeArgs {
                 aux: &scratch,
                 carry,
                 state_slots: &state_slots,
                 lanes,
-                block_cs: &block_cs,
                 block_keys: keys,
                 layout,
                 paged: &paged,
@@ -1643,7 +1649,42 @@ mod tests {
                 eps: 1e-6,
             })
         };
+        // Each block key on the host: the mean of its raw keys, RMS-normed (unit weight), its
+        // leading 2 * HALF_ROT dims rotated by the block's first position. Physical rows follow
+        // the block table: logical block 0 is in slots 8..12 (row 2), block 1 in slots 0..4.
+        let cos_host = cos.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        let sin_host = sin.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        let check_keys = |raw: &Tensor, keys: &Tensor| -> Result<()> {
+            let raw = raw.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+            let keys = keys.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+            for (block, row) in [(0usize, 2usize), (1, 0)] {
+                let first = block * RATIO;
+                let mut v: Vec<f32> = (0..QSA_HEAD_DIM)
+                    .map(|d| (0..RATIO).map(|m| raw[first + m][d]).sum::<f32>() / RATIO as f32)
+                    .collect();
+                let inv = (v.iter().map(|x| x * x).sum::<f32>() / QSA_HEAD_DIM as f32 + 1e-6)
+                    .sqrt()
+                    .recip();
+                v.iter_mut().for_each(|x| *x *= inv);
+                let (c, s) = (&cos_host[first], &sin_host[first]);
+                for (d, &got) in keys[row].iter().enumerate() {
+                    let want = if d < HALF_ROT {
+                        v[d] * c[d] - v[d + HALF_ROT] * s[d]
+                    } else if d < 2 * HALF_ROT {
+                        v[d] * c[d - HALF_ROT] + v[d - HALF_ROT] * s[d - HALF_ROT]
+                    } else {
+                        v[d]
+                    };
+                    assert!(
+                        (got - want).abs() < 0.03,
+                        "block {block} dim {d}: {got} vs {want}"
+                    );
+                }
+            }
+            Ok(())
+        };
         write_and_finalize(&raw, &cos, &sin, &slots, &full_layout, &carry, &keys)?;
+        check_keys(&raw, &keys)?;
 
         // Replace the open block's last tokens and finalize only that suffix: the carry supplies
         // the block's earlier raw keys.
@@ -1675,6 +1716,7 @@ mod tests {
             keys.to_dtype(DType::F32)?.to_vec2::<f32>()?,
             fresh_keys.to_dtype(DType::F32)?.to_vec2::<f32>()?
         );
+        check_keys(&accepted, &fresh_keys)?;
         Ok(())
     }
 }

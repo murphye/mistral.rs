@@ -766,7 +766,7 @@ impl Qwen4ExpTextModel {
             layer_types,
             rotary_emb,
             qsa,
-            aux_dim: qsa.aux_cache_elements_per_token(cfg.rot_dim()),
+            aux_dim: qsa.aux_cache_elements_per_token(),
             dense_kv_cap: qsa.max_selected_tokens(),
             hc: cfg.hc_count,
             lm_head,

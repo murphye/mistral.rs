@@ -510,7 +510,6 @@ mod tests {
             budget: 2048,
             compress_ratio: 4,
         };
-        let rot_dim = 64;
         let model = Qwen4ExpPagedConfig::new(
             base.clone(),
             &[
@@ -518,7 +517,7 @@ mod tests {
                 LayerType::LinearAttention,
                 LayerType::FullAttention,
             ],
-            qsa.aux_cache_elements_per_token(rot_dim),
+            qsa.aux_cache_elements_per_token(),
             qsa.max_selected_tokens(),
             0,
         );
@@ -530,7 +529,7 @@ mod tests {
         };
         let slots = cache.block_size * cache.num_gpu_blocks;
         let kv = slots * base.num_kv_heads * (base.k_head_dim + base.v_head_dim);
-        let aux = slots * qsa.aux_cache_elements_per_token(rot_dim);
+        let aux = slots * qsa.aux_cache_elements_per_token();
         let expected = (kv + aux) * DType::BF16.size_in_bytes();
         let per_layer = (0..model.num_layers())
             .map(|idx| paged_layer_cache_bytes(&model, idx, DType::BF16, &cache))
@@ -564,7 +563,7 @@ mod tests {
                 LayerType::FullAttention,
                 LayerType::FullAttention,
             ],
-            qsa.aux_cache_elements_per_token(rot_dim),
+            qsa.aux_cache_elements_per_token(),
             qsa.max_selected_tokens(),
             1,
         );

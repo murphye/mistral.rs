@@ -64,20 +64,14 @@ pub(super) struct QsaStateSlots {
     pub lanes: usize,
 }
 
-/// Bytes of one raw indexer-key row: int8 per element plus an f32 scale (the kernels'
-/// Q4_QSA_RAW_ROW_BYTES).
-const QSA_RAW_ROW_BYTES: usize = 4;
-
 #[derive(Clone)]
 #[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 struct QsaAuxCache {
-    /// Raw indexer keys of each sequence's open compressed block and the one before it,
-    /// `[slot_capacity * 2 * ratio, head_dim + 4]` u8, indexed by recurrent state slot. Keys
-    /// of completed blocks are not kept: only their pooled block key is.
+    /// Aux rows (raw indexer key, cos and sin; `kernels::qsa_aux_row_bytes`) of each
+    /// sequence's open compressed block and the one before it, `[slot_capacity * 2 * ratio,
+    /// row bytes]` u8, indexed by recurrent state slot. Rows of completed blocks are not kept:
+    /// only their pooled block key is.
     carry: Tensor,
-    /// cos then sin of each compressed block's first position, `[slots / ratio, 2 * half_rot]`:
-    /// the finalize kernel rotates the pooled block key by the block's first position only.
-    block_cs: Tensor,
     /// Pooled, normed and rotated key per completed block, `[slots / ratio, head_dim]`.
     block_keys: Tensor,
 }
@@ -426,7 +420,8 @@ impl QsaAttention {
         let num_blocks = key_cache.dim(0)?;
         let ratio = self.qsa.compress_ratio;
         let carry_rows = slot_capacity * 2 * ratio;
-        let row_bytes = self.qsa.head_dim + QSA_RAW_ROW_BYTES;
+        let row_bytes =
+            super::kernels::qsa_aux_row_bytes(self.qsa.head_dim, self.rotary_emb_half_dim(), dtype);
         if let Some(existing) = aux.as_mut() {
             if existing.block_keys.dim(0)? == num_blocks * block_size / ratio
                 && existing.block_keys.device().same_device(key_cache.device())
@@ -441,14 +436,8 @@ impl QsaAttention {
                 return Ok(existing.clone());
             }
         }
-        let half_rot = self.rotary_emb_half_dim();
         let cache = QsaAuxCache {
             carry: Tensor::zeros((carry_rows, row_bytes), DType::U8, key_cache.device())?,
-            block_cs: Tensor::zeros(
-                (num_blocks * block_size / self.qsa.compress_ratio, 2 * half_rot),
-                dtype,
-                key_cache.device(),
-            )?,
             block_keys: Tensor::zeros(
                 (
                     num_blocks * block_size / self.qsa.compress_ratio,
@@ -553,10 +542,13 @@ impl QsaAttention {
                 candle_core::bail!("Qwen4-Exp paged QSA needs the sequences' recurrent state slots");
             };
             let aux = self.aux_cache(&key_cache, block_size, q.dtype(), state_slots.capacity)?;
-            // This step's raw indexer keys, consumed by the finalize and carry update below.
+            // This step's aux rows, consumed by the finalize and carry update below.
             let scratch = unsafe {
                 Tensor::empty(
-                    (n_tokens, self.qsa.head_dim + QSA_RAW_ROW_BYTES),
+                    (
+                        n_tokens,
+                        kernels::qsa_aux_row_bytes(self.qsa.head_dim, shape.half_rot, q.dtype()),
+                    ),
                     DType::U8,
                     q.device(),
                 )
@@ -567,7 +559,6 @@ impl QsaAttention {
                 &cos_sin.1.reshape((n_tokens, shape.half_rot))?,
                 slot_mapping,
                 &scratch,
-                &aux.block_cs,
                 shape.ratio,
             )?;
             kernels::qsa_finalize(kernels::QsaFinalizeArgs {
@@ -575,7 +566,6 @@ impl QsaAttention {
                 carry: &aux.carry,
                 state_slots: &state_slots.slots,
                 lanes: state_slots.lanes,
-                block_cs: &aux.block_cs,
                 block_keys: &aux.block_keys,
                 layout,
                 paged: &paged,

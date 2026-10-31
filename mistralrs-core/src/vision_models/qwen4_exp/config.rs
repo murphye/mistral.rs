@@ -147,11 +147,12 @@ impl QsaConfig {
         self.budget + self.compress_ratio - 1
     }
 
-    /// 16-bit elements per KV slot of the paged QSA aux cache: one cos/sin pair and one pooled
-    /// block key per `compress_ratio` tokens.
-    pub(crate) fn aux_cache_elements_per_token(&self, rot_dim: usize) -> usize {
-        // Raw keys live in a per-step scratch and a per-sequence carry, not per KV slot.
-        (rot_dim + self.head_dim).div_ceil(self.compress_ratio)
+    /// 16-bit elements per KV slot of the paged QSA aux cache: one pooled block key per
+    /// `compress_ratio` tokens.
+    pub(crate) fn aux_cache_elements_per_token(&self) -> usize {
+        // Raw keys and a block's cos/sin live in a per-step scratch and a per-sequence carry,
+        // not per KV slot.
+        self.head_dim.div_ceil(self.compress_ratio)
     }
 }
 
