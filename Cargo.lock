@@ -643,7 +643,7 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/murphye/candle.git?rev=3a94a2066b309e5129015a74a157b54d81431670#3a94a2066b309e5129015a74a157b54d81431670"
+source = "git+https://github.com/murphye/candle.git?rev=90f3bcea3e6097f2417e8555cd680c09c3acdf8d#90f3bcea3e6097f2417e8555cd680c09c3acdf8d"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -677,7 +677,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn-v3"
 version = "0.11.0"
-source = "git+https://github.com/murphye/candle.git?rev=3a94a2066b309e5129015a74a157b54d81431670#3a94a2066b309e5129015a74a157b54d81431670"
+source = "git+https://github.com/murphye/candle.git?rev=90f3bcea3e6097f2417e8555cd680c09c3acdf8d#90f3bcea3e6097f2417e8555cd680c09c3acdf8d"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -690,7 +690,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.11.0"
-source = "git+https://github.com/murphye/candle.git?rev=3a94a2066b309e5129015a74a157b54d81431670#3a94a2066b309e5129015a74a157b54d81431670"
+source = "git+https://github.com/murphye/candle.git?rev=90f3bcea3e6097f2417e8555cd680c09c3acdf8d#90f3bcea3e6097f2417e8555cd680c09c3acdf8d"
 dependencies = [
  "cudaforge",
 ]
@@ -698,7 +698,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.11.0"
-source = "git+https://github.com/murphye/candle.git?rev=3a94a2066b309e5129015a74a157b54d81431670#3a94a2066b309e5129015a74a157b54d81431670"
+source = "git+https://github.com/murphye/candle.git?rev=90f3bcea3e6097f2417e8555cd680c09c3acdf8d#90f3bcea3e6097f2417e8555cd680c09c3acdf8d"
 dependencies = [
  "block2",
  "half",
@@ -713,7 +713,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/murphye/candle.git?rev=3a94a2066b309e5129015a74a157b54d81431670#3a94a2066b309e5129015a74a157b54d81431670"
+source = "git+https://github.com/murphye/candle.git?rev=90f3bcea3e6097f2417e8555cd680c09c3acdf8d#90f3bcea3e6097f2417e8555cd680c09c3acdf8d"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -732,7 +732,7 @@ dependencies = [
 [[package]]
 name = "candle-rocm-kernels"
 version = "0.11.0"
-source = "git+https://github.com/murphye/candle.git?rev=3a94a2066b309e5129015a74a157b54d81431670#3a94a2066b309e5129015a74a157b54d81431670"
+source = "git+https://github.com/murphye/candle.git?rev=90f3bcea3e6097f2417e8555cd680c09c3acdf8d#90f3bcea3e6097f2417e8555cd680c09c3acdf8d"
 
 [[package]]
 name = "castaway"
