@@ -1717,14 +1717,16 @@ impl Sampler {
             .then_some((self.top_k as usize, temperature))
     }
 
+    /// The distribution `sample_packed_topk` draws from: the packed top-k candidates' token ids
+    /// and their probabilities after top-p and min-p (filtered candidates are zero; the rest are
+    /// not renormalized).
     #[cfg(any(feature = "metal", feature = "rocm"))]
-    pub(crate) fn sample_packed_topk(
+    pub(crate) fn packed_topk_distribution(
         &self,
         packed: &[f32],
         k: usize,
         temperature: f64,
-        rng: Arc<Mutex<Isaac64Rng>>,
-    ) -> Result<Logprobs> {
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
         if packed.len() != 2 * k + 2 {
             candle_core::bail!(
                 "invalid device top-k packed output length {}, expected {}",
@@ -1770,7 +1772,18 @@ impl Sampler {
                 }
             }
         }
+        Ok((top_indices, probs))
+    }
 
+    #[cfg(any(feature = "metal", feature = "rocm"))]
+    pub(crate) fn sample_packed_topk(
+        &self,
+        packed: &[f32],
+        k: usize,
+        temperature: f64,
+        rng: Arc<Mutex<Isaac64Rng>>,
+    ) -> Result<Logprobs> {
+        let (top_indices, probs) = self.packed_topk_distribution(packed, k, temperature)?;
         let distr = match WeightedIndex::new(&probs) {
             Ok(distr) => distr,
             Err(e) => {

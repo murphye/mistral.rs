@@ -19,9 +19,9 @@ use crate::{
     pipeline::text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
     speculative::{
         hybrid_state::SpecCapture, paged_rows::make_paged_rows_metadata,
-        proposer::sample_draft_rows, SpeculativeKvCache, SpeculativePrefillCtx,
-        SpeculativePrefixReplay, SpeculativeProposal, SpeculativeProposalBatch,
-        SpeculativeProposeBatchCtx, TargetAttentionInputs,
+        proposer::{sample_draft_rows_with_distributions, DraftRowDistribution},
+        SpeculativeKvCache, SpeculativePrefillCtx, SpeculativePrefixReplay, SpeculativeProposal,
+        SpeculativeProposalBatch, SpeculativeProposeBatchCtx, TargetAttentionInputs,
     },
 };
 
@@ -101,6 +101,29 @@ struct DraftRow {
 #[derive(Default)]
 pub(crate) struct BuiltinMtpProposer {
     pending_prompt_tails: Mutex<HashMap<usize, PendingPromptTail>>,
+}
+
+/// A proposal carrying each position's sampling distribution, as `[positions, width]` host
+/// tensors (rows narrower than the widest are padded with zero-probability candidates).
+fn sparse_proposal(
+    tokens: Vec<u32>,
+    steps: Vec<DraftRowDistribution>,
+) -> Result<SpeculativeProposal> {
+    let width = steps.iter().map(|(ids, _)| ids.len()).max().unwrap_or(0);
+    let mut ids = Vec::with_capacity(steps.len() * width);
+    let mut probs = Vec::with_capacity(steps.len() * width);
+    for (step_ids, step_probs) in &steps {
+        ids.extend_from_slice(step_ids);
+        probs.extend_from_slice(step_probs);
+        ids.resize(ids.len() + width - step_ids.len(), 0);
+        probs.resize(probs.len() + width - step_probs.len(), 0.0);
+    }
+    let shape = (steps.len(), width);
+    SpeculativeProposal::with_sparse_probs(
+        tokens,
+        Tensor::from_vec(ids, shape, &candle_core::Device::Cpu)?,
+        Tensor::from_vec(probs, shape, &candle_core::Device::Cpu)?,
+    )
 }
 
 impl BuiltinMtpProposer {
@@ -339,13 +362,29 @@ impl BuiltinMtpProposer {
             .collect::<Vec<_>>();
         let mut tokens: Vec<Vec<u32>> = vec![Vec::with_capacity(n_predict); batch];
         let mut logits = Vec::with_capacity(n_predict);
+        // Each row's sampling distribution per step, while every step's sampling reports one.
+        let mut distributions: Option<Vec<Vec<DraftRowDistribution>>> =
+            Some(vec![Vec::with_capacity(n_predict); batch]);
         for step in 0..n_predict {
             let t0 = std::time::Instant::now();
             let step_logits = host.mtp_draft_logits(&hidden.logits_hidden)?;
             super::spec_timing("mtp_lm_head", t0);
             let t0 = std::time::Instant::now();
-            let drafts = sample_draft_rows(&step_logits, ctx.sequences, &mut contexts, &ctx.rng)?;
+            let (drafts, step_distributions) = sample_draft_rows_with_distributions(
+                &step_logits,
+                ctx.sequences,
+                &mut contexts,
+                &ctx.rng,
+            )?;
             super::spec_timing("mtp_sample", t0);
+            match (step_distributions, distributions.as_mut()) {
+                (Some(step), Some(rows)) => {
+                    for (row, distribution) in rows.iter_mut().zip(step) {
+                        row.push(distribution);
+                    }
+                }
+                _ => distributions = None,
+            }
             for (i, draft) in drafts.iter().enumerate() {
                 tokens[i].push(*draft);
             }
@@ -377,13 +416,26 @@ impl BuiltinMtpProposer {
             super::spec_timing("mtp_chain", t0);
         }
 
-        // [n_predict, batch, vocab] -> per sequence [n_predict, vocab]
-        let logits = Tensor::stack(&logits, 1)?;
-        let proposals = tokens
-            .into_iter()
-            .enumerate()
-            .map(|(row, tokens)| Ok(SpeculativeProposal::with_logits(tokens, logits.get(row)?)))
-            .collect::<Result<Vec<_>>>()?;
+        // The sampled-from distributions, when known, spare verification a softmax over the whole
+        // vocabulary per draft row (and the logits' read-back to the host).
+        let proposals = match distributions {
+            Some(rows) => tokens
+                .into_iter()
+                .zip(rows)
+                .map(|(tokens, steps)| sparse_proposal(tokens, steps))
+                .collect::<Result<Vec<_>>>()?,
+            None => {
+                // [n_predict, batch, vocab] -> per sequence [n_predict, vocab]
+                let logits = Tensor::stack(&logits, 1)?;
+                tokens
+                    .into_iter()
+                    .enumerate()
+                    .map(|(row, tokens)| {
+                        Ok(SpeculativeProposal::with_logits(tokens, logits.get(row)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
         Ok(Some(SpeculativeProposalBatch::new(proposals)))
     }
 

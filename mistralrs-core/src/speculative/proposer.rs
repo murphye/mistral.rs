@@ -451,6 +451,10 @@ pub trait SpeculativeProposer {
     ) -> Result<SpeculativeProposalBatch>;
 }
 
+/// One draft row's sampling distribution: candidate token ids and their (unnormalized)
+/// probabilities, zero for filtered candidates.
+pub type DraftRowDistribution = (Vec<u32>, Vec<f32>);
+
 /// Sample one draft token per row of `logits` (`[rows, vocab]`) with each row's own sampler.
 pub fn sample_draft_rows(
     logits: &Tensor,
@@ -458,6 +462,17 @@ pub fn sample_draft_rows(
     contexts: &mut [Vec<u32>],
     rng: &Arc<Mutex<Isaac64Rng>>,
 ) -> Result<Vec<u32>> {
+    Ok(sample_draft_rows_with_distributions(logits, sequences, contexts, rng)?.0)
+}
+
+/// [`sample_draft_rows`], also returning each row's sampling distribution when the sampling path
+/// computed it anyway (the ROCm batched top-k), so verification need not rebuild it from logits.
+pub fn sample_draft_rows_with_distributions(
+    logits: &Tensor,
+    sequences: &[&Sequence],
+    contexts: &mut [Vec<u32>],
+    rng: &Arc<Mutex<Isaac64Rng>>,
+) -> Result<(Vec<u32>, Option<Vec<DraftRowDistribution>>)> {
     let batch = sequences.len();
     if contexts.len() != batch || logits.dim(0)? != batch {
         candle_core::bail!(
@@ -486,7 +501,7 @@ pub fn sample_draft_rows(
             for (context, token) in contexts.iter_mut().zip(&tokens) {
                 context.push(*token);
             }
-            return Ok(tokens);
+            return Ok((tokens, None));
         }
     }
     // One batched device top-k for every row whose sampler allows it (greedy rows at k = 1),
@@ -509,6 +524,7 @@ pub fn sample_draft_rows(
                 crate::rocm::sampling::topk_logits_packed_batched(&logits.contiguous()?, k.min(vocab), &inv_t)?;
             let kk = k.min(vocab);
             let mut tokens = Vec::with_capacity(batch);
+            let mut distributions = Vec::with_capacity(batch);
             for ((row, seq), (row_k, temperature)) in packed.iter().zip(sequences).zip(&plans) {
                 // Each row keeps its own candidate count: the first `row_k` of the common k,
                 // plus the row's softmax denominator and maximum.
@@ -522,11 +538,16 @@ pub fn sample_draft_rows(
                     .sampler()
                     .sample_packed_topk(&own, row_k, *temperature, sequence_rng)?;
                 tokens.push(sampled.token);
+                distributions.push(seq.sampler().packed_topk_distribution(
+                    &own,
+                    row_k,
+                    *temperature,
+                )?);
             }
             for (context, token) in contexts.iter_mut().zip(&tokens) {
                 context.push(*token);
             }
-            return Ok(tokens);
+            return Ok((tokens, Some(distributions)));
         }
     }
     let mut tokens = Vec::with_capacity(batch);
@@ -545,7 +566,7 @@ pub fn sample_draft_rows(
         contexts[row].push(sampled.token);
         tokens.push(sampled.token);
     }
-    Ok(tokens)
+    Ok((tokens, None))
 }
 
 #[cfg(all(test, feature = "cuda"))]
