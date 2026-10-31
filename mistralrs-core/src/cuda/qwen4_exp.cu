@@ -1045,9 +1045,12 @@ q4_qsa_finalize_kernel(const uint8_t *__restrict__ aux, const uint8_t *__restric
   }
 }
 
-// After a step, each sequence's open block (positions from the last block boundary to its
-// kv length) is copied from the step's scratch into the carry; positions before this step
-// are already there. One block per sequence, one thread per row byte.
+// After a step, each sequence's open block and the one before it (positions from one block
+// before the last block boundary to its kv length) are copied from the step's scratch into
+// the carry; positions before this step are already there. The block before matters when a
+// verify step crosses a block boundary: rejecting its drafts can reopen the earlier block,
+// whose rows written in this step the next finalize then reads from the carry. One block of
+// threads per sequence, one thread per row byte.
 __global__ void q4_qsa_carry_update_kernel(const uint8_t *__restrict__ scratch,
                                            uint8_t *__restrict__ carry,
                                            const unsigned *__restrict__ state_slots, int lanes,
@@ -1062,8 +1065,8 @@ __global__ void q4_qsa_carry_update_kernel(const uint8_t *__restrict__ scratch,
   }
   const int kv = (int)pg.kv_lens[seq];
   const int first = kv - len;
-  const int open_start = kv - kv % ratio;
-  for (int p = max(open_start, first); p < kv; ++p) {
+  const int keep_start = max(kv - kv % ratio - ratio, 0);
+  for (int p = max(keep_start, first); p < kv; ++p) {
     const uint8_t *src = scratch + (size_t)(q4_start_of(l, seq) + (p - first)) * aux_dim;
     uint8_t *dst = carry + q4_carry_row(state_slots[seq], lanes, p, ratio) * aux_dim;
     for (int b = threadIdx.x; b < aux_dim; b += blockDim.x) {

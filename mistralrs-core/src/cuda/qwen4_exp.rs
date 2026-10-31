@@ -1570,8 +1570,11 @@ mod tests {
     const REPLACED_TOKENS: usize = 2;
 
     #[test]
-    #[ignore = "requires a CUDA device"]
+    #[ignore = "requires a CUDA or ROCm device"]
     fn qsa_reopened_block_matches_fresh_prefill() -> Result<()> {
+        #[cfg(feature = "rocm")]
+        let device = Device::new_rocm(0)?;
+        #[cfg(not(feature = "rocm"))]
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         // One raw indexer-key row: int8 per element plus an f32 scale.
