@@ -229,6 +229,9 @@ impl DecodeGraphs {
         let mut forward = hooks.forward;
 
         hooks.device.synchronize()?;
+        // The capture's buffers come from `hipMalloc`, outside the memory pool, which otherwise
+        // keeps the largest prefill's peak for itself.
+        rocm.trim_memory()?;
         rocm.begin_capture()?;
         let captured = forward(&inputs.input_ids, &stable_ctx);
         let graph = rocm.end_capture();
@@ -252,7 +255,8 @@ impl DecodeGraphs {
                     },
                 );
                 tracing::info!(
-                    "Captured a ROCm decode graph for batch size {batch}, {tokens} token(s) per sequence"
+                    "Captured a ROCm decode graph for batch size {batch}, {tokens} token(s) per sequence (graph pool {} MiB)",
+                    rocm.hip_stream().graph_pool_bytes() >> 20
                 );
                 Ok(logits)
             }
