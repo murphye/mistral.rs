@@ -67,6 +67,8 @@ pub(crate) struct Qwen4ExpPagedConfig {
     /// Aux cache elements per token of a QSA layer (16-bit activations).
     aux_dim: usize,
     dense_kv_cap: usize,
+    /// Index of the first MTP layer (they follow the trunk's layers).
+    first_draft_layer: usize,
 }
 
 /// Bytes of one aux cache element: the model's bf16/f16 activations.
@@ -78,8 +80,10 @@ impl Qwen4ExpPagedConfig {
         layer_types: &[config::LayerType],
         aux_dim: usize,
         dense_kv_cap: usize,
+        mtp_layers: usize,
     ) -> Self {
         Self {
+            first_draft_layer: layer_types.len().saturating_sub(mtp_layers),
             inner: HybridPagedKvCacheConfig::new(
                 base,
                 layer_types
@@ -151,6 +155,9 @@ impl ModelConfigLike for Qwen4ExpPagedConfig {
     }
     fn layer_kv_cache_elements_per_token(&self, layer_idx: usize) -> Option<usize> {
         self.inner.layer_kv_cache_elements_per_token(layer_idx)
+    }
+    fn layer_is_draft(&self, layer_idx: usize) -> bool {
+        layer_idx >= self.first_draft_layer
     }
     fn layer_side_cache_bytes_per_token(&self, layer_idx: usize) -> usize {
         if self.inner.layer_has_paged_kv_cache(layer_idx) {
@@ -655,6 +662,7 @@ impl MultimodalModel for Qwen4ExpModel {
             &layer_types,
             self.text.aux_dim,
             self.text.dense_kv_cap,
+            usize::from(self.text.mtp.is_some()),
         ))
     }
     fn default_model_specific_args(&self, input_ids: &Tensor) -> Box<dyn Any> {

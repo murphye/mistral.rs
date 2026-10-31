@@ -143,16 +143,18 @@ fn explicit_prefix_context_capacity(
         .paged
         .block_size
         .unwrap_or(DEFAULT_PAGED_ATTENTION_BLOCK_SIZE);
-    let elements = (0..model.num_layers()).try_fold(0usize, |total, layer| {
+    let bytes_per_token = (0..model.num_layers()).try_fold(0usize, |total, layer| {
+        let bytes = crate::paged_attention::layer_kv_bytes_per_token(
+            model,
+            layer,
+            ctx.paged.cache_type,
+            ctx.dtype,
+        )?;
         total
-            .checked_add(model.layer_kv_cache_elements_per_token(layer).unwrap_or(0))
+            .checked_add(bytes)
             .context("prefix KV geometry overflow")
     })?;
-    let bytes_per_block = product(&[
-        elements,
-        block_size,
-        ctx.paged.cache_type.to_dtype(ctx.dtype).size_in_bytes(),
-    ])?;
+    let bytes_per_block = product(&[bytes_per_token, block_size])?;
     anyhow::ensure!(
         bytes_per_block > 0,
         "The model has no paged KV cache storage"

@@ -689,21 +689,48 @@ fn rocm_allocator_retention_bytes(remaining: usize) -> usize {
     }
 }
 
+/// Bytes per token of a layer's paged keys and values in `cache_type` (side caches excluded):
+/// the KV elements in the cache dtype, or 4-bit rows for the packed cache types.
+pub(crate) fn layer_kv_bytes_per_token(
+    config: &dyn ModelConfigLike,
+    layer: usize,
+    cache_type: PagedCacheType,
+    act_dtype: DType,
+) -> anyhow::Result<usize> {
+    let elements = config.layer_kv_cache_elements_per_token(layer).unwrap_or(0);
+    if elements == 0 {
+        return Ok(0);
+    }
+    let cache_type = cache_type.for_layer(config, layer);
+    if !matches!(cache_type, PagedCacheType::Q4 | PagedCacheType::F8E4M3Q4V) {
+        return elements
+            .checked_mul(cache_type.to_dtype(act_dtype).size_in_bytes())
+            .ok_or_else(|| anyhow::anyhow!("KV token size overflow"));
+    }
+    // Validated as token-major layers: heads x (key + value) rows.
+    let heads = config.num_kv_heads_for_layer(layer);
+    Ok(cache_type.kv_bytes_per_token(
+        act_dtype,
+        heads * config.k_head_dim_for_layer(layer),
+        heads * config.v_head_dim_for_layer(layer),
+    ))
+}
+
 fn cache_device_allocations<'a>(
     config: &dyn ModelConfigLike,
-    cache_dtype: DType,
+    cache_type: PagedCacheType,
+    act_dtype: DType,
     block_size: usize,
     device: &'a Device,
     layer_devices: &'a [Option<Device>],
 ) -> anyhow::Result<Vec<CacheDeviceAllocation<'a>>> {
+    #[cfg_attr(not(feature = "metal"), allow(unused_variables))]
+    let cache_dtype = cache_type.to_dtype(act_dtype);
     let mut devices: Vec<CacheDeviceAllocation<'_>> = Vec::new();
     for layer in 0..config.num_layers() {
-        let elements = config.layer_kv_cache_elements_per_token(layer);
-        // KV elements in the cache dtype, plus side caches kept in their own dtype.
-        let bytes = elements
-            .unwrap_or(0)
-            .checked_mul(cache_dtype.size_in_bytes())
-            .and_then(|bytes| bytes.checked_add(config.layer_side_cache_bytes_per_token(layer)))
+        // KV in the cache's storage, plus side caches kept in their own dtype.
+        let bytes = layer_kv_bytes_per_token(config, layer, cache_type, act_dtype)?
+            .checked_add(config.layer_side_cache_bytes_per_token(layer))
             .and_then(|bytes| bytes.checked_mul(block_size))
             .ok_or_else(|| anyhow::anyhow!("KV block size overflow"))?;
         let layer_device = layer_devices
@@ -797,8 +824,8 @@ pub fn calculate_cache_config(
     cache_type
         .validate(dtype, config, device, layer_devices)
         .map_err(anyhow::Error::msg)?;
-    let cache_dtype = cache_type.to_dtype(dtype);
-    let devices = cache_device_allocations(config, cache_dtype, block_size, device, layer_devices)?;
+    let devices =
+        cache_device_allocations(config, cache_type, dtype, block_size, device, layer_devices)?;
     let total_bytes_per_block = devices
         .iter()
         .try_fold(0usize, |sum, allocation| {
@@ -953,7 +980,11 @@ pub fn calculate_cache_config(
             );
         }
         let allocated_bytes = total_allocation_bytes(num_gpu_blocks)?;
-        info!("Allocating {} MiB logical shared {cache_dtype:?} KV cache (estimated allocation {} MiB): {tokens} usable tokens, {num_gpu_blocks} blocks of {block_size} tokens", cache_bytes.div_ceil(SIZE_IN_MB), allocated_bytes.div_ceil(SIZE_IN_MB));
+        let cache_kind = match cache_type {
+            PagedCacheType::Auto => format!("{dtype:?}"),
+            other => format!("{other:?}"),
+        };
+        info!("Allocating {} MiB logical shared {cache_kind} KV cache (estimated allocation {} MiB): {tokens} usable tokens, {num_gpu_blocks} blocks of {block_size} tokens", cache_bytes.div_ceil(SIZE_IN_MB), allocated_bytes.div_ceil(SIZE_IN_MB));
     }
     crate::pipeline::apply_model_activation_memory(paged_config, final_activation);
     Ok(CacheConfig {

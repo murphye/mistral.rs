@@ -522,9 +522,12 @@ impl QsaAttention {
                 .slot_mappings
                 .get(&location)
                 .ok_or_else(|| candle_core::Error::msg("QSA requires paged slot mappings"))?;
-            if key_cache.dtype() != q.dtype() && key_cache.dtype() != DType::F8E4M3 {
+            // U8 is the 4-bit row format; the kernels check the K/V pair in detail.
+            if key_cache.dtype() != q.dtype()
+                && !matches!(key_cache.dtype(), DType::F8E4M3 | DType::U8)
+            {
                 candle_core::bail!(
-                    "Qwen4-Exp QSA needs a {:?} or f8e4m3 KV cache, got {:?}",
+                    "Qwen4-Exp QSA needs a {:?}, f8e4m3 or 4-bit KV cache, got {:?}",
                     q.dtype(),
                     key_cache.dtype()
                 );
@@ -985,6 +988,130 @@ mod tests {
         .to_dtype(DType::F32)?;
         let diff = (got - expected)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(diff, 0.0);
+        Ok(())
+    }
+
+    /// The 4-bit token-major KV cache: rows decode to the written values within half a
+    /// quantization step, and attention over fp8, fp8-key/4-bit-value and 4-bit caches stays
+    /// close to the bf16 cache through both the prefill (WMMA) and decode kernels.
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn rocm_4bit_kv_cache_tracks_bf16() -> Result<()> {
+        use crate::rocm::qwen4_exp as k;
+        let rocm = Device::new_rocm(0)?;
+        let (tokens, q_heads, kv_heads, d, block_size, ratio) = (96usize, 8, 1, 256, 32, 4);
+        let blocks = tokens / block_size;
+        let rand = |shape: (usize, usize, usize)| -> Result<Tensor> {
+            Tensor::randn(0f32, 1.0, shape, &Device::Cpu)?
+                .to_dtype(DType::BF16)?
+                .to_device(&rocm)
+        };
+        let (kx, vx, q) = (
+            rand((tokens, kv_heads, d))?,
+            rand((tokens, kv_heads, d))?,
+            rand((tokens, q_heads, d))?,
+        );
+        let slots = Tensor::arange(0i64, tokens as i64, &rocm)?;
+        let tables = Tensor::new(&[[0u32, 1, 2]], &rocm)?;
+        let kv_lens = Tensor::new(&[tokens as u32], &rocm)?;
+        let paged = k::PagedView {
+            block_tables: &tables,
+            kv_lens: &kv_lens,
+            block_size,
+        };
+        let shape = k::QsaShape {
+            ratio,
+            topk: tokens / ratio,
+            half_rot: 32,
+            n_index_heads: 1,
+        };
+        let i4_row = k::ATTN_I4_ROW_BYTES;
+        let cache = |dtype: DType, last: usize| {
+            Tensor::zeros((blocks, kv_heads, block_size, last), dtype, &rocm)
+        };
+
+        // Every element of a 4-bit row decodes within half a step of what was written.
+        let (kc, vc) = (cache(DType::U8, i4_row)?, cache(DType::U8, i4_row)?);
+        k::kv_write_hnd(&kx, &vx, &kc, &vc, &slots, None, None)?;
+        let bytes = kc.flatten_all()?.to_vec1::<u8>()?;
+        let want = kx.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        for t in 0..tokens {
+            let row = &bytes[t * i4_row..(t + 1) * i4_row];
+            for e in 0..d {
+                let code = (row[e / 2] >> (4 * (e % 2))) & 0xf;
+                let s = half::f16::from_le_bytes([
+                    row[d / 2 + e / 32 * 2],
+                    row[d / 2 + e / 32 * 2 + 1],
+                ])
+                .to_f32();
+                let x = want[t * d + e];
+                let got = (f32::from(code) - 8.0) * s;
+                assert!(
+                    (got - x).abs() <= 0.5 * s + 1e-3 * x.abs() + 1e-6,
+                    "token {t} elem {e}: {got} vs {x} (scale {s})"
+                );
+            }
+        }
+
+        // Prefill (all 96 tokens, WMMA) and decode (the last 8 tokens) attention per cache kind.
+        let run = |kc: &Tensor, vc: &Tensor, queries: usize| -> Result<Tensor> {
+            let q = q.narrow(0, tokens - queries, queries)?;
+            let layout = k::TokenLayout::from_host(&[(0, queries)], &[tokens], queries, &rocm)?;
+            let (selected, n_selected) = k::qsa_select_all(&layout, &paged, &shape, &rocm)?;
+            k::kv_write_hnd(&kx, &vx, kc, vc, &slots, None, None)?;
+            let (out, _) = k::qsa_attention(k::QsaAttentionArgs {
+                q: &q,
+                key_cache: kc,
+                value_cache: vc,
+                layout: &layout,
+                paged: &paged,
+                selected: &selected,
+                n_selected: &n_selected,
+                shape: &shape,
+                n_kv_heads: kv_heads,
+                scale: 1.0 / 16.0,
+                gate: None,
+                kv_scales: (1.0, 1.0),
+            })?;
+            out.to_dtype(DType::F32)
+        };
+        let rel = |a: &Tensor, b: &Tensor| -> Result<f32> {
+            let num = (a - b)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
+            let den = b.sqr()?.sum_all()?.to_scalar::<f32>()?;
+            Ok((num / den).sqrt())
+        };
+        for queries in [tokens, 8] {
+            let reference = run(&cache(DType::BF16, d)?, &cache(DType::BF16, d)?, queries)?;
+            let fp8 = rel(
+                &run(
+                    &cache(DType::F8E4M3, d)?,
+                    &cache(DType::F8E4M3, d)?,
+                    queries,
+                )?,
+                &reference,
+            )?;
+            let fp8_i4v = rel(
+                &run(
+                    &cache(DType::F8E4M3, d)?,
+                    &cache(DType::U8, i4_row)?,
+                    queries,
+                )?,
+                &reference,
+            )?;
+            let i4 = rel(
+                &run(
+                    &cache(DType::U8, i4_row)?,
+                    &cache(DType::U8, i4_row)?,
+                    queries,
+                )?,
+                &reference,
+            )?;
+            eprintln!("{queries} queries: rel rms vs bf16 cache: fp8 {fp8:.4}, fp8 K + 4-bit V {fp8_i4v:.4}, 4-bit {i4:.4}");
+            assert!(
+                fp8 < 0.1 && fp8_i4v < 0.2 && i4 < 0.25,
+                "{queries} queries: {fp8} {fp8_i4v} {i4}"
+            );
+        }
         Ok(())
     }
 

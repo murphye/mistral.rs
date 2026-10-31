@@ -174,6 +174,11 @@ pub trait ModelConfigLike {
         self.layer_has_paged_kv_cache(layer_idx)
             .then(|| self.kv_cache_elements_per_token())
     }
+    /// True for a speculative draft head's layer (a built-in MTP layer). 4-bit cache types keep
+    /// its K/V in e4m3: the draft's acceptance rate depends on it.
+    fn layer_is_draft(&self, _layer_idx: usize) -> bool {
+        false
+    }
     /// Bytes per token of side caches a layer allocates alongside its paged KV blocks (one row
     /// per KV slot) that are not stored in the KV cache's dtype, such as Qwen4-Exp's QSA indexer
     /// keys. The memory plan charges them per block in addition to the KV elements.
@@ -356,6 +361,10 @@ where
 
     fn layer_kv_cache_elements_per_token(&self, layer_idx: usize) -> Option<usize> {
         self.base.layer_kv_cache_elements_per_token(layer_idx)
+    }
+
+    fn layer_is_draft(&self, layer_idx: usize) -> bool {
+        self.base.layer_is_draft(layer_idx)
     }
 
     fn layer_side_cache_bytes_per_token(&self, layer_idx: usize) -> usize {
@@ -582,6 +591,9 @@ impl ModelConfigLike for HybridPagedKvCacheConfig {
     }
     fn layer_has_paged_kv_cache(&self, layer_idx: usize) -> bool {
         self.paged_layers.get(layer_idx).copied().unwrap_or(true)
+    }
+    fn layer_is_draft(&self, layer_idx: usize) -> bool {
+        self.base.layer_is_draft(layer_idx)
     }
     fn prefix_prefill_attention_features(
         &self,

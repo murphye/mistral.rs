@@ -124,6 +124,93 @@ template <typename TC> struct Q4CacheX {
   static constexpr int value = 16 / (int)sizeof(TC);
 };
 
+// A 4-bit cache row of the token-major layout: the 256 elements as symmetric 4-bit codes, two a
+// byte (element 2i in the low nibble), then one fp16 scale per 32 elements, 128 + 16 = 144 bytes
+// against 256 for fp8. An element is (code - 8) * scale with scale = absmax / 7 over its group.
+// Stored per token and group, so a cache write needs no other token's values.
+struct Q4I4 {
+  uint8_t b;
+};
+#define Q4_I4_ROW_BYTES (Q4_ATTN_HEAD_DIM / 2 + Q4_ATTN_HEAD_DIM / 32 * 2)
+template <typename TC> struct Q4Packed {
+  static constexpr bool value = false;
+};
+template <> struct Q4Packed<Q4I4> {
+  static constexpr bool value = true;
+};
+// One cached 256-element row in units of TC.
+template <typename TC> struct Q4Row {
+  static constexpr int units = Q4_ATTN_HEAD_DIM;
+};
+template <> struct Q4Row<Q4I4> {
+  static constexpr int units = Q4_I4_ROW_BYTES;
+};
+
+// Eight consecutive elements d0 .. d0 + 7 (d0 % 8 == 0) of a cached row: loaded raw, then
+// read one at a time as floats (fp8 and 4-bit codes scaled).
+template <typename TC> struct Q4Raw8 {
+  TC x[8];
+  __device__ __forceinline__ void load(const TC *__restrict__ row, int d0) {
+    *this = *reinterpret_cast<const Q4Raw8 *>(row + d0);
+  }
+  __device__ __forceinline__ void zero() {
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+      x[u] = TC{};
+    }
+  }
+  __device__ __forceinline__ float get(int u, float scale) const {
+    return q4_cache_f<TC>(x[u], scale);
+  }
+};
+template <> struct Q4Raw8<Q4I4> {
+  uint32_t w;
+  float s;
+  __device__ __forceinline__ void load(const Q4I4 *__restrict__ row, int d0) {
+    const uint8_t *r = reinterpret_cast<const uint8_t *>(row);
+    w = *reinterpret_cast<const uint32_t *>(r + d0 / 2);
+    s = __half2float(*reinterpret_cast<const __half *>(r + Q4_ATTN_HEAD_DIM / 2 + (d0 / 32) * 2));
+  }
+  __device__ __forceinline__ void zero() {
+    w = 0x88888888u;
+    s = 0.0f;
+  }
+  __device__ __forceinline__ float get(int u, float) const {
+    return (float)((int)((w >> (4 * u)) & 0xFu) - 8) * s;
+  }
+};
+
+// Quantizes eight consecutive elements at d (d % 8 == 0) of a row into a 4-bit row. The four
+// consecutive lanes holding one 32-wide group exchange their maxima, so every lane of the warp
+// must call this together.
+template <typename T>
+__device__ __forceinline__ void q4_i4_store8(Q4I4 *__restrict__ row, int d, const T (&x)[8]) {
+  float f[8];
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    f[i] = q4_f(x[i]);
+    amax = fmaxf(amax, fabsf(f[i]));
+  }
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, 32));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, 32));
+  // Quantize against the stored (fp16) scale so the codes decode with the scale the readers see.
+  const __half hs = __float2half(amax / 7.0f);
+  const float s = __half2float(hs);
+  const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+  uint32_t w = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int c = min(max(__float2int_rn(f[i] * inv), -8), 7);
+    w |= (uint32_t)(c + 8) << (4 * i);
+  }
+  uint8_t *r = reinterpret_cast<uint8_t *>(row);
+  *reinterpret_cast<uint32_t *>(r + d / 2) = w;
+  if ((d & 31) == 0) {
+    *reinterpret_cast<__half *>(r + Q4_ATTN_HEAD_DIM / 2 + (d / 32) * 2) = hs;
+  }
+}
+
 // Flattened token -> logical sequence mapping. A null tok_seq is the
 // rectangular layout: every sequence has q_len consecutive new tokens (decode
 // is q_len 1). tok_seq < 0 marks padding.
@@ -1137,11 +1224,11 @@ __global__ void q4_qsa_topk_kernel(const float *__restrict__ scores,
 // when splits > 1. Head dim is fixed at 256: each lane owns 8 dims.
 // flashinfer_layout: K and V are [blocks, kv_heads, block_size, 256]; otherwise
 // K is [blocks, kv_heads, 256/8, block_size, 8] and V is [blocks, kv_heads,
-// 256, block_size].
-template <typename T, typename TC>
+// 256, block_size]. 4-bit caches (Q4I4) exist in the first layout only.
+template <typename T, typename TCK, typename TCV>
 __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
-    const T *__restrict__ q, const TC *__restrict__ k_cache,
-    const TC *__restrict__ v_cache, Q4Tokens l, Q4Paged pg,
+    const T *__restrict__ q, const TCK *__restrict__ k_cache,
+    const TCV *__restrict__ v_cache, Q4Tokens l, Q4Paged pg,
     const int *__restrict__ selected, const int *__restrict__ n_selected,
     int topk, int ratio, int n_q_heads, int n_kv_heads, int items_per_split,
     float scale, int flashinfer_layout, float k_scale, float v_scale, T *__restrict__ out,
@@ -1197,12 +1284,11 @@ __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
     }
   }
 
-  const size_t head_stride_fi = (size_t)pg.block_size * Q4_ATTN_HEAD_DIM;
-  constexpr int X = Q4CacheX<TC>::value;
+  constexpr bool packed = Q4Packed<TCK>::value || Q4Packed<TCV>::value;
   for (int it0 = begin; it0 < end; it0 += Q4_ATTN_ITEMS) {
     // Resolve and load a batch of items up front so the dependent loads overlap
-    const TC *kp[Q4_ATTN_ITEMS];
-    const TC *vp[Q4_ATTN_ITEMS];
+    const TCK *kp[Q4_ATTN_ITEMS];
+    const TCV *vp[Q4_ATTN_ITEMS];
 #pragma unroll
     for (int j = 0; j < Q4_ATTN_ITEMS; ++j) {
       const int it = min(it0 + j, end - 1);
@@ -1216,14 +1302,15 @@ __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
                                       p / pg.block_size];
       const int off = p % pg.block_size;
       const size_t head_base = (size_t)blk * n_kv_heads + g;
-      if (flashinfer_layout) {
-        const size_t base = head_base * head_stride_fi +
-                            (size_t)off * Q4_ATTN_HEAD_DIM + lane * 8;
-        kp[j] = k_cache + base;
-        vp[j] = v_cache + base;
-      } else {
+      if (packed || flashinfer_layout) {
+        // The item's row; the lane reads elements lane * 8 .. +8 of it.
+        const size_t row = head_base * pg.block_size + off;
+        kp[j] = k_cache + row * Q4Row<TCK>::units;
+        vp[j] = v_cache + row * Q4Row<TCV>::units;
+      } else if constexpr (!packed) {
         // K: [blocks, kv_heads, 256/X, block_size, X]; the lane's eight elements
         // d = lane * 8 .. +8 lie in one X-wide column group.
+        constexpr int X = Q4CacheX<TCK>::value;
         kp[j] = k_cache +
                 (head_base * (Q4_ATTN_HEAD_DIM / X) + (lane * 8) / X) * pg.block_size * X +
                 (size_t)off * X + (lane * 8) % X;
@@ -1235,13 +1322,21 @@ __global__ void __launch_bounds__(Q4_ATTN_WARPS * 32) q4_qsa_attention_kernel(
     float vf[Q4_ATTN_ITEMS][8];
 #pragma unroll
     for (int j = 0; j < Q4_ATTN_ITEMS; ++j) {
-      q4_load8c<TC>(kp[j], k_scale, kf[j]);
-      if (flashinfer_layout) {
-        q4_load8c<TC>(vp[j], v_scale, vf[j]);
-      } else {
+      if (packed || flashinfer_layout) {
+        Q4Raw8<TCK> kr;
+        Q4Raw8<TCV> vr;
+        kr.load(kp[j], lane * 8);
+        vr.load(vp[j], lane * 8);
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-          vf[j][i] = q4_cache_f<TC>(vp[j][(size_t)i * pg.block_size], v_scale);
+          kf[j][i] = kr.get(i, k_scale);
+          vf[j][i] = vr.get(i, v_scale);
+        }
+      } else if constexpr (!packed) {
+        q4_load8c<TCK>(kp[j], k_scale, kf[j]);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          vf[j][i] = q4_cache_f<TCV>(vp[j][(size_t)i * pg.block_size], v_scale);
         }
       }
     }
@@ -1440,19 +1535,16 @@ q4_qsa_attention_reduce_kernel(const float *__restrict__ part_acc,
 // Eight-element pieces of K and of V per step, per thread.
 #define Q4W_PIECES (Q4W_ITEMS * (Q4_ATTN_HEAD_DIM / 8) / Q4W_THREADS)
 
-template <typename TC> struct Q4WRaw8 {
-  TC x[8];
-};
-
-template <typename T, typename TC>
+template <typename T, typename TCK, typename TCV>
 __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
-    const T *__restrict__ q, const TC *__restrict__ k_cache,
-    const TC *__restrict__ v_cache, Q4Tokens l, Q4Paged pg,
+    const T *__restrict__ q, const TCK *__restrict__ k_cache,
+    const TCV *__restrict__ v_cache, Q4Tokens l, Q4Paged pg,
     const int *__restrict__ selected, const int *__restrict__ n_selected,
     int topk, int ratio, int n_q_heads, int n_kv_heads, float scale,
     int flashinfer_layout, float k_scale, float v_scale, T *__restrict__ out) {
   using namespace rocwmma;
-  constexpr int X = Q4CacheX<TC>::value;
+  // 4-bit caches exist in the token-major (flashinfer) layout only.
+  constexpr bool packed = Q4Packed<TCK>::value || Q4Packed<TCV>::value;
   constexpr int GROUPS = Q4_ATTN_HEAD_DIM / 8;
   // fp16 operands: after the q/k norms the scores, probabilities and values are small,
   // and fp16's mantissa keeps the products ~8x closer to the f32 kernel than bf16.
@@ -1465,8 +1557,8 @@ __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
   __shared__ float m_row[Q4W_ROWS], l_row[Q4W_ROWS], corr_row[Q4W_ROWS];
   // Item row pointers of the step being loaded (double buffered against the step
   // being converted).
-  __shared__ const TC *k_item[2][Q4W_ITEMS];
-  __shared__ const TC *v_item[2][Q4W_ITEMS];
+  __shared__ const TCK *k_item[2][Q4W_ITEMS];
+  __shared__ const TCV *v_item[2][Q4W_ITEMS];
 
   const int t = blockIdx.x;
   const int g = blockIdx.y;
@@ -1484,13 +1576,12 @@ __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
     tail_start = nb * ratio;
     n_items = n_block_items + (pos + 1 - tail_start);
   }
-  const size_t head_stride_fi = (size_t)pg.block_size * Q4_ATTN_HEAD_DIM;
-
   // Row pointers of items it0 .. it0 + 31 into buffer `buf` (threads 0..31).
   auto resolve = [&](const int it0, const int buf) {
     if (tid < Q4W_ITEMS) {
       const int it = it0 + tid;
-      const TC *kp = nullptr, *vp = nullptr;
+      const TCK *kp = nullptr;
+      const TCV *vp = nullptr;
       if (it < n_items) {
         const int p = it < n_block_items
                           ? selected[(size_t)t * topk + it / ratio] * ratio + it % ratio
@@ -1498,11 +1589,13 @@ __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
         const int blk = pg.block_tables[(size_t)seq * pg.max_blocks_per_seq + p / pg.block_size];
         const int off = p % pg.block_size;
         const size_t head_base = (size_t)blk * n_kv_heads + g;
-        if (flashinfer_layout) {
-          kp = k_cache + head_base * head_stride_fi + (size_t)off * Q4_ATTN_HEAD_DIM;
-          vp = v_cache + head_base * head_stride_fi + (size_t)off * Q4_ATTN_HEAD_DIM;
-        } else {
+        if (packed || flashinfer_layout) {
+          const size_t row = head_base * pg.block_size + off;
+          kp = k_cache + row * Q4Row<TCK>::units;
+          vp = v_cache + row * Q4Row<TCV>::units;
+        } else if constexpr (!packed) {
           // K: [blocks, kv_heads, 256/X, block_size, X]; V: [blocks, kv_heads, 256, block_size].
+          constexpr int X = Q4CacheX<TCK>::value;
           kp = k_cache + head_base * Q4_ATTN_HEAD_DIM * pg.block_size + (size_t)off * X;
           vp = v_cache + head_base * Q4_ATTN_HEAD_DIM * pg.block_size + off;
         }
@@ -1518,31 +1611,30 @@ __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
     c = e % GROUPS;
   };
   // Global loads of one step's K and V pieces into registers (no conversion yet).
-  Q4WRaw8<TC> kraw[Q4W_PIECES], vraw[Q4W_PIECES];
+  Q4Raw8<TCK> kraw[Q4W_PIECES];
+  Q4Raw8<TCV> vraw[Q4W_PIECES];
   auto load_step = [&](const int buf) {
 #pragma unroll
     for (int i = 0; i < Q4W_PIECES; ++i) {
       int j, c;
       piece(i, j, c);
-      const TC *kp = k_item[buf][j];
-      const TC *vp = v_item[buf][j];
+      const TCK *kp = k_item[buf][j];
+      const TCV *vp = v_item[buf][j];
       if (kp) {
-        if (flashinfer_layout) {
-          kraw[i] = *reinterpret_cast<const Q4WRaw8<TC> *>(kp + c * 8);
-          vraw[i] = *reinterpret_cast<const Q4WRaw8<TC> *>(vp + c * 8);
-        } else {
+        if (packed || flashinfer_layout) {
+          kraw[i].load(kp, c * 8);
+          vraw[i].load(vp, c * 8);
+        } else if constexpr (!packed) {
           // K's eight elements sit in one X-wide column group; V's are block_size apart.
-          kraw[i] = *reinterpret_cast<const Q4WRaw8<TC> *>(
+          constexpr int X = Q4CacheX<TCK>::value;
+          kraw[i] = *reinterpret_cast<const Q4Raw8<TCK> *>(
               kp + (size_t)((c * 8) / X) * pg.block_size * X + (c * 8) % X);
 #pragma unroll
           for (int u = 0; u < 8; ++u) vraw[i].x[u] = vp[(size_t)(c * 8 + u) * pg.block_size];
         }
       } else {
-#pragma unroll
-        for (int u = 0; u < 8; ++u) {
-          kraw[i].x[u] = TC{};
-          vraw[i].x[u] = TC{};
-        }
+        kraw[i].zero();
+        vraw[i].zero();
       }
     }
   };
@@ -1554,8 +1646,8 @@ __global__ void __launch_bounds__(Q4W_THREADS) q4_qsa_attention_wmma_kernel(
       piece(i, j, c);
 #pragma unroll
       for (int u = 0; u < 8; ++u) {
-        k_lds[j * Q4W_LD + c * 8 + u] = static_cast<bf>(q4_cache_f<TC>(kraw[i].x[u], k_scale));
-        v_lds[j * Q4W_LD + c * 8 + u] = static_cast<bf>(q4_cache_f<TC>(vraw[i].x[u], v_scale));
+        k_lds[j * Q4W_LD + c * 8 + u] = static_cast<bf>(kraw[i].get(u, k_scale));
+        v_lds[j * Q4W_LD + c * 8 + u] = static_cast<bf>(vraw[i].get(u, v_scale));
       }
     }
   };
@@ -2003,15 +2095,26 @@ extern "C" void qwen4_qsa_attention(
     return;
   }
   const cudaStream_t s = (cudaStream_t)stream;
-  // `cache_fp8` selects an OCP e4m3 cache (elements decoded with k_scale / v_scale);
-  // otherwise the cache holds the activation type.
+  // `cache_fp8` is the cache kind: 0 the activation type, 1 OCP e4m3 (elements decoded with
+  // k_scale / v_scale), 2 e4m3 keys with 4-bit values, 3 4-bit keys and values (Q4I4 rows,
+  // token-major layout only).
 #define Q4_QSA_WITH_CACHE_T(...)                                               \
   do {                                                                         \
-    if (cache_fp8) {                                                           \
-      using cache_t = uint8_t;                                                 \
+    if (cache_fp8 == 1) {                                                      \
+      using cache_k_t = uint8_t;                                               \
+      using cache_v_t = uint8_t;                                               \
+      __VA_ARGS__;                                                             \
+    } else if (cache_fp8 == 2) {                                               \
+      using cache_k_t = uint8_t;                                               \
+      using cache_v_t = Q4I4;                                                  \
+      __VA_ARGS__;                                                             \
+    } else if (cache_fp8 == 3) {                                               \
+      using cache_k_t = Q4I4;                                                  \
+      using cache_v_t = Q4I4;                                                  \
       __VA_ARGS__;                                                             \
     } else {                                                                   \
-      using cache_t = scalar_t;                                                \
+      using cache_k_t = scalar_t;                                              \
+      using cache_v_t = scalar_t;                                              \
       __VA_ARGS__;                                                             \
     }                                                                          \
   } while (0)
@@ -2022,9 +2125,9 @@ extern "C" void qwen4_qsa_attention(
     const dim3 wgrid(layout.n_tokens, n_kv_heads);
     Q4_DISPATCH_HALF(dtype, {
       Q4_QSA_WITH_CACHE_T({
-        q4_qsa_attention_wmma_kernel<scalar_t, cache_t><<<wgrid, Q4W_THREADS, 0, s>>>(
-            (const scalar_t *)q, (const cache_t *)k_cache,
-            (const cache_t *)v_cache, layout, paged, selected, n_selected, topk,
+        q4_qsa_attention_wmma_kernel<scalar_t, cache_k_t, cache_v_t><<<wgrid, Q4W_THREADS, 0, s>>>(
+            (const scalar_t *)q, (const cache_k_t *)k_cache,
+            (const cache_v_t *)v_cache, layout, paged, selected, n_selected, topk,
             ratio, n_q_heads, n_kv_heads, scale, flashinfer_layout, k_scale, v_scale,
             (scalar_t *)out);
       });
@@ -2035,9 +2138,9 @@ extern "C" void qwen4_qsa_attention(
   const dim3 grid(layout.n_tokens, n_kv_heads, splits);
   Q4_DISPATCH_HALF(dtype, {
     Q4_QSA_WITH_CACHE_T({
-      q4_qsa_attention_kernel<scalar_t, cache_t><<<grid, Q4_ATTN_WARPS * 32, 0, s>>>(
-          (const scalar_t *)q, (const cache_t *)k_cache,
-          (const cache_t *)v_cache, layout, paged, selected, n_selected, topk,
+      q4_qsa_attention_kernel<scalar_t, cache_k_t, cache_v_t><<<grid, Q4_ATTN_WARPS * 32, 0, s>>>(
+          (const scalar_t *)q, (const cache_k_t *)k_cache,
+          (const cache_v_t *)v_cache, layout, paged, selected, n_selected, topk,
           ratio, n_q_heads, n_kv_heads, items_per_split, scale, flashinfer_layout,
           k_scale, v_scale, (scalar_t *)out, part_acc, part_ml, (const scalar_t *)gate,
           gate_tok_stride, gate_head_stride, (Q4Q8Block *)q8_out);
@@ -2095,13 +2198,34 @@ __device__ __forceinline__ uint8_t q4_cache_store<__nv_bfloat16, uint8_t>(__nv_b
   return __hip_cvt_float_to_fp8(q4_f(x) * inv_scale, __HIP_SATFINITE, __HIP_E4M3);
 }
 
-// Writes `k`, `v` ([tokens, kv_heads, head_dim], contiguous) into a token-major paged cache
-// ([blocks, kv_heads, block_size, head_dim]) at `slots` (block * block_size + offset; a
-// negative slot skips the token). Eight consecutive elements per thread.
+// Eight elements of a row into a cache row of TC at d (4-bit rows quantize per 32-wide group).
 template <typename T, typename TC>
+__device__ __forceinline__ void q4_cache_store8(TC *__restrict__ row, int d, const T (&x)[8],
+                                                float inv_scale) {
+  if constexpr (Q4Packed<TC>::value) {
+    q4_i4_store8<T>(row, d, x);
+  } else {
+    struct __align__(8 * sizeof(TC)) Out8 {
+      TC x[8];
+    };
+    Out8 out;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      out.x[i] = q4_cache_store<T, TC>(x[i], inv_scale);
+    }
+    *reinterpret_cast<Out8 *>(row + d) = out;
+  }
+}
+
+// Writes `k`, `v` ([tokens, kv_heads, head_dim], contiguous) into a token-major paged cache
+// ([blocks, kv_heads, block_size, head_dim], or 4-bit rows of Q4_I4_ROW_BYTES) at `slots`
+// (block * block_size + offset; a negative slot skips the token). Eight consecutive elements per
+// thread; the slot is per block, so a skipped token leaves its whole block of threads idle and
+// the 4-bit groups' lane exchange stays within threads that all store.
+template <typename T, typename TCK, typename TCV>
 __global__ void q4_kv_write_hnd_kernel(const T *__restrict__ k, const T *__restrict__ v,
-                                       const int64_t *__restrict__ slots, TC *__restrict__ kc,
-                                       TC *__restrict__ vc, int kv_heads, int head_dim,
+                                       const int64_t *__restrict__ slots, TCK *__restrict__ kc,
+                                       TCV *__restrict__ vc, int kv_heads, int head_dim,
                                        int block_size, const float *__restrict__ k_scale,
                                        const float *__restrict__ v_scale) {
   const int t = blockIdx.x;
@@ -2116,23 +2240,14 @@ __global__ void q4_kv_write_hnd_kernel(const T *__restrict__ k, const T *__restr
   for (int e8 = threadIdx.x * 8; e8 < n; e8 += blockDim.x * 8) {
     const int h = e8 / head_dim, d = e8 - h * head_dim;
     const size_t src = (size_t)t * n + e8;
-    const size_t dst = (((size_t)blk * kv_heads + h) * block_size + off) * head_dim + d;
+    const size_t row = ((size_t)blk * kv_heads + h) * block_size + off;
     struct __align__(16) In8 {
       T x[8];
     };
-    struct __align__(8 * sizeof(TC)) Out8 {
-      TC x[8];
-    };
     const In8 kin = *reinterpret_cast<const In8 *>(k + src);
     const In8 vin = *reinterpret_cast<const In8 *>(v + src);
-    Out8 kout, vout;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      kout.x[i] = q4_cache_store<T, TC>(kin.x[i], ki);
-      vout.x[i] = q4_cache_store<T, TC>(vin.x[i], vi);
-    }
-    *reinterpret_cast<Out8 *>(kc + dst) = kout;
-    *reinterpret_cast<Out8 *>(vc + dst) = vout;
+    q4_cache_store8<T, TCK>(kc + row * Q4Row<TCK>::units, d, kin.x, ki);
+    q4_cache_store8<T, TCV>(vc + row * Q4Row<TCV>::units, d, vin.x, vi);
   }
 }
 
@@ -2146,9 +2261,10 @@ extern "C" void qwen4_kv_write_hnd(const void *k, const void *v, const int64_t *
   const int threads = min(256, max(32, (kv_heads * head_dim / 8 + 31) / 32 * 32));
   Q4_DISPATCH_HALF(dtype, {
     Q4_QSA_WITH_CACHE_T({
-      q4_kv_write_hnd_kernel<scalar_t, cache_t><<<n_tokens, threads, 0, (cudaStream_t)stream>>>(
-          (const scalar_t *)k, (const scalar_t *)v, slots, (cache_t *)kc, (cache_t *)vc,
-          kv_heads, head_dim, block_size, k_scale, v_scale);
+      q4_kv_write_hnd_kernel<scalar_t, cache_k_t, cache_v_t>
+          <<<n_tokens, threads, 0, (cudaStream_t)stream>>>(
+              (const scalar_t *)k, (const scalar_t *)v, slots, (cache_k_t *)kc,
+              (cache_v_t *)vc, kv_heads, head_dim, block_size, k_scale, v_scale);
     });
   });
 }

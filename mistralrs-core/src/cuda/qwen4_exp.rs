@@ -422,6 +422,52 @@ fn half_dtype_code(dtype: DType) -> Result<i32> {
     }
 }
 
+/// Bytes of one 4-bit KV cache row (`Q4_I4_ROW_BYTES` in qwen4_exp.cu): the 256 elements as
+/// 4-bit codes, then one f16 scale per 32 of them.
+pub(crate) const ATTN_I4_ROW_BYTES: usize = ATTN_HEAD_DIM / 2 + ATTN_HEAD_DIM / 32 * 2;
+
+/// The kernels' cache kind for a K/V cache pair: 0 the activation type, 1 e4m3, 2 e4m3 keys with
+/// 4-bit values, 3 4-bit keys and values. A 4-bit cache is a U8 tensor of `ATTN_I4_ROW_BYTES`
+/// rows in the token-major layout (rank 4, rows last); the vLLM layout's last dimension is a
+/// column group, so only token-major caches are checked for their row length.
+fn cache_kind(
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    act: DType,
+    head_dim: usize,
+    what: &str,
+) -> Result<i32> {
+    #[derive(Debug, PartialEq)]
+    enum Elem {
+        Act,
+        Fp8,
+        I4,
+    }
+    let elem = |cache: &Tensor| -> Result<Elem> {
+        let token_major = cache.rank() == 4;
+        let last = cache.dims().last().copied().unwrap_or(0);
+        let rows = !token_major || last == head_dim;
+        match cache.dtype() {
+            DType::F8E4M3 if rows => Ok(Elem::Fp8),
+            DType::U8 if token_major && head_dim == ATTN_HEAD_DIM && last == ATTN_I4_ROW_BYTES => {
+                Ok(Elem::I4)
+            }
+            dtype if dtype == act && rows => Ok(Elem::Act),
+            dtype => candle_core::bail!(
+                "{what}: unsupported KV cache {dtype:?} {:?} for head dim {head_dim}",
+                cache.dims()
+            ),
+        }
+    };
+    match (elem(key_cache)?, elem(value_cache)?) {
+        (Elem::Act, Elem::Act) => Ok(0),
+        (Elem::Fp8, Elem::Fp8) => Ok(1),
+        (Elem::Fp8, Elem::I4) => Ok(2),
+        (Elem::I4, Elem::I4) => Ok(3),
+        (k, v) => candle_core::bail!("{what}: no kernels for {k:?} keys with {v:?} values"),
+    }
+}
+
 fn empty(shape: &[usize], dtype: DType, device: &Device) -> Result<Tensor> {
     // Safety: every element is written by the kernel before it is read.
     unsafe { Tensor::empty(shape, dtype, device) }
@@ -1213,14 +1259,13 @@ pub(crate) fn kv_write_hnd(
     let key = key.contiguous()?;
     let value = value.contiguous()?;
     let (n_tokens, kv_heads, head_dim) = key.dims3()?;
-    let (blocks, cache_heads, block_size, cache_dim) = key_cache.dims4()?;
+    let (blocks, cache_heads, block_size, _) = key_cache.dims4()?;
+    let (v_blocks, v_heads, v_block_size, _) = value_cache.dims4()?;
     if value.dims() != key.dims()
-        || value_cache.dims() != key_cache.dims()
+        || (v_blocks, v_heads, v_block_size) != (blocks, cache_heads, block_size)
         || cache_heads != kv_heads
-        || cache_dim != head_dim
         || head_dim % 8 != 0
         || key.dtype() != value.dtype()
-        || key_cache.dtype() != value_cache.dtype()
     {
         candle_core::bail!(
             "kv_write_hnd: shapes disagree (k {:?}, cache {:?} x {blocks} blocks)",
@@ -1236,14 +1281,13 @@ pub(crate) fn kv_write_hnd(
         );
     }
     let slot_mapping = slot_mapping.contiguous()?;
-    let cache_fp8 = match key_cache.dtype() {
-        DType::F8E4M3 => true,
-        dtype if dtype == key.dtype() => false,
-        dtype => candle_core::bail!(
-            "kv_write_hnd: cache dtype {dtype:?} does not match {:?}",
-            key.dtype()
-        ),
-    };
+    let cache_kind = cache_kind(
+        key_cache,
+        value_cache,
+        key.dtype(),
+        head_dim,
+        "kv_write_hnd",
+    )?;
     let scale_ptr = |scale: Option<&Tensor>| -> Result<u64> {
         match scale {
             Some(s) if s.dtype() == DType::F32 && s.elem_count() == 1 => dev_ptr(s),
@@ -1265,7 +1309,7 @@ pub(crate) fn kv_write_hnd(
             scale_ptr(k_scale)? as *const f32,
             scale_ptr(v_scale)? as *const f32,
             half_dtype_code(key.dtype())?,
-            i32::from(cache_fp8),
+            cache_kind,
             stream(key.device())?,
         );
     }
@@ -1414,14 +1458,16 @@ pub(crate) fn qsa_attention(args: QsaAttentionArgs<'_>) -> Result<(Tensor, bool)
     }
     let device = q.device();
     let flashinfer_layout = args.key_cache.rank() == 4;
-    let cache_fp8 = match args.key_cache.dtype() {
-        DType::F8E4M3 => true,
-        dtype if dtype == q.dtype() => false,
-        dtype => candle_core::bail!(
-            "QSA attention needs a {:?} or f8e4m3 KV cache, got {dtype:?}",
-            q.dtype()
-        ),
-    };
+    let cache_kind = cache_kind(
+        args.key_cache,
+        args.value_cache,
+        q.dtype(),
+        head_dim,
+        "QSA attention",
+    )?;
+    if cache_kind >= 2 && !flashinfer_layout {
+        candle_core::bail!("QSA attention: 4-bit KV caches need the token-major layout");
+    }
     let max_items = args.shape.topk * args.shape.ratio + args.shape.ratio - 1;
     let ctas = n_tokens * args.n_kv_heads;
     let splits = ATTN_TARGET_CTAS
@@ -1496,7 +1542,7 @@ pub(crate) fn qsa_attention(args: QsaAttentionArgs<'_>) -> Result<(Tensor, bool)
                 p as *mut _
             },
             half_dtype_code(q.dtype())?,
-            i32::from(cache_fp8),
+            cache_kind,
             args.kv_scales.0,
             args.kv_scales.1,
             stream(device)?,

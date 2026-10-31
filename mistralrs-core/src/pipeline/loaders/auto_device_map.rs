@@ -2,7 +2,8 @@ use std::fmt::{self, Display};
 
 use crate::memory_plan::{device_memory_budget, MemoryGoal};
 use crate::paged_attention::{
-    requested_cache_blocks, CacheConfig, ModelConfigLike, DEFAULT_PAGED_ATTENTION_BLOCK_SIZE,
+    layer_kv_bytes_per_token, requested_cache_blocks, CacheConfig, ModelConfigLike,
+    DEFAULT_PAGED_ATTENTION_BLOCK_SIZE,
 };
 use crate::utils::debug::DeviceRepr;
 use crate::{DeviceLayerMapMetadata, DeviceMapMetadata, MemoryUsage, PagedAttentionConfig};
@@ -150,14 +151,12 @@ fn paged_layer_cache_bytes(
     model_dtype: DType,
     cache: &CacheConfig,
 ) -> Result<usize> {
-    let cache_dtype = cache.cache_type.to_dtype(model_dtype);
-    let elements = model_config
-        .layer_kv_cache_elements_per_token(layer_idx)
-        .unwrap_or(0);
-    elements
+    // As the allocator charges them: KV in the cache's storage, plus side caches.
+    layer_kv_bytes_per_token(model_config, layer_idx, cache.cache_type, model_dtype)?
+        .checked_add(model_config.layer_side_cache_bytes_per_token(layer_idx))
+        .context("paged KV cache size overflow")?
         .checked_mul(cache.block_size)
         .and_then(|bytes| bytes.checked_mul(cache.num_gpu_blocks))
-        .and_then(|bytes| bytes.checked_mul(cache_dtype.size_in_bytes()))
         .context("paged KV cache size overflow")
 }
 
@@ -169,13 +168,15 @@ fn mapping_cache_config(
     let block_size = config
         .block_size
         .unwrap_or(DEFAULT_PAGED_ATTENTION_BLOCK_SIZE);
-    let cache_dtype = config.cache_type.to_dtype(dtype);
     let total_bytes_per_block = (0..model.num_layers())
         .try_fold(0usize, |total, idx| {
-            total.checked_add(model.layer_kv_cache_elements_per_token(idx).unwrap_or(0))
-        })
-        .and_then(|elements| elements.checked_mul(block_size))
-        .and_then(|elements| elements.checked_mul(cache_dtype.size_in_bytes()))
+            let bytes = layer_kv_bytes_per_token(model, idx, config.cache_type, dtype)?
+                + model.layer_side_cache_bytes_per_token(idx);
+            total
+                .checked_add(bytes)
+                .context("paged KV block size overflow")
+        })?
+        .checked_mul(block_size)
         .context("paged KV block size overflow")?;
     anyhow::ensure!(
         total_bytes_per_block != 0,
@@ -519,6 +520,7 @@ mod tests {
             ],
             qsa.aux_cache_elements_per_token(rot_dim),
             qsa.max_selected_tokens(),
+            0,
         );
         let mut cache = CacheConfig {
             block_size: 32,
@@ -528,9 +530,8 @@ mod tests {
         };
         let slots = cache.block_size * cache.num_gpu_blocks;
         let kv = slots * base.num_kv_heads * (base.k_head_dim + base.v_head_dim);
-        let raw_aux = slots * (qsa.head_dim + rot_dim);
-        let block_keys = slots / qsa.compress_ratio * qsa.head_dim;
-        let expected = (kv + raw_aux + block_keys) * DType::BF16.size_in_bytes();
+        let aux = slots * qsa.aux_cache_elements_per_token(rot_dim);
+        let expected = (kv + aux) * DType::BF16.size_in_bytes();
         let per_layer = (0..model.num_layers())
             .map(|idx| paged_layer_cache_bytes(&model, idx, DType::BF16, &cache))
             .collect::<Result<Vec<_>>>()?;
@@ -550,6 +551,35 @@ mod tests {
             .map(|idx| paged_layer_cache_bytes(&base, idx, DType::BF16, &cache))
             .collect::<Result<Vec<_>>>()?;
         assert_eq!(per_layer, [kv; 3]);
+
+        // 4-bit caches keep the MTP layer (the last one here) in e4m3.
+        let with_mtp = Qwen4ExpPagedConfig::new(
+            ModelConfigMetadata {
+                num_layers: 4,
+                ..base.clone()
+            },
+            &[
+                LayerType::FullAttention,
+                LayerType::LinearAttention,
+                LayerType::FullAttention,
+                LayerType::FullAttention,
+            ],
+            qsa.aux_cache_elements_per_token(rot_dim),
+            qsa.max_selected_tokens(),
+            1,
+        );
+        let q4 = (0..4)
+            .map(|idx| {
+                crate::paged_attention::layer_kv_bytes_per_token(
+                    &with_mtp,
+                    idx,
+                    PagedCacheType::Q4,
+                    DType::BF16,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let heads = base.num_kv_heads;
+        assert_eq!(q4, [heads * 2 * 144, 0, heads * 2 * 144, heads * 2 * 256]);
         Ok(())
     }
 

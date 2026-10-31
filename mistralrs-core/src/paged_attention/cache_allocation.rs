@@ -119,7 +119,8 @@ pub fn allocate_cache(
     let mut cache_config = calculate_cache_config(&mut final_config, request)?;
     let allocations = cache_device_allocations(
         request.model,
-        cache_config.cache_type.to_dtype(request.dtype),
+        cache_config.cache_type,
+        request.dtype,
         cache_config.block_size,
         request.device,
         request.layer_devices,

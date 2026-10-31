@@ -56,14 +56,80 @@ pub enum PagedCacheType {
     #[default]
     Auto,
     F8E4M3,
+    /// 4-bit keys and values: per 32 elements, 4-bit codes and an f16 scale (18 bytes, against
+    /// 32 for fp8). Token-major ROCm layers with 256-wide heads only (Qwen4-Exp QSA).
+    Q4,
+    /// e4m3 keys with 4-bit values.
+    F8E4M3Q4V,
+}
+
+/// Bytes of a 4-bit cache row of `elements`: the codes two a byte, then an f16 scale per 32.
+pub(crate) fn q4_row_bytes(elements: usize) -> usize {
+    elements / 2 + elements / 32 * 2
 }
 
 impl PagedCacheType {
+    /// The element dtype, for the paths that size or warm caches by dtype. 4-bit caches are U8
+    /// rows; their exact sizes come from [`Self::token_major_storage`].
     pub fn to_dtype(&self, act_dtype: DType) -> DType {
         match self {
-            PagedCacheType::F8E4M3 => DType::F8E4M3,
+            PagedCacheType::F8E4M3 | PagedCacheType::F8E4M3Q4V => DType::F8E4M3,
+            PagedCacheType::Q4 => DType::U8,
             PagedCacheType::Auto => act_dtype,
         }
+    }
+
+    /// The cache type `layer` stores. 4-bit types keep a draft layer in e4m3: with a 4-bit MTP
+    /// layer, Qwen4-Exp's acceptance fell from 82% to 75% at three streams, for 4% more tokens.
+    pub(crate) fn for_layer(self, model_config: &dyn ModelConfigLike, layer: usize) -> Self {
+        if self.packed_value() && model_config.layer_is_draft(layer) {
+            Self::F8E4M3
+        } else {
+            self
+        }
+    }
+
+    fn packed_key(&self) -> bool {
+        matches!(self, Self::Q4)
+    }
+
+    fn packed_value(&self) -> bool {
+        matches!(self, Self::Q4 | Self::F8E4M3Q4V)
+    }
+
+    /// The dtype and last dimension of a token-major cache tensor holding key (or value) rows of
+    /// `head_dim` elements.
+    pub fn token_major_storage(
+        &self,
+        act_dtype: DType,
+        head_dim: usize,
+        value: bool,
+    ) -> (DType, usize) {
+        if (value && self.packed_value()) || (!value && self.packed_key()) {
+            (DType::U8, q4_row_bytes(head_dim))
+        } else {
+            match self {
+                PagedCacheType::Auto => (act_dtype, head_dim),
+                _ => (DType::F8E4M3, head_dim),
+            }
+        }
+    }
+
+    /// Bytes per token of a layer's keys and values, each `heads * head_dim` elements.
+    pub fn kv_bytes_per_token(
+        &self,
+        act_dtype: DType,
+        key_elements: usize,
+        value_elements: usize,
+    ) -> usize {
+        let bytes = |elements: usize, packed: bool| {
+            if packed {
+                q4_row_bytes(elements)
+            } else {
+                elements * self.to_dtype(act_dtype).size_in_bytes()
+            }
+        };
+        bytes(key_elements, self.packed_key()) + bytes(value_elements, self.packed_value())
     }
 
     pub fn validate(
@@ -75,6 +141,29 @@ impl PagedCacheType {
     ) -> std::result::Result<(), String> {
         if *self == Self::Auto {
             return Ok(());
+        }
+        if self.packed_value() {
+            // The 4-bit row format exists in the Qwen4-Exp QSA kernels' token-major ROCm path.
+            for layer_idx in 0..model_config.num_layers() {
+                if !model_config.layer_has_paged_kv_cache(layer_idx) {
+                    continue;
+                }
+                let layer_device = layer_devices
+                    .get(layer_idx)
+                    .and_then(Option::as_ref)
+                    .unwrap_or(device);
+                if !layer_device.is_rocm()
+                    || model_config.kv_cache_layout_for_layer(layer_idx)
+                        != KvCacheLayout::FlashInferHnd
+                    || model_config.k_head_dim_for_layer(layer_idx) != 256
+                    || model_config.v_head_dim_for_layer(layer_idx) != 256
+                {
+                    return Err(format!(
+                        "4-bit KV cache needs token-major ROCm attention layers with 256-wide heads \
+                         (Qwen4-Exp); layer {layer_idx} is not one"
+                    ));
+                }
+            }
         }
         if !matches!(act_dtype, DType::F16 | DType::BF16 | DType::F32) {
             return Err(format!(
@@ -132,8 +221,10 @@ impl FromStr for PagedCacheType {
         match s {
             "auto" => Ok(Self::Auto),
             "f8e4m3" => Ok(Self::F8E4M3),
+            "q4" => Ok(Self::Q4),
+            "f8e4m3-q4v" => Ok(Self::F8E4M3Q4V),
             other => Err(format!(
-                "Unexpected `PagedCacheType`, got `{other}` but expected `auto` and `f8e4m3`."
+                "Unexpected `PagedCacheType`, got `{other}` but expected `auto`, `f8e4m3`, `q4` or `f8e4m3-q4v`."
             )),
         }
     }
@@ -168,9 +259,16 @@ impl CacheEngine {
             .cache_type
             .validate(dtype, model_config, device, &layer_devices)
             .map_err(candle_core::Error::msg)?;
+        let act_dtype = dtype;
         let dtype = cache_config.cache_type.to_dtype(dtype);
-        let gpu_cache =
-            Self::allocate_gpu_cache(model_config, cache_config, dtype, device, layer_devices)?;
+        let gpu_cache = Self::allocate_gpu_cache(
+            model_config,
+            cache_config,
+            dtype,
+            act_dtype,
+            device,
+            layer_devices,
+        )?;
         #[cfg(all(feature = "cuda", target_family = "unix"))]
         let fa3_prefill_workspaces = register_fa3_prefill_caches(&gpu_cache)?;
         #[cfg(all(feature = "cuda", target_family = "unix"))]
@@ -200,6 +298,7 @@ impl CacheEngine {
         model_config: &dyn ModelConfigLike,
         cache_config: &CacheConfig,
         dtype: DType,
+        act_dtype: DType,
         device: &Device,
         layer_devices: Vec<Option<Device>>,
     ) -> Result<Vec<KVCache>> {
@@ -421,18 +520,32 @@ impl CacheEngine {
                             unreachable!()
                         }
                     } else {
+                        // 4-bit caches hold rows of packed codes and scales (U8) instead.
+                        let (key_dtype, key_row) = cache_config
+                            .cache_type
+                            .for_layer(model_config, layer_idx)
+                            .token_major_storage(act_dtype, key_block_shape.2, false);
                         unsafe {
                             Tensor::empty(
                                 (
                                     num_gpu_blocks,
                                     key_block_shape.0,
                                     key_block_shape.1,
-                                    key_block_shape.2,
+                                    key_row,
                                 ),
-                                dtype,
+                                key_dtype,
                                 device,
                             )?
                         }
+                    };
+                    // Values take the key block shape, as they always have here.
+                    let (value_dtype, value_row) = if device.is_metal() {
+                        (dtype, key_block_shape.2)
+                    } else {
+                        cache_config
+                            .cache_type
+                            .for_layer(model_config, layer_idx)
+                            .token_major_storage(act_dtype, key_block_shape.2, true)
                     };
                     let value_blocks = unsafe {
                         Tensor::empty(
@@ -440,9 +553,9 @@ impl CacheEngine {
                                 num_gpu_blocks,
                                 key_block_shape.0,
                                 key_block_shape.1,
-                                key_block_shape.2,
+                                value_row,
                             ),
-                            dtype,
+                            value_dtype,
                             device,
                         )?
                     };
@@ -829,6 +942,47 @@ mod tests {
                 assert_eq!(value.dims(), &[blocks, 4, 128, 32]);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn four_bit_caches_size_rows_and_reject_other_layers() -> Result<()> {
+        // 128 bytes of codes and 8 f16 scales per 256-element row.
+        assert_eq!(q4_row_bytes(256), 144);
+        let q4: PagedCacheType = "q4".parse().map_err(candle_core::Error::msg)?;
+        let q4v: PagedCacheType = "f8e4m3-q4v".parse().map_err(candle_core::Error::msg)?;
+        assert_eq!(q4.kv_bytes_per_token(DType::BF16, 256, 256), 288);
+        assert_eq!(q4v.kv_bytes_per_token(DType::BF16, 256, 256), 256 + 144);
+        assert_eq!(
+            PagedCacheType::F8E4M3.kv_bytes_per_token(DType::BF16, 256, 256),
+            512
+        );
+        assert_eq!(
+            PagedCacheType::Auto.kv_bytes_per_token(DType::BF16, 256, 256),
+            1024
+        );
+        assert_eq!(
+            q4.token_major_storage(DType::BF16, 256, false),
+            (DType::U8, 144)
+        );
+        assert_eq!(
+            q4v.token_major_storage(DType::BF16, 256, false),
+            (DType::F8E4M3, 256)
+        );
+        assert_eq!(
+            q4v.token_major_storage(DType::BF16, 256, true),
+            (DType::U8, 144)
+        );
+
+        let err = q4
+            .validate(
+                DType::BF16,
+                &model_config(KvCacheLayout::FlashInferHnd),
+                &Device::Cpu,
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("layer 0 is not one"), "{err}");
         Ok(())
     }
 

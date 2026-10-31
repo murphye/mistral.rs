@@ -448,12 +448,18 @@ fn paged_kv_bytes_per_token(
     dtype: DType,
     model_config: &dyn ModelConfigLike,
 ) -> Result<usize> {
-    paged_attn_config
-        .cache_type
-        .to_dtype(dtype)
-        .size_in_bytes()
-        .checked_mul(model_config.total_kv_cache_elements_per_token())
-        .and_then(|bytes| bytes.checked_add(model_config.total_side_cache_bytes_per_token()))
+    let mut kv = 0usize;
+    for layer in 0..model_config.num_layers() {
+        kv = kv
+            .checked_add(crate::paged_attention::layer_kv_bytes_per_token(
+                model_config,
+                layer,
+                paged_attn_config.cache_type,
+                dtype,
+            )?)
+            .ok_or_else(|| anyhow::anyhow!("PagedAttention token memory size overflow"))?;
+    }
+    kv.checked_add(model_config.total_side_cache_bytes_per_token())
         .ok_or_else(|| anyhow::anyhow!("PagedAttention token memory size overflow"))
 }
 

@@ -8780,6 +8780,7 @@ impl DeviceMappedModelLoader for Qwen4ExpLoader {
             &text.paged_layer_types(cfg.mtp),
             qsa.aux_cache_elements_per_token(text.rot_dim()),
             qsa.max_selected_tokens(),
+            text.mtp_layers(cfg.mtp),
         )))
     }
 

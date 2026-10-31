@@ -35,7 +35,9 @@ pub struct PagedAttentionOptions {
     #[arg(long = "pa-block-size")]
     pub block_size: Option<usize>,
 
-    /// KV cache quantization type
+    /// KV cache quantization type: auto (the activation dtype), f8e4m3, or on ROCm Qwen4-Exp
+    /// q4 (4-bit keys and values) and f8e4m3-q4v (fp8 keys, 4-bit values). With either 4-bit
+    /// type an MTP draft layer keeps f8e4m3.
     #[arg(long = "pa-cache-type", default_value = "auto", value_parser = parse_cache_type)]
     #[serde(default)]
     pub cache_type: PagedCacheType,
