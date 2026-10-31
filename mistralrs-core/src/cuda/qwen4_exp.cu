@@ -1078,16 +1078,16 @@ __global__ void q4_qsa_carry_update_kernel(const uint8_t *__restrict__ scratch,
   }
 }
 
-// scores[t, j] = sum_h relu(q[t, h] . block_key[j]) / sqrt(d) for rows with
-// more complete blocks than the budget selects; other rows are skipped.
+// scores[t - t0, j] = sum_h relu(q[t, h] . block_key[j]) / sqrt(d) for the rows t0 + y of a
+// tile with more complete blocks than the budget selects; other rows are skipped.
 template <typename T>
 __global__ void
 q4_qsa_score_kernel(const T *__restrict__ q, const T *__restrict__ block_keys,
                     Q4Tokens l, Q4Paged pg, float *__restrict__ scores,
                     int score_stride, int n_heads, int ratio, int topk,
-                    int key_dim) {
+                    int key_dim, int t0) {
   __shared__ float qs[Q4_QSA_MAX_INDEX_HEADS * Q4_QSA_HEAD_DIM];
-  const int t = blockIdx.y;
+  const int t = t0 + blockIdx.y;
   int seq;
   const int pos = q4_pos_of(l, pg, t, seq);
   const int nb = pos < 0 ? 0 : (pos + 1) / ratio;
@@ -1129,7 +1129,7 @@ q4_qsa_score_kernel(const T *__restrict__ q, const T *__restrict__ block_keys,
       total += fmaxf(dots[h], 0.0f);
     }
   }
-  scores[(size_t)t * score_stride + j] = total * rsqrtf((float)Q4_QSA_HEAD_DIM);
+  scores[(size_t)(t - t0) * score_stride + j] = total * rsqrtf((float)Q4_QSA_HEAD_DIM);
 }
 
 __device__ __forceinline__ unsigned int q4_ordered(float v) {
@@ -1143,15 +1143,16 @@ __device__ __forceinline__ unsigned int q4_ordered(float v) {
 // Per query row: the indices of the topk largest scores among the first nb
 // complete blocks (all of them when nb <= topk). Radix select over the
 // order-preserving float bits.
+// Rows t0 + x of a tile; `scores` holds the tile's rows.
 __global__ void q4_qsa_topk_kernel(const float *__restrict__ scores,
                                    int score_stride, Q4Tokens l, Q4Paged pg,
                                    int ratio, int topk,
                                    int *__restrict__ selected,
-                                   int *__restrict__ n_selected) {
+                                   int *__restrict__ n_selected, int t0) {
   __shared__ unsigned int hist[256];
   __shared__ unsigned int s_prefix, s_mask, s_remaining;
   __shared__ unsigned int s_gt, s_eq;
-  const int t = blockIdx.x;
+  const int t = t0 + blockIdx.x;
   int seq;
   const int pos = q4_pos_of(l, pg, t, seq);
   const int nb = pos < 0 ? 0 : (pos + 1) / ratio;
@@ -1165,7 +1166,7 @@ __global__ void q4_qsa_topk_kernel(const float *__restrict__ scores,
     }
     return;
   }
-  const float *row = scores + (size_t)t * score_stride;
+  const float *row = scores + (size_t)(t - t0) * score_stride;
   if (threadIdx.x == 0) {
     s_prefix = 0u;
     s_mask = 0u;
@@ -2051,25 +2052,30 @@ extern "C" void qwen4_qsa_finalize(const void *aux, const void *carry,
       aux_dim);
 }
 
+// `scores` holds `tile_rows` rows: the query rows are scored and selected a tile at a time, so a
+// long-context prefill chunk needs no [tokens, blocks] buffer (2048 x 54K blocks is 440 MB).
 extern "C" void qwen4_qsa_select(const void *q, const void *block_keys,
                                  Q4Tokens layout, Q4Paged paged, float *scores,
-                                 int score_stride, int n_heads, int ratio,
+                                 int score_stride, int tile_rows, int n_heads, int ratio,
                                  int topk, int key_dim, int *selected,
                                  int *n_selected, int dtype, int64_t stream) {
   if (layout.n_tokens == 0) {
     return;
   }
   const cudaStream_t s = (cudaStream_t)stream;
-  if (score_stride > topk) {
-    const int threads = 128;
-    const dim3 grid((score_stride + threads - 1) / threads, layout.n_tokens);
-    Q4_DISPATCH_HALF(
-        dtype, q4_qsa_score_kernel<scalar_t><<<grid, threads, 0, s>>>(
-                   (const scalar_t *)q, (const scalar_t *)block_keys, layout,
-                   paged, scores, score_stride, n_heads, ratio, topk, key_dim));
+  for (int t0 = 0; t0 < layout.n_tokens; t0 += tile_rows) {
+    const int rows = min(tile_rows, layout.n_tokens - t0);
+    if (score_stride > topk) {
+      const int threads = 128;
+      const dim3 grid((score_stride + threads - 1) / threads, rows);
+      Q4_DISPATCH_HALF(
+          dtype, q4_qsa_score_kernel<scalar_t><<<grid, threads, 0, s>>>(
+                     (const scalar_t *)q, (const scalar_t *)block_keys, layout,
+                     paged, scores, score_stride, n_heads, ratio, topk, key_dim, t0));
+    }
+    q4_qsa_topk_kernel<<<rows, 1024, 0, s>>>(scores, score_stride, layout, paged, ratio, topk,
+                                             selected, n_selected, t0);
   }
-  q4_qsa_topk_kernel<<<layout.n_tokens, 1024, 0, s>>>(
-      scores, score_stride, layout, paged, ratio, topk, selected, n_selected);
 }
 
 // Top-k over scores produced elsewhere (the cuTile scoring kernel).
@@ -2081,7 +2087,7 @@ extern "C" void qwen4_qsa_topk(const float *scores, int score_stride,
     return;
   }
   q4_qsa_topk_kernel<<<layout.n_tokens, 1024, 0, (cudaStream_t)stream>>>(
-      scores, score_stride, layout, paged, ratio, topk, selected, n_selected);
+      scores, score_stride, layout, paged, ratio, topk, selected, n_selected, 0);
 }
 
 // `gate` (nullable): the q projection's gate half, [tokens] x [heads] strided as given; the

@@ -268,6 +268,7 @@ mod ffi {
             paged: Q4Paged,
             scores: *mut f32,
             score_stride: i32,
+            tile_rows: i32,
             n_heads: i32,
             ratio: i32,
             topk: i32,
@@ -1186,6 +1187,9 @@ pub(crate) fn qsa_finalize(args: QsaFinalizeArgs<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Bound on the selection's score buffer: query rows are scored a tile at a time.
+const QSA_SCORE_TILE_BYTES: usize = 64 << 20;
+
 /// Per-query top-k blocks as `(selected [tokens, topk], n_selected [tokens])`, both i32.
 pub(crate) fn qsa_select(
     q: &Tensor,
@@ -1194,6 +1198,27 @@ pub(crate) fn qsa_select(
     paged: &PagedView<'_>,
     shape: &QsaShape,
     max_blocks: usize,
+) -> Result<(Tensor, Tensor)> {
+    qsa_select_tiled(
+        q,
+        block_keys,
+        layout,
+        paged,
+        shape,
+        max_blocks,
+        QSA_SCORE_TILE_BYTES,
+    )
+}
+
+/// [`qsa_select`] with the score buffer bounded by `tile_bytes`.
+fn qsa_select_tiled(
+    q: &Tensor,
+    block_keys: &Tensor,
+    layout: &TokenLayout,
+    paged: &PagedView<'_>,
+    shape: &QsaShape,
+    max_blocks: usize,
+    tile_bytes: usize,
 ) -> Result<(Tensor, Tensor)> {
     if shape.n_index_heads > QSA_MAX_INDEX_HEADS || q.dim(candle_core::D::Minus1)? != QSA_HEAD_DIM {
         candle_core::bail!(
@@ -1204,7 +1229,8 @@ pub(crate) fn qsa_select(
     let device = q.device();
     let n_tokens = layout.n_tokens;
     let score_stride = max_blocks.max(shape.topk + 1);
-    let scores = empty(&[n_tokens, score_stride], DType::F32, device)?;
+    let tile_rows = (tile_bytes / (score_stride * 4)).clamp(1, n_tokens.max(1));
+    let scores = empty(&[tile_rows, score_stride], DType::F32, device)?;
     let selected = empty(&[n_tokens, shape.topk], DType::I32, device)?;
     let n_selected = empty(&[n_tokens], DType::I32, device)?;
     unsafe {
@@ -1215,6 +1241,7 @@ pub(crate) fn qsa_select(
             paged.ffi()?,
             dev_ptr(&scores)? as *mut f32,
             score_stride as i32,
+            tile_rows as i32,
             shape.n_index_heads as i32,
             shape.ratio as i32,
             shape.topk as i32,
@@ -1685,6 +1712,31 @@ mod tests {
         };
         write_and_finalize(&raw, &cos, &sin, &slots, &full_layout, &carry, &keys)?;
         check_keys(&raw, &keys)?;
+
+        // Selection scores the stored keys: from the last position (two complete blocks, top 1),
+        // a query equal to a block's key picks that block.
+        let last_query = TokenLayout::from_host(&[(0, 1)], &[TOKENS], 1, &device)?;
+        let stored = keys.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        for (block, row) in [(0i32, 2usize), (1, 0)] {
+            let q = Tensor::new(stored[row].as_slice(), &device)?
+                .to_dtype(dtype)?
+                .reshape((1, 1, QSA_HEAD_DIM))?;
+            let (selected, _) = qsa_select(&q, &keys, &last_query, &paged, &shape, 2)?;
+            assert_eq!(selected.to_vec2::<i32>()?, [[block]]);
+        }
+        // One-row score tiles: the second tile's row reads its scores at the tile's offset.
+        // Position 6 has one complete block (all selected); position 7 picks block 1.
+        let two_queries = TokenLayout::from_host(&[(0, 2)], &[TOKENS], 2, &device)?;
+        let q = Tensor::from_vec(
+            [stored[2].clone(), stored[0].clone()].concat(),
+            (2, 1, QSA_HEAD_DIM),
+            &device,
+        )?
+        .to_dtype(dtype)?;
+        let (selected, n_selected) =
+            qsa_select_tiled(&q, &keys, &two_queries, &paged, &shape, 2, 2 * 4)?;
+        assert_eq!(selected.to_vec2::<i32>()?, [[0], [1]]);
+        assert_eq!(n_selected.to_vec1::<i32>()?, [1, 1]);
 
         // Replace the open block's last tokens and finalize only that suffix: the carry supplies
         // the block's earlier raw keys.
