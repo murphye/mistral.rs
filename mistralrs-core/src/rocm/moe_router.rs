@@ -47,6 +47,17 @@ pub fn moe_router_topk_rocm_into(
             config.top_k
         );
     }
+    // The kernel is instantiated for these expert counts only (cuda/moe_router.cu); any other
+    // count launched nothing and left the routing table unwritten, so the expert kernels read
+    // garbage ids and faulted (a pruned 403-expert MTP head).
+    if !matches!(
+        n_experts,
+        1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 288 | 512 | 576
+    ) {
+        candle_core::bail!(
+            "moe_router_topk_rocm has no kernel for {n_experts} experts (1-512 in powers of two, 288 or 576)"
+        );
+    }
     let f32_param = |t: Option<&Tensor>, name: &str| -> Result<(Option<Tensor>, *const c_void)> {
         let Some(t) = t else {
             return Ok((None, std::ptr::null()));
