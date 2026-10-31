@@ -983,6 +983,26 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("layer 0 is not one"), "{err}");
+
+        // On a ROCm device the layout and head width decide. Qwen4-Exp's config keeps the
+        // token-major layout on ROCm, where a generic config resolves it to the standard one.
+        #[cfg(feature = "rocm")]
+        if let Ok(rocm) = Device::new_rocm(0) {
+            use crate::vision_models::qwen4_exp::{config::LayerType, Qwen4ExpPagedConfig};
+            let qwen4 = |head_dim: usize| {
+                let mut base = model_config(KvCacheLayout::FlashInferHnd);
+                base.k_head_dim = head_dim;
+                base.v_head_dim = head_dim;
+                Qwen4ExpPagedConfig::new(base, &[LayerType::FullAttention; 2], 64, 2051, 0)
+            };
+            assert_eq!(q4.validate(DType::BF16, &qwen4(256), &rocm, &[]), Ok(()));
+            assert_eq!(q4v.validate(DType::BF16, &qwen4(256), &rocm, &[]), Ok(()));
+            assert!(q4.validate(DType::BF16, &qwen4(128), &rocm, &[]).is_err());
+            let mut generic = model_config(KvCacheLayout::FlashInferHnd);
+            generic.k_head_dim = 256;
+            generic.v_head_dim = 256;
+            assert!(q4.validate(DType::BF16, &generic, &rocm, &[]).is_err());
+        }
         Ok(())
     }
 

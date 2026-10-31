@@ -195,7 +195,8 @@ __device__ __forceinline__ void q4_i4_store8(Q4I4 *__restrict__ row, int d, cons
   amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, 32));
   amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, 32));
   // Quantize against the stored (fp16) scale so the codes decode with the scale the readers see.
-  const __half hs = __float2half(amax / 7.0f);
+  // Saturates at the largest f16: an inf scale would decode the whole group as NaN.
+  const __half hs = __float2half(fminf(amax / 7.0f, 65504.0f));
   const float s = __half2float(hs);
   const float inv = s > 0.0f ? 1.0f / s : 0.0f;
   uint32_t w = 0;
@@ -2246,8 +2247,12 @@ __global__ void q4_kv_write_hnd_kernel(const T *__restrict__ k, const T *__restr
     };
     const In8 kin = *reinterpret_cast<const In8 *>(k + src);
     const In8 vin = *reinterpret_cast<const In8 *>(v + src);
-    q4_cache_store8<T, TCK>(kc + row * Q4Row<TCK>::units, d, kin.x, ki);
-    q4_cache_store8<T, TCV>(vc + row * Q4Row<TCV>::units, d, vin.x, vi);
+    // 4-bit rows are fixed at 144 bytes (head_dim 256, checked by the wrapper); others are
+    // head_dim elements of any width the wrapper accepts.
+    const size_t k_units = Q4Packed<TCK>::value ? Q4Row<TCK>::units : head_dim;
+    const size_t v_units = Q4Packed<TCV>::value ? Q4Row<TCV>::units : head_dim;
+    q4_cache_store8<T, TCK>(kc + row * k_units, d, kin.x, ki);
+    q4_cache_store8<T, TCV>(vc + row * v_units, d, vin.x, vi);
   }
 }
 

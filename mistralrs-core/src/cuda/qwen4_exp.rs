@@ -443,8 +443,9 @@ fn cache_kind(
         Fp8,
         I4,
     }
+    // The vLLM layout's V cache is rank 4 as well (`[blocks, heads, head_dim, block_size]`).
+    let token_major = key_cache.rank() == 4;
     let elem = |cache: &Tensor| -> Result<Elem> {
-        let token_major = cache.rank() == 4;
         let last = cache.dims().last().copied().unwrap_or(0);
         let rows = !token_major || last == head_dim;
         match cache.dtype() {

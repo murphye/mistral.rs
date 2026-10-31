@@ -144,12 +144,13 @@ fn explicit_prefix_context_capacity(
         .block_size
         .unwrap_or(DEFAULT_PAGED_ATTENTION_BLOCK_SIZE);
     let bytes_per_token = (0..model.num_layers()).try_fold(0usize, |total, layer| {
+        // As the allocator charges them: KV in the cache's storage, plus side caches.
         let bytes = crate::paged_attention::layer_kv_bytes_per_token(
             model,
             layer,
             ctx.paged.cache_type,
             ctx.dtype,
-        )?;
+        )? + model.layer_side_cache_bytes_per_token(layer);
         total
             .checked_add(bytes)
             .context("prefix KV geometry overflow")

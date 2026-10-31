@@ -58,7 +58,13 @@ pub fn copy_blocks(
         {
             candle_core::bail!("copy_blocks cache layer {layer} is on a different ROCm device");
         }
-        if key_cache.dtype() != dtype || value_cache.dtype() != dtype {
+        // e4m3 and 4-bit (U8) caches both copy as bytes, so an e4m3-key/4-bit-value pair is
+        // one byte type.
+        let bytes = |d: candle_core::DType| {
+            matches!(d, candle_core::DType::F8E4M3 | candle_core::DType::U8)
+        };
+        let same = |d: candle_core::DType| d == dtype || (bytes(d) && bytes(dtype));
+        if !same(key_cache.dtype()) || !same(value_cache.dtype()) {
             candle_core::bail!("copy_blocks cache layer {layer} has a mismatched dtype");
         }
         if !key_cache.is_contiguous() || !value_cache.is_contiguous() {
@@ -117,8 +123,10 @@ pub fn copy_blocks(
         candle_core::DType::BF16 => copy_blocks_bf16,
         candle_core::DType::F16 => copy_blocks_f16,
         candle_core::DType::F32 => copy_blocks_f32,
-        candle_core::DType::F8E4M3 => copy_blocks_u8,
-        _ => candle_core::bail!("only f32, f16, bf16 and f8e4m3 input data types are supported"),
+        candle_core::DType::F8E4M3 | candle_core::DType::U8 => copy_blocks_u8,
+        _ => candle_core::bail!(
+            "only f32, f16, bf16, f8e4m3 and 4-bit (u8) input data types are supported"
+        ),
     };
     unsafe {
         launch(
