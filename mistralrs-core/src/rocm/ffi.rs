@@ -181,6 +181,33 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn gdn_speculative_state_commit(
+        mixed_qkv: *const c_void,
+        convolved_qkv: *const c_void,
+        b: *const c_void,
+        a: *const c_void,
+        initial_conv_state: *const c_void,
+        initial_recurrent_state: *const c_void,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        conv_state_pool: *mut c_void,
+        recurrent_state_pool: *mut c_void,
+        keep_rows: *const u32,
+        slot_indices: *const u32,
+        batch_size: i32,
+        seq_len: i32,
+        num_k_heads: i32,
+        num_v_heads: i32,
+        head_k_dim: i32,
+        head_v_dim: i32,
+        kernel_size: i32,
+        tiled_v_heads: i32,
+        value_major: i32,
+        dtype: i32,
+        state_dtype: i32,
+        stream: i64,
+    );
+
     pub fn gdn_decode_recurrence_multi(
         mixed_qkv: *const c_void,
         b: *const c_void,

@@ -155,6 +155,112 @@ pub fn gated_delta_rule_recurrence_rocm(
     )))
 }
 
+/// Speculative GDN commit on ROCm: for every sequence with a nonzero keep count, the conv and
+/// recurrent states after its first `keep_rows` verified rows, rebuilt from the pre-step
+/// snapshot and the stashed step inputs and written to its pool slot (gdn.cu's
+/// `gdn_speculative_state_commit`, one launch per layer for the whole batch).
+pub fn speculative_state_commit_rocm(
+    commit: crate::cuda::gdn::GdnSpeculativeStateCommit<'_>,
+) -> Result<()> {
+    use candle_core as candle;
+    use core::ffi::c_void;
+
+    let crate::cuda::gdn::GdnSpeculativeStateCommit {
+        mixed_qkv,
+        convolved_qkv,
+        b,
+        a,
+        initial_conv_state,
+        initial_recurrent_state,
+        a_log,
+        dt_bias,
+        conv_state_pool,
+        recurrent_state_pool,
+        keep_rows,
+        slot_indices,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        tiled_v_heads,
+        state_layout,
+    } = commit;
+    let (batch_size, seq_len, _) = mixed_qkv.dims3()?;
+    let kernel_size = initial_conv_state.dim(candle_core::D::Minus1)?;
+    let value_major = match state_layout {
+        RecurrentStateLayout::GdnKeyMajor => false,
+        RecurrentStateLayout::GdnValueMajor => true,
+        RecurrentStateLayout::Opaque => {
+            candle::bail!("GDN speculative commit does not support opaque state")
+        }
+    };
+    if keep_rows.dims1()? != batch_size || slot_indices.dims1()? != batch_size {
+        candle::bail!("GDN speculative commit index tensors must match batch size");
+    }
+    if !conv_state_pool.is_contiguous() || !recurrent_state_pool.is_contiguous() {
+        candle::bail!("GDN speculative commit state pools must be contiguous");
+    }
+    let dtype_code = match mixed_qkv.dtype() {
+        DType::F16 => 0,
+        DType::BF16 => 1,
+        other => {
+            candle::bail!("GDN speculative state commit only supports f16/bf16, got {other:?}")
+        }
+    };
+    let half_ptr = |t: &Tensor, name: &str| -> Result<*mut c_void> {
+        Ok(match t.dtype() {
+            DType::F16 => rocm_ptr::<half::f16>(t, name)?,
+            DType::BF16 => rocm_ptr::<half::bf16>(t, name)?,
+            other => candle::bail!("{name} has unsupported dtype {other:?}"),
+        } as *mut c_void)
+    };
+    let mixed_qkv = mixed_qkv.contiguous()?;
+    let convolved_qkv = convolved_qkv.contiguous()?;
+    let b = b.contiguous()?;
+    let a = a.contiguous()?;
+    let initial_conv_state = initial_conv_state.contiguous()?;
+    let initial_recurrent_state = initial_recurrent_state.contiguous()?;
+    let a_log = a_log.to_dtype(DType::F32)?.contiguous()?;
+    let dt_bias = dt_bias.to_dtype(DType::F32)?.contiguous()?;
+    let (initial_recurrent_ptr, state_dtype) =
+        rocm_recurrent_state_ptr(&initial_recurrent_state, "initial_recurrent_state")?;
+    let (recurrent_pool_ptr, pool_state_dtype) =
+        rocm_recurrent_state_ptr(recurrent_state_pool, "recurrent_state_pool")?;
+    if state_dtype != pool_state_dtype {
+        candle::bail!("GDN speculative commit recurrent state dtype mismatch");
+    }
+    let stream = mixed_qkv.device().as_rocm_device()?.hip_stream().raw() as i64;
+    unsafe {
+        crate::rocm::ffi::gdn_speculative_state_commit(
+            half_ptr(&mixed_qkv, "mixed_qkv")?,
+            half_ptr(&convolved_qkv, "convolved_qkv")?,
+            half_ptr(&b, "b")?,
+            half_ptr(&a, "a")?,
+            half_ptr(&initial_conv_state, "initial_conv_state")?,
+            initial_recurrent_ptr,
+            rocm_ptr::<f32>(&a_log, "a_log")? as *const f32,
+            rocm_ptr::<f32>(&dt_bias, "dt_bias")? as *const f32,
+            half_ptr(conv_state_pool, "conv_state_pool")?,
+            recurrent_pool_ptr,
+            rocm_ptr::<u32>(keep_rows, "keep_rows")? as *const u32,
+            rocm_ptr::<u32>(slot_indices, "slot_indices")? as *const u32,
+            batch_size as i32,
+            seq_len as i32,
+            num_k_heads as i32,
+            num_v_heads as i32,
+            head_k_dim as i32,
+            head_v_dim as i32,
+            kernel_size as i32,
+            i32::from(tiled_v_heads),
+            i32::from(value_major),
+            dtype_code,
+            state_dtype,
+            stream,
+        );
+    }
+    Ok(())
+}
+
 fn rocm_recurrent_state_ptr(tensor: &Tensor, name: &str) -> Result<(*mut core::ffi::c_void, i32)> {
     use candle_core as candle;
 
@@ -860,4 +966,250 @@ pub fn prepare_recurrence_inputs_rocm(
         );
     }
     Ok((q, k, v, g, beta))
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_core::{DType, Device, Result, Tensor};
+
+    use super::*;
+
+    fn patterned(len: usize, salt: usize, scale: f32, offset: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let x = ((i.wrapping_mul(37) + salt.wrapping_mul(17)) % 257) as u16 as f32;
+                ((x / 128.0) - 1.0) * scale + offset
+            })
+            .collect()
+    }
+
+    fn flat(tensor: &Tensor) -> Result<Vec<f32>> {
+        tensor
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+    }
+
+    fn max_abs_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
+        lhs.iter()
+            .zip(rhs)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, |m, d| if d.is_nan() { f32::NAN } else { m.max(d) })
+    }
+
+    /// The fused speculative commit against a replay of each sequence's kept rows through the
+    /// separate conv and verify-recurrence kernels and against the recurrence on the host:
+    /// conv states exactly, recurrent states closely, and slots of sequences that keep nothing
+    /// untouched.
+    #[test]
+    fn speculative_state_commit_matches_prefix_replay_rocm() -> Result<()> {
+        let Ok(dev) = Device::new_rocm(0) else {
+            return Ok(());
+        };
+        let (batch, seq_len, kernel_size, capacity) = (3usize, 4usize, 4usize, 5usize);
+        let (num_k_heads, num_v_heads, head_k_dim, head_v_dim) =
+            (1usize, 2usize, 128usize, 128usize);
+        let conv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim;
+        let row_state = num_v_heads * head_k_dim * head_v_dim;
+        let row_conv = conv_dim * kernel_size;
+        let keep_rows = vec![1u32, 3, 0];
+        let slots = vec![4u32, 1, 3];
+        let bf16 = |data: Vec<f32>, shape: &[usize]| -> Result<Tensor> {
+            Tensor::from_vec(data, shape, &dev)?.to_dtype(DType::BF16)
+        };
+        let mixed_qkv = bf16(
+            patterned(batch * seq_len * conv_dim, 110, 0.08, 0.01),
+            &[batch, seq_len, conv_dim],
+        )?;
+        let conv_weight = bf16(
+            patterned(conv_dim * kernel_size, 111, 0.05, -0.01),
+            &[conv_dim, kernel_size],
+        )?;
+        let initial_conv = bf16(
+            patterned(batch * row_conv, 112, 0.03, 0.0),
+            &[batch, conv_dim, kernel_size],
+        )?;
+        let (convolved, _) = causal_conv1d_rocm(
+            &mixed_qkv,
+            &conv_weight,
+            &initial_conv,
+            kernel_size,
+            false,
+            GdnStateSlots::Gathered,
+        )?;
+        let b = bf16(
+            patterned(batch * seq_len * num_v_heads, 113, 0.2, 0.1),
+            &[batch, seq_len, num_v_heads],
+        )?;
+        let a = bf16(
+            patterned(batch * seq_len * num_v_heads, 114, 0.18, -0.04),
+            &[batch, seq_len, num_v_heads],
+        )?;
+        let a_log = Tensor::from_vec(patterned(num_v_heads, 115, 0.05, -0.2), num_v_heads, &dev)?;
+        let dt_bias = Tensor::from_vec(patterned(num_v_heads, 116, 0.1, 0.3), num_v_heads, &dev)?;
+        for state_dtype in [DType::F32, DType::BF16] {
+            let initial_state = Tensor::from_vec(
+                patterned(batch * row_state, 117, 0.02, 0.0),
+                (batch, num_v_heads, head_k_dim, head_v_dim),
+                &dev,
+            )?
+            .to_dtype(state_dtype)?;
+            let conv_pool = bf16(
+                patterned(capacity * row_conv, 118, 0.04, 0.0),
+                &[capacity, conv_dim, kernel_size],
+            )?;
+            let state_pool = Tensor::from_vec(
+                patterned(capacity * row_state, 119, 0.02, 0.0),
+                (capacity, num_v_heads, head_k_dim, head_v_dim),
+                &dev,
+            )?
+            .to_dtype(state_dtype)?;
+            let mut want_conv = flat(&conv_pool)?;
+            let mut want_state = flat(&state_pool)?;
+            for (i, &rows) in keep_rows.iter().enumerate() {
+                let rows = rows as usize;
+                if rows == 0 {
+                    continue;
+                }
+                let (_, conv_state) = causal_conv1d_rocm(
+                    &mixed_qkv
+                        .narrow(0, i, 1)?
+                        .narrow(1, 0, rows)?
+                        .contiguous()?,
+                    &conv_weight,
+                    &initial_conv.narrow(0, i, 1)?.contiguous()?,
+                    kernel_size,
+                    false,
+                    GdnStateSlots::Gathered,
+                )?;
+                let dst = slots[i] as usize * row_conv;
+                want_conv[dst..dst + row_conv].copy_from_slice(&flat(&conv_state)?);
+                // The replay this commit replaces: the verify step's own recurrence kernels
+                // over the kept rows, from the pre-step state.
+                // A copy: the kernels update the state in place, and an f32 narrow would alias
+                // the initial state the commit reads.
+                let mut state = initial_state
+                    .narrow(0, i, 1)?
+                    .to_dtype(DType::F32)?
+                    .reshape((num_v_heads, head_k_dim, head_v_dim))?
+                    .copy()?;
+                let (convolved_row, b_row, a_row) = (
+                    convolved
+                        .narrow(0, i, 1)?
+                        .narrow(1, 0, rows)?
+                        .contiguous()?,
+                    b.narrow(0, i, 1)?.narrow(1, 0, rows)?.contiguous()?,
+                    a.narrow(0, i, 1)?.narrow(1, 0, rows)?.contiguous()?,
+                );
+                let launch = FusedDecodeRecurrence {
+                    mixed_qkv: &convolved_row,
+                    b: &b_row,
+                    a: &a_row,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    state: &mut state,
+                    batch_size: 1,
+                    num_k_heads,
+                    num_v_heads,
+                    head_k_dim,
+                    head_v_dim,
+                    tiled_v_heads: false,
+                    state_layout: RecurrentStateLayout::GdnKeyMajor,
+                    slots: GdnStateSlots::Gathered,
+                };
+                if rows == 1 {
+                    fused_decode_recurrence_rocm(launch)?;
+                } else {
+                    fused_multi_recurrence_rocm(launch, rows)?;
+                }
+                let dst = slots[i] as usize * row_state;
+                want_state[dst..dst + row_state].copy_from_slice(&flat(&state)?);
+            }
+            speculative_state_commit_rocm(crate::cuda::gdn::GdnSpeculativeStateCommit {
+                mixed_qkv: &mixed_qkv,
+                convolved_qkv: &convolved,
+                b: &b,
+                a: &a,
+                initial_conv_state: &initial_conv,
+                initial_recurrent_state: &initial_state,
+                a_log: &a_log,
+                dt_bias: &dt_bias,
+                conv_state_pool: &conv_pool,
+                recurrent_state_pool: &state_pool,
+                keep_rows: &Tensor::from_vec(keep_rows.clone(), batch, &dev)?,
+                slot_indices: &Tensor::from_vec(slots.clone(), batch, &dev)?,
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                tiled_v_heads: false,
+                state_layout: RecurrentStateLayout::GdnKeyMajor,
+            })?;
+            // The gated delta rule on the host from the same convolved inputs.
+            let conv_h = flat(&convolved)?;
+            let (b_h, a_h) = (flat(&b)?, flat(&a)?);
+            let (alog_h, dtb_h) = (flat(&a_log)?, flat(&dt_bias)?);
+            let init_h = flat(&initial_state)?;
+            let mut cpu_state = flat(&state_pool)?;
+            let key_dim = num_k_heads * head_k_dim;
+            for (i, &rows) in keep_rows.iter().enumerate() {
+                for vh in 0..num_v_heads {
+                    let kh = vh / (num_v_heads / num_k_heads);
+                    let base = (i * num_v_heads + vh) * head_k_dim * head_v_dim;
+                    let mut st = init_h[base..base + head_k_dim * head_v_dim].to_vec();
+                    for p in 0..rows as usize {
+                        let row =
+                            &conv_h[(i * seq_len + p) * conv_dim..(i * seq_len + p + 1) * conv_dim];
+                        let key = &row[key_dim + kh * head_k_dim..key_dim + (kh + 1) * head_k_dim];
+                        let inv = 1.0 / (key.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
+                        let gi = (i * seq_len + p) * num_v_heads + vh;
+                        let beta = 1.0 / (1.0 + (-b_h[gi]).exp());
+                        let av = a_h[gi] + dtb_h[vh];
+                        let sp = if av > 20.0 { av } else { av.exp().ln_1p() };
+                        let decay = (-alog_h[vh].exp() * sp).exp();
+                        for vi in 0..head_v_dim {
+                            let v = row[2 * key_dim + vh * head_v_dim + vi];
+                            let dot: f32 = (0..head_k_dim)
+                                .map(|k| st[k * head_v_dim + vi] * key[k] * inv)
+                                .sum();
+                            let delta = (v - decay * dot) * beta;
+                            for k in 0..head_k_dim {
+                                st[k * head_v_dim + vi] =
+                                    key[k] * inv * delta + decay * st[k * head_v_dim + vi];
+                            }
+                        }
+                    }
+                    if rows > 0 {
+                        let dst = (slots[i] as usize * num_v_heads + vh) * head_k_dim * head_v_dim;
+                        cpu_state[dst..dst + st.len()].copy_from_slice(&st);
+                    }
+                }
+            }
+            if state_dtype == DType::F32 {
+                let cpu_diff = max_abs_diff(&flat(&state_pool)?, &cpu_state);
+                assert!(
+                    cpu_diff <= 1e-6,
+                    "recurrent state vs the CPU recurrence: max diff {cpu_diff}"
+                );
+            }
+            let conv_diff = max_abs_diff(&flat(&conv_pool)?, &want_conv);
+            assert!(
+                conv_diff == 0.0,
+                "{state_dtype:?} conv state: max diff {conv_diff}"
+            );
+            // The replay keeps its state in f32; a bf16 pool rounds the committed state once.
+            let tol = if state_dtype == DType::F32 {
+                2e-4
+            } else {
+                4e-3
+            };
+            let state_diff = max_abs_diff(&flat(&state_pool)?, &want_state);
+            assert!(
+                state_diff <= tol,
+                "{state_dtype:?} recurrent state: max diff {state_diff}"
+            );
+        }
+        Ok(())
+    }
 }

@@ -324,11 +324,11 @@ impl GatedDeltaNet {
         let Ok((batch_size, seq_len, conv_dim)) = stash.mixed_qkv.dims3() else {
             return false;
         };
-        if !cfg!(feature = "cuda")
+        if !cfg!(any(feature = "cuda", feature = "rocm"))
             || batch_size == 0
             || seq_len == 0
             || conv_dim != self.dims.conv_dim
-            || !pool.device().is_cuda()
+            || !(pool.device().is_cuda() || pool.device().is_rocm())
             || !matches!(stash.mixed_qkv.dtype(), DType::F16 | DType::BF16)
             || !speculative_state_commit_dims_supported(&self.dims)
         {
@@ -958,6 +958,33 @@ impl GatedDeltaNet {
         #[cfg(feature = "cuda")]
         if stash.mixed_qkv.device().is_cuda() {
             crate::cuda::gdn::speculative_state_commit_cuda(
+                crate::cuda::gdn::GdnSpeculativeStateCommit {
+                    mixed_qkv: &stash.mixed_qkv,
+                    convolved_qkv: &stash.convolved_qkv,
+                    b: &stash.b,
+                    a: &stash.a,
+                    initial_conv_state,
+                    initial_recurrent_state,
+                    a_log: &self.a_log,
+                    dt_bias: &self.dt_bias,
+                    conv_state_pool: &pool.conv_state,
+                    recurrent_state_pool: &pool.recurrent_state,
+                    keep_rows,
+                    slot_indices: slots,
+                    num_k_heads: self.dims.num_k_heads,
+                    num_v_heads: self.dims.num_v_heads,
+                    head_k_dim: self.dims.head_k_dim,
+                    head_v_dim: self.dims.head_v_dim,
+                    tiled_v_heads: self.dims.v_head_layout == super::config::GdnVHeadLayout::Tiled,
+                    state_layout: pool.state_layout(),
+                },
+            )?;
+            return Ok(true);
+        }
+
+        #[cfg(feature = "rocm")]
+        if stash.mixed_qkv.device().is_rocm() {
+            crate::rocm::gdn::speculative_state_commit_rocm(
                 crate::cuda::gdn::GdnSpeculativeStateCommit {
                     mixed_qkv: &stash.mixed_qkv,
                     convolved_qkv: &stash.convolved_qkv,

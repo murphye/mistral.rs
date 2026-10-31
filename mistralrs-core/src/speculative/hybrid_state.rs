@@ -378,7 +378,10 @@ pub(crate) fn replay_gdn_prefixes<'a>(
     });
     let fused_commit_supported = !stash.layers.is_empty()
         && stash.layers.iter().all(|layer| match &layer.rollback {
-            GdnLayerRollback::Replay { projected, .. } => projected.mixed_qkv.device().is_cuda(),
+            GdnLayerRollback::Replay { projected, .. } => {
+                let device = projected.mixed_qkv.device();
+                device.is_cuda() || device.is_rocm()
+            }
             GdnLayerRollback::Transition(_) => false,
         })
         && {
