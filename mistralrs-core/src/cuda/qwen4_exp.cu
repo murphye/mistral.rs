@@ -1132,6 +1132,180 @@ q4_qsa_score_kernel(const T *__restrict__ q, const T *__restrict__ block_keys,
   scores[(size_t)(t - t0) * score_stride + j] = total * rsqrtf((float)Q4_QSA_HEAD_DIM);
 }
 
+#ifdef USE_ROCM
+// q4_qsa_score_kernel on gfx12 WMMA. A workgroup of four waves takes Q4S_ROWS query rows (16
+// per wave) and Q4S_KEYS consecutive blocks; each wave keeps its rows' queries for every head
+// in registers and scores 16 blocks per step: per head eight 16x16x16 products over the 128
+// key dims, then relu and the sum over heads. Only rows with more complete blocks than the
+// budget selects are scored, and only their first nb blocks are written, as in the scalar
+// kernel. Rows of different sequences read different block keys, so a wave whose rows span
+// several takes one pass per sequence. Targets without these instructions score with scalar
+// loops. At most 4 heads.
+#define Q4S_ROWS 64
+#define Q4S_KEYS 256
+#define Q4S_MAX_HEADS 4
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define Q4S_WMMA 1
+typedef __bf16 q4s_bf8 __attribute__((ext_vector_type(8)));
+typedef _Float16 q4s_h8 __attribute__((ext_vector_type(8)));
+typedef float q4s_f8 __attribute__((ext_vector_type(8)));
+template <typename T> struct Q4sFrag;
+template <> struct Q4sFrag<__nv_bfloat16> {
+  typedef q4s_bf8 type;
+  static __device__ __forceinline__ q4s_f8 mma(type a, type b, q4s_f8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+  }
+};
+template <> struct Q4sFrag<__half> {
+  typedef q4s_h8 type;
+  static __device__ __forceinline__ q4s_f8 mma(type a, type b, q4s_f8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+  }
+};
+#endif
+
+__device__ __forceinline__ int q4s_wave_max(int v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    v = max(v, __shfl_xor(v, off, 32));
+  }
+  return v;
+}
+__device__ __forceinline__ int q4s_wave_min(int v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    v = min(v, __shfl_xor(v, off, 32));
+  }
+  return v;
+}
+
+template <typename T>
+__global__ void __launch_bounds__(128)
+q4_qsa_score_wmma_kernel(const T *__restrict__ q, const T *__restrict__ block_keys,
+                         Q4Tokens l, Q4Paged pg, float *__restrict__ scores,
+                         int score_stride, int n_heads, int ratio, int topk,
+                         int key_dim, int t0, int rows) {
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+  const int h = lane >> 4, col = lane & 15;
+  const int r0 = blockIdx.y * Q4S_ROWS + wave * 16;
+  const int j_begin = blockIdx.x * Q4S_KEYS;
+  // Lane l describes tile row l % 16 (lanes l and l + 16 agree).
+  const int rr = r0 + col;
+  int seq = -1, nb = 0;
+  if (rr < rows) {
+    const int pos = q4_pos_of(l, pg, t0 + rr, seq);
+    nb = pos < 0 ? 0 : (pos + 1) / ratio;
+  }
+  const int nb_need = nb > topk ? nb : 0;
+  const int nb_max = q4s_wave_max(nb_need);
+  if (nb_max <= j_begin) {
+    return;
+  }
+  const float inv_sqrt_d = rsqrtf((float)Q4_QSA_HEAD_DIM);
+  const size_t q_row = (size_t)n_heads * Q4_QSA_HEAD_DIM;
+#ifdef Q4S_WMMA
+  typedef typename Q4sFrag<T>::type frag;
+  // A: row col's query, elements 8h .. 8h + 7 of each 16-wide step, every head.
+  frag a[Q4S_MAX_HEADS][Q4_QSA_HEAD_DIM / 16];
+  const T *qr = q + (size_t)(t0 + min(rr, rows - 1)) * q_row;
+#pragma unroll
+  for (int hd = 0; hd < Q4S_MAX_HEADS; ++hd) {
+#pragma unroll
+    for (int st = 0; st < Q4_QSA_HEAD_DIM / 16; ++st) {
+      a[hd][st] = hd < n_heads
+                      ? *reinterpret_cast<const frag *>(qr + hd * Q4_QSA_HEAD_DIM + st * 16 + 8 * h)
+                      : frag{};
+    }
+  }
+  // One pass per sequence among the scored rows (almost always one).
+  bool done = nb_need == 0;
+  while (true) {
+    const int seq0 = q4s_wave_min(done ? 0x7fffffff : seq);
+    if (seq0 == 0x7fffffff) {
+      break;
+    }
+    const bool mine = !done && seq == seq0;
+    done = done || mine;
+    const int nb_pass = mine ? nb_need : 0;
+    const int j_end = min(j_begin + Q4S_KEYS, q4s_wave_max(nb_pass));
+    // Row 8h + i's block count in this pass, for the rows this lane's accumulators hold.
+    int nb_row[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      nb_row[i] = __shfl(nb_pass, 8 * h + i, 32);
+    }
+    for (int j0 = j_begin; j0 < j_end; j0 += 16) {
+      // B: block j0 + col's key, the same elements; past the last block the first stands in.
+      const int n = j0 + col < j_end ? j0 + col : j_begin;
+      const T *kp = block_keys + q4_slot(pg, seq0, n * ratio) / ratio * key_dim;
+      frag b[Q4_QSA_HEAD_DIM / 16];
+#pragma unroll
+      for (int st = 0; st < Q4_QSA_HEAD_DIM / 16; ++st) {
+        b[st] = *reinterpret_cast<const frag *>(kp + st * 16 + 8 * h);
+      }
+      q4s_f8 total = {};
+#pragma unroll
+      for (int hd = 0; hd < Q4S_MAX_HEADS; ++hd) {
+        if (hd < n_heads) {
+          q4s_f8 d = {};
+#pragma unroll
+          for (int st = 0; st < Q4_QSA_HEAD_DIM / 16; ++st) {
+            d = Q4sFrag<T>::mma(a[hd][st], b[st], d);
+          }
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            total[i] += fmaxf(d[i], 0.0f);
+          }
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        if (j0 + col < nb_row[i] && j0 + col < j_end) {
+          scores[(size_t)(r0 + 8 * h + i) * score_stride + j0 + col] = total[i] * inv_sqrt_d;
+        }
+      }
+    }
+  }
+#else
+  const int j_end = min(j_begin + Q4S_KEYS, nb_max);
+  int nb_row[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    nb_row[i] = __shfl(nb_need, 8 * h + i, 32);
+  }
+  // Scalar: lane (h, col) scores block j0 + col for rows 8h .. 8h + 7.
+  for (int j0 = j_begin; j0 < j_end; j0 += 16) {
+    const int n = j0 + col;
+#pragma unroll 1
+    for (int i = 0; i < 8; ++i) {
+      const int row = r0 + 8 * h + i;
+      if (n >= nb_row[i] || n >= j_end) {
+        continue;
+      }
+      const int row_seq = __shfl(seq, 8 * h + i, 32);
+      const T *kp = block_keys + q4_slot(pg, row_seq, n * ratio) / ratio * key_dim;
+      const T *qr = q + (size_t)(t0 + row) * q_row;
+      float total = 0.0f;
+      for (int hd = 0; hd < n_heads; ++hd) {
+        float dot = 0.0f;
+        for (int d = 0; d < Q4_QSA_HEAD_DIM; d += 8) {
+          float kv[8], qv[8];
+          q4_load8(kp + d, kv);
+          q4_load8(qr + hd * Q4_QSA_HEAD_DIM + d, qv);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            dot = fmaf(qv[e], kv[e], dot);
+          }
+        }
+        total += fmaxf(dot, 0.0f);
+      }
+      scores[(size_t)row * score_stride + n] = total * inv_sqrt_d;
+    }
+  }
+#endif
+}
+#endif
+
 __device__ __forceinline__ unsigned int q4_ordered(float v) {
   if (v != v) {
     return 0u;
@@ -2066,12 +2240,23 @@ extern "C" void qwen4_qsa_select(const void *q, const void *block_keys,
   for (int t0 = 0; t0 < layout.n_tokens; t0 += tile_rows) {
     const int rows = min(tile_rows, layout.n_tokens - t0);
     if (score_stride > topk) {
-      const int threads = 128;
-      const dim3 grid((score_stride + threads - 1) / threads, rows);
-      Q4_DISPATCH_HALF(
-          dtype, q4_qsa_score_kernel<scalar_t><<<grid, threads, 0, s>>>(
-                     (const scalar_t *)q, (const scalar_t *)block_keys, layout,
-                     paged, scores, score_stride, n_heads, ratio, topk, key_dim, t0));
+#ifdef USE_ROCM
+      if (n_heads <= Q4S_MAX_HEADS) {
+        const dim3 grid((score_stride + Q4S_KEYS - 1) / Q4S_KEYS, (rows + Q4S_ROWS - 1) / Q4S_ROWS);
+        Q4_DISPATCH_HALF(
+            dtype, q4_qsa_score_wmma_kernel<scalar_t><<<grid, 128, 0, s>>>(
+                       (const scalar_t *)q, (const scalar_t *)block_keys, layout, paged,
+                       scores, score_stride, n_heads, ratio, topk, key_dim, t0, rows));
+      } else
+#endif
+      {
+        const int threads = 128;
+        const dim3 grid((score_stride + threads - 1) / threads, rows);
+        Q4_DISPATCH_HALF(
+            dtype, q4_qsa_score_kernel<scalar_t><<<grid, threads, 0, s>>>(
+                       (const scalar_t *)q, (const scalar_t *)block_keys, layout,
+                       paged, scores, score_stride, n_heads, ratio, topk, key_dim, t0));
+      }
     }
     q4_qsa_topk_kernel<<<rows, 1024, 0, s>>>(scores, score_stride, layout, paged, ratio, topk,
                                              selected, n_selected, t0);
